@@ -2,16 +2,16 @@
 
 ## Zig toolchains
 
-The default development shell uses Zig 0.15.2:
+The default development shell uses Zig 0.16.0:
 
 ```bash
 nix develop
 ```
 
-The migration shell uses Zig 0.16.0:
+The compatibility shell uses Zig 0.15.2:
 
 ```bash
-nix develop .#zig016
+nix develop .#zig015
 ```
 
 Run `just test` and `just lint` in both shells when changing code that touches the embedded frontend or its compatibility adapters.
@@ -19,24 +19,24 @@ Run `just test` and `just lint` in both shells when changing code that touches t
 ## Formatting
 
 Zig 0.15.2 is the sole canonical formatter. Format and check source files
-from the default shell:
+from the compatibility shell:
 
 ```bash
-nix develop -c zig fmt src
-nix develop -c zig fmt --check src/
+nix develop .#zig015 -c zig fmt src
+nix develop .#zig015 -c zig fmt --check src/
 ```
 
-The Zig 0.16.0 shell validates the alternate frontend but does not establish
-a competing formatting baseline. Accordingly, `just lint` checks formatting
-in the 0.15.2 shell and runs the remaining lint checks in the 0.16.0 shell.
+The default Zig 0.16.0 shell validates the current frontend. It does not
+establish a competing formatting baseline; `just lint` checks formatting only
+when run in the Zig 0.15.2 compatibility shell.
 
 ## macOS SDK workaround
 
-On macOS 26.x hosts the active `MacOSX.sdk/usr/lib/libSystem.tbd` only advertises `arm64e-macos`, so Zig 0.15.2 cannot link the build runner and emits a long list of undefined libSystem symbols (`__availability_version_check`, `_realpath$DARWIN_EXTSN`, etc.). Upstream tracker: <https://codeberg.org/ziglang/zig/issues/31756>.
+On current macOS hosts the active `MacOSX.sdk/usr/lib/libSystem.tbd` can advertise only `arm64e-macos`, so Zig 0.15.2 cannot link the build runner and emits a long list of undefined libSystem symbols (`__availability_version_check`, `_realpath$DARWIN_EXTSN`, etc.). Upstream tracker: <https://codeberg.org/ziglang/zig/issues/31756>.
 
-`flake.nix`'s Darwin `shellHook` sources `scripts/setup-macos-sdk-workaround.sh`, which detects the broken stub and, when needed, materializes a fake `DEVELOPER_DIR` under `.tmp/macos-sdk-workaround` that points at `MacOSX15.4.sdk` (the most recent SDK that still lists `arm64-macos`). A narrow `xcrun --sdk macosx --show-sdk-path` shim is prepended to `PATH` so Zig's internal SDK lookup picks up the same path. The hook is a no-op when the active SDK already advertises `arm64-macos`, when `MacOSX15.4.sdk` is missing, or on non-Darwin systems. The macOS Zig 0.15.2 release job sources the same script and persists its `DEVELOPER_DIR` and shim path for the build step.
+`flake.nix`'s Darwin shell hooks source `scripts/setup-macos-sdk-workaround.sh`, which checks the SDK stub directly and, when the compatible `MacOSX15.4.sdk` is installed, materializes a fake `DEVELOPER_DIR` under `.tmp/macos-sdk-workaround` that points at it. A narrow `xcrun --sdk macosx --show-sdk-path` shim is prepended to `PATH` so Zig's internal SDK lookup picks up the same path. The helper is a no-op when the active stub is compatible, when the legacy SDK is missing, or on non-Darwin systems. The default shell uses Zig 0.16.0, while the `zig015` shell retains the legacy frontend.
 
-Remove the script and the corresponding `flake.nix` lines once Zwanzig moves off Zig 0.15.2 or upstream resolves the arm64e-only stub regression.
+Remove the script and the corresponding `flake.nix` lines once upstream resolves the arm64e-only stub regression.
 
 ## Architecture
 

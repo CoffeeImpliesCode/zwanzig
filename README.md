@@ -37,16 +37,16 @@ The two frontend artifacts are maintained through the v0.17.x release line.
 v0.18.0 is the first planned release without a Zig 0.15.2 artifact; users on
 Zig 0.15.2 should stay on the latest v0.17.x release.
 
-To build from source with the 0.15.2 frontend, use the default shell:
+To build from source with the 0.16.0 frontend, use the default shell:
 
 ```bash
 nix develop -c just build
 ```
 
-To build with the 0.16.0 frontend, select the migration shell:
+To build with the 0.15.2 frontend, select the compatibility shell:
 
 ```bash
-nix develop .#zig016 -c just build
+nix develop .#zig015 -c just build
 ```
 
 ### Zig build dependency

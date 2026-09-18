@@ -60,9 +60,9 @@ jobs:
       matrix:
         include:
           - zig_version: '0.15.2'
-            nix_flake: '.'
+            nix_flake: '.#zig015'
           - zig_version: '0.16.0'
-            nix_flake: '.#zig016'
+            nix_flake: '.'
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zwanzig/.zig-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zwanzig/.zig-cache/local
