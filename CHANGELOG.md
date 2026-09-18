@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The default macOS development shell now uses Zig 0.16.0, avoiding the Zig 0.15.2 toolchain failure with current SDKs while retaining an explicit compatibility shell for the older frontend. (#81)
+
 ## [0.15.1]
 
 ### Fixed

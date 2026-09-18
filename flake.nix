@@ -28,7 +28,7 @@
         };
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.zig015 = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             just
             shellcheck
@@ -54,22 +54,46 @@
             # some dependency but we need to rely on system Xcode tools
             export PATH=$(echo "$PATH" | ${pkgs.gawk}/bin/awk -v RS=: -v ORS=: '$0 !~ /xcrun/ || $0 == "/usr/bin" {print}' | ${pkgs.gnused}/bin/sed 's/:$//')
 
-            # Zig 0.15.2 cannot link correctly against the arm64e-only macOS 26.x SDK stubs.
-            # Remove this once we move off Zig 0.15.2 or the upstream fix lands.
+            # Zig 0.15.2 cannot link correctly against the arm64e-only macOS SDK stubs.
+            # Remove this once the upstream fix lands.
             # https://codeberg.org/ziglang/zig/issues/31756
             project_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
             . "$project_root/scripts/setup-macos-sdk-workaround.sh"
           '');
         };
 
-        # Zig 0.16.0 shell for the dual-frontend migration
-        # (see docs/ZIG_0_16_MIGRATION_PLAN.md).
-        devShells.zig016 = pkgs.mkShell {
+        devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             just
             shellcheck
             zig.packages.${system}."0.16.0"
           ];
+
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+            pkgs.gawk
+            pkgs.gnused
+          ];
+
+          shellHook = ''
+            echo "Zwanzig development environment (Zig 0.16.0)"
+            echo "Available commands: just --list"
+          ''
+          + (pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+            # On macOS, we unset the macOS SDK env vars that Nix sets up because
+            # we rely on a system installation.
+            unset SDKROOT
+            unset DEVELOPER_DIR
+
+            # We need to remove "xcrun" from the PATH. It is injected by
+            # some dependency but we need to rely on system Xcode tools
+            export PATH=$(echo "$PATH" | ${pkgs.gawk}/bin/awk -v RS=: -v ORS=: '$0 !~ /xcrun/ || $0 == "/usr/bin" {print}' | ${pkgs.gnused}/bin/sed 's/:$//')
+
+            # Zig 0.16.0 cannot link correctly against arm64e-only macOS SDK stubs.
+            # Remove this once the upstream fix lands.
+            # https://codeberg.org/ziglang/zig/issues/31756
+            project_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+            . "$project_root/scripts/setup-macos-sdk-workaround.sh"
+          '');
         };
       }
     );

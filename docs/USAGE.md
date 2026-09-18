@@ -6,16 +6,16 @@
 zig build
 ```
 
-For a reproducible source build with the Zig 0.15.2 frontend, use the default development shell:
+For a reproducible source build with the Zig 0.16.0 frontend, use the default development shell:
 
 ```bash
 nix develop -c just build
 ```
 
-To build with the Zig 0.16.0 frontend, select the dedicated shell:
+To build with the Zig 0.15.2 frontend, select the dedicated compatibility shell:
 
 ```bash
-nix develop .#zig016 -c just build
+nix develop .#zig015 -c just build
 ```
 
 ## Run the CLI
