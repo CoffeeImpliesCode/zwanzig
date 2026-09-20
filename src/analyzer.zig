@@ -8,6 +8,7 @@ const checker_mod = @import("checker.zig");
 const Checker = checker_mod.Checker;
 const CheckerManagerWithRules = checker_mod.CheckerManagerWithRules;
 const TypeContext = checker_mod.TypeContext;
+const AnalysisCache = @import("analysis_cache.zig").AnalysisCache;
 const Config = checker_mod.Config;
 pub const AnalysisResult = checker_mod.AnalysisResult;
 pub const AnalysisStats = checker_mod.AnalysisStats;
@@ -24,6 +25,9 @@ const diagnostic_mod = @import("diagnostic.zig");
 const suppression = @import("suppression.zig");
 const ProjectSources = @import("project_sources.zig").ProjectSources;
 const project_unused_decl = @import("project_unused_decl.zig");
+const DupeImportRule = @import("rules/dupe_import.zig").DupeImportRule;
+const UnusedDeclRule = @import("rules/unused_decl.zig").UnusedDeclRule;
+const OptionalUnwrapEngineChecker = @import("checkers/optional_unwrap_engine.zig").OptionalUnwrapEngineChecker;
 
 pub const Analyzer = struct {
     allocator: std.mem.Allocator,
@@ -229,11 +233,19 @@ pub const Analyzer = struct {
         }
     }
 
+    fn needsTypeInformation(self: *const Analyzer) bool {
+        for (self.checker_manager.checkers.items) |chkr| {
+            if (self.isRuleEnabled(chkr.name) and chkr.type_requirement != .none) return true;
+        }
+        return false;
+    }
+
     pub fn prepareProject(self: *Analyzer, files: []const []const u8) !void {
         if (self.project_sources) |*project| {
             project.deinit();
             self.project_sources = null;
         }
+        if (!self.needsTypeInformation() and !self.shouldRunProjectUnusedDecls()) return;
         self.project_sources = try ProjectSources.init(
             self.getIoContext(),
             self.allocator,
@@ -242,7 +254,11 @@ pub const Analyzer = struct {
     }
 
     pub fn shouldRunProjectUnusedDecls(self: *const Analyzer) bool {
-        return self.isRuleEnabled("unused-decl");
+        if (!self.isRuleEnabled("unused-decl")) return false;
+        for (self.checker_manager.adapted_rules.items) |rule| {
+            if (std.mem.eql(u8, rule.name, "unused-decl")) return true;
+        }
+        return false;
     }
 
     pub fn analyzeProjectUnusedDecls(self: *Analyzer) !void {
@@ -262,12 +278,10 @@ pub const Analyzer = struct {
     }
 
     pub fn mergeResult(self: *Analyzer, result: *AnalysisResult) !void {
-        self.analysis_stats.merge(result.stats);
-        // Reserve capacity upfront so append can't fail mid-way.
-        // This prevents use-after-free on error: if ensureUnusedCapacity fails,
-        // we haven't moved any diagnostics yet, so errdefer in analyzeFile
-        // can safely free result's diagnostics.
+        // Reserve before changing statistics or transferring diagnostic ownership.
+        // On allocation failure the caller can retry or free the unchanged result.
         try self.diagnostics.ensureUnusedCapacity(self.allocator, result.diagnostics.items.len);
+        self.analysis_stats.merge(result.stats);
         for (result.diagnostics.items) |diag| {
             self.diagnostics.appendAssumeCapacity(diag);
         }
@@ -320,7 +334,22 @@ pub const Analyzer = struct {
         };
         defer source.deinit();
         const content = source.getContent();
-        const type_info_available = source.hasTypeInfo();
+        var result = AnalysisResult.init();
+        errdefer result.deinit(self.allocator);
+
+        const tree = try source.ast();
+        if (tree.errors.len != 0) {
+            try appendParseErrors(&source, tree, self.allocator, &result.diagnostics);
+            return result;
+        }
+
+        const type_info_available = if (self.needsTypeInformation()) available: {
+            _ = source.requireZirBridge() catch |err| {
+                if (err == error.OutOfMemory) return err;
+                break :available false;
+            };
+            break :available true;
+        } else false;
 
         var cached_artifacts: ?CachedArtifacts = null;
         defer if (cached_artifacts) |*ca| ca.deinit();
@@ -375,10 +404,6 @@ pub const Analyzer = struct {
             }
         }
 
-        // Initialize result early so we can use its stats field
-        var result = AnalysisResult.init();
-        errdefer result.deinit(self.allocator);
-
         // Use a temporary list for diagnostics created with scratch allocator
         var scratch_diagnostics: std.ArrayList(Diagnostic) = .empty;
         defer {
@@ -397,7 +422,8 @@ pub const Analyzer = struct {
 
         // Transfer diagnostics from scratch allocator to persistent allocator
         for (scratch_diagnostics.items) |diag| {
-            const cloned = try diag.clone(self.allocator);
+            var cloned = try diag.clone(self.allocator);
+            errdefer cloned.deinit(self.allocator);
             try result.diagnostics.append(self.allocator, cloned);
         }
 
@@ -419,6 +445,33 @@ pub const Analyzer = struct {
 
         log.debug("analyzeResult: done {s}", .{file_path});
         return result;
+    }
+
+    fn appendParseErrors(
+        source: *Source,
+        tree: *const std.zig.Ast,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+    ) !void {
+        var message: std.Io.Writer.Allocating = .init(allocator);
+        defer message.deinit();
+        for (tree.errors) |parse_error| {
+            message.writer.end = 0;
+            tree.renderError(parse_error, &message.writer) catch return error.OutOfMemory;
+            const offset = tree.tokens.items(.start)[parse_error.token] + tree.errorOffset(parse_error);
+            const location = try source.byteToLocation(offset);
+            var diagnostic = try Diagnostic.initAtLocation(
+                allocator,
+                source.getFilePath(),
+                "parse-error",
+                if (parse_error.is_note) .hint else .err,
+                message.written(),
+                location.line,
+                location.column,
+            );
+            errdefer diagnostic.deinit(allocator);
+            try diagnostics.append(allocator, diagnostic);
+        }
     }
 
     /// Filter suppressed diagnostics in a standalone list.
@@ -453,19 +506,58 @@ pub const Analyzer = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         analysis_stats: *checker_mod.AnalysisStats,
     ) !void {
-        var type_ctx = TypeContext.init(scratch_allocator, source);
-        defer type_ctx.deinit();
-        if (self.project_sources) |*project| {
-            type_ctx.project_resolver = project.resolverForPath(source.getFilePath());
+        var type_ctx: ?TypeContext = if (self.needsTypeInformation())
+            TypeContext.init(scratch_allocator, source)
+        else
+            null;
+        defer if (type_ctx) |*ctx| ctx.deinit();
+
+        var types_available = false;
+        if (type_ctx) |*ctx| {
+            if (self.project_sources) |*project| {
+                ctx.project_resolver = project.resolverForPath(source.getFilePath());
+            }
+            types_available = available: {
+                ctx.ensureAvailable() catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    const message = try std.fmt.allocPrint(
+                        scratch_allocator,
+                        "Type information is unavailable with embedded Zig {s}: {s}. " ++
+                            "Required typed checks are skipped; optional checks use AST fallback.",
+                        .{ @import("builtin").zig_version_string, @errorName(err) },
+                    );
+                    defer scratch_allocator.free(message);
+                    var diagnostic = try Diagnostic.initAtLocation(
+                        scratch_allocator,
+                        source.getFilePath(),
+                        "frontend-error",
+                        .err,
+                        message,
+                        1,
+                        1,
+                    );
+                    errdefer diagnostic.deinit(scratch_allocator);
+                    try diagnostics.append(scratch_allocator, diagnostic);
+                    break :available false;
+                };
+                break :available true;
+            };
+
+            var builder = checker_mod.CfgBuilder.initWithTypes(scratch_allocator, ctx);
+            var cfgs = cached_artifacts.cfgs.valueIterator();
+            while (cfgs.next()) |cfg| {
+                checker_mod.CfgBuilder.TypeAnnotation.restoreDeclarationTypes(&builder, cfg.*, source);
+            }
         }
-        log.debug("type context: created for {s}, available={}", .{
-            source.getFilePath(),
-            type_ctx.isAvailable(),
-        });
+
+        // Cached engines borrow the context and CFGs, so they must be released first.
+        var analysis_cache = AnalysisCache.init(scratch_allocator);
+        defer analysis_cache.deinit();
 
         const context = checker_mod.CheckerContext{
             .build_metadata = self.getBuildMetadata(),
-            .type_context = &type_ctx,
+            .type_context = if (type_ctx) |*ctx| ctx else null,
+            .analysis_cache = &analysis_cache,
             .analysis_stats = analysis_stats,
             .analysis_limits = .{
                 .max_worklist_steps = self.max_worklist_steps,
@@ -481,9 +573,10 @@ pub const Analyzer = struct {
             .io_context = self.getIoContext(),
         };
 
-        // Run native checkers
+        // Run native checkers with one annotation mode for the shared CFG artifacts.
         for (self.checker_manager.checkers.items) |chkr| {
             if (self.isRuleEnabled(chkr.name)) {
+                if (chkr.type_requirement == .required and !types_available) continue;
                 log.debug("checker: start {s} ({s})", .{ source.getFilePath(), chkr.name });
                 try chkr.checkAst(source, scratch_allocator, diagnostics, context);
                 log.debug("checker: done {s} ({s})", .{ source.getFilePath(), chkr.name });
@@ -644,11 +737,13 @@ test "Analyzer.isRuleEnabled: blocklist" {
     try std.testing.expect(analyzer.isRuleEnabled("other-rule"));
 }
 
-test "Analyzer.shouldRunProjectUnusedDecls follows rule filter" {
+test "Analyzer.shouldRunProjectUnusedDecls requires registration and follows rule filter" {
     const allocator = std.testing.allocator;
     var analyzer = Analyzer.init(allocator);
     defer analyzer.deinit();
 
+    try std.testing.expect(!analyzer.shouldRunProjectUnusedDecls());
+    try analyzer.registerRule(&UnusedDeclRule.rule);
     try std.testing.expect(analyzer.shouldRunProjectUnusedDecls());
 
     const allowlist = [_][]const u8{"todo"};
@@ -768,7 +863,6 @@ test "Analyzer cache enabled" {
 test "Analyzer cache hit still produces diagnostics" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const DupeImportRule = @import("rules/dupe_import.zig").DupeImportRule;
 
     var io_context = try compat.Context.init(allocator, 1);
     defer io_context.deinit();
@@ -811,11 +905,275 @@ test "Analyzer cache hit still produces diagnostics" {
     }
 }
 
+test "Analyzer reports parse errors and continues valid project siblings" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    try temp_dir.writeFile("invalid.zig", "const broken = ;\n");
+    try temp_dir.writeFile("valid.zig", "const first = @import(\"std\");\nconst second = @import(\"std\");\n");
+    const invalid_path = try std.fmt.allocPrint(allocator, "{s}/invalid.zig", .{temp_dir.path()});
+    defer allocator.free(invalid_path);
+    const valid_path = try std.fmt.allocPrint(allocator, "{s}/valid.zig", .{temp_dir.path()});
+    defer allocator.free(valid_path);
+    var analyzer = Analyzer.initWithContext(allocator, &io_context);
+    defer analyzer.deinit();
+    try analyzer.registerRule(&DupeImportRule.rule);
+    try analyzer.registerRule(&UnusedDeclRule.rule);
+    try analyzer.prepareProject(&.{ invalid_path, valid_path });
+    try analyzer.analyzeFile(invalid_path);
+    try analyzer.analyzeFile(valid_path);
+    try analyzer.analyzeProjectUnusedDecls();
+
+    var parse_errors: usize = 0;
+    var duplicate_imports: usize = 0;
+    for (analyzer.diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.file_path, invalid_path)) {
+            try testing.expectEqualStrings("parse-error", diagnostic.rule_id);
+            try testing.expectEqual(@as(usize, 1), diagnostic.range.start.line);
+            if (diagnostic.severity == .err) parse_errors += 1;
+        }
+        if (std.mem.eql(u8, diagnostic.rule_id, "dupe-import")) {
+            try testing.expectEqualStrings(valid_path, diagnostic.file_path);
+            duplicate_imports += 1;
+        }
+    }
+    try testing.expect(parse_errors != 0);
+    try testing.expectEqual(@as(usize, 1), duplicate_imports);
+}
+
+test "Analyzer gates frontend failures by checker type requirements" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const SyntaxChecker = @import("checkers/unreachable_code_checker.zig").UnreachableCodeChecker;
+    const cases = [_]struct {
+        requirement: checker_mod.TypeRequirement,
+        frontend_failure: bool,
+        reports_unreachable: bool,
+    }{
+        .{ .requirement = .optional, .frontend_failure = true, .reports_unreachable = true },
+        .{ .requirement = .required, .frontend_failure = true, .reports_unreachable = false },
+        .{ .requirement = .required, .frontend_failure = false, .reports_unreachable = true },
+    };
+    for (cases) |case| {
+        const code: [:0]const u8 = if (case.frontend_failure)
+            "const x = @zwanzigUnsupportedBuiltin();\nfn foo() void { if (false) {} }"
+        else
+            "fn foo() void { if (false) {} }";
+        var source = Source.init(allocator, "frontend.zig", code);
+        defer source.deinit();
+        var artifacts = CachedArtifacts.init(allocator);
+        defer artifacts.deinit();
+        var result = AnalysisResult.init();
+        defer result.deinit(allocator);
+        var checker = SyntaxChecker.checker;
+        checker.type_requirement = case.requirement;
+        var analyzer = Analyzer.init(allocator);
+        defer analyzer.deinit();
+        try analyzer.registerChecker(&checker);
+        try analyzer.runChecksOnSource(&source, allocator, &artifacts, &result.diagnostics, &result.stats);
+
+        var frontend_errors: usize = 0;
+        var unreachable_reports: usize = 0;
+        for (result.diagnostics.items) |diagnostic| {
+            if (std.mem.eql(u8, diagnostic.rule_id, "frontend-error")) frontend_errors += 1;
+            if (std.mem.eql(u8, diagnostic.rule_id, "unreachable-code-engine")) unreachable_reports += 1;
+        }
+        try testing.expectEqual(@as(usize, @intFromBool(case.frontend_failure)), frontend_errors);
+        try testing.expectEqual(@as(usize, @intFromBool(case.reports_unreachable)), unreachable_reports);
+    }
+}
+
+test "Analyzer disabled typed checkers leave AST-only CFG analysis lazy" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var ast_only = OptionalUnwrapEngineChecker.checker;
+    ast_only.type_requirement = .none;
+    const disabled = Checker{ .name = "disabled-typed", .type_requirement = .required };
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+    try analyzer.registerChecker(&ast_only);
+    try analyzer.registerChecker(&disabled);
+    analyzer.setRuleFilter(.{ .allowlist = &.{"optional-unwrap"} });
+    try analyzer.prepareProject(&.{"missing-file-must-not-be-read.zig"});
+    try testing.expect(analyzer.project_sources == null);
+
+    var source = Source.init(allocator, "ast-only.zig", "const Bad = @zwanzigUnsupportedBuiltin();\n" ++
+        "fn foo() u8 { const value: ?u8 = null; return value.?; }");
+    defer source.deinit();
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    var result = AnalysisResult.init();
+    defer result.deinit(allocator);
+    try analyzer.runChecksOnSource(&source, allocator, &artifacts, &result.diagnostics, &result.stats);
+    try testing.expect(!source.zir_load_attempted);
+    try testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+    try testing.expectEqualStrings("optional-unwrap", result.diagnostics.items[0].rule_id);
+}
+
+test "Analyzer failed diagnostic insertion releases its persistent clone" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    try temp_dir.writeFile("duplicate.zig", "const first = @import(\"std\");\nconst second = @import(\"std\");\n");
+    const path = try std.fmt.allocPrint(allocator, "{s}/duplicate.zig", .{temp_dir.path()});
+    defer allocator.free(path);
+    var failing = testing.FailingAllocator.init(allocator, .{});
+    var analyzer = Analyzer.initWithContext(failing.allocator(), &io_context);
+    defer analyzer.deinit();
+    try analyzer.registerRule(&DupeImportRule.rule);
+    // Allow the message clone, then fail growth of the persistent diagnostic list.
+    failing.fail_index = failing.alloc_index + 1;
+    try testing.expectError(error.OutOfMemory, analyzer.analyzeFileResultWithScratchAllocator(path, allocator));
+}
+
+test "Analyzer.mergeResult preserves diagnostics and statistics on allocation failure" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    try temp_dir.writeFile("first.zig", "fn first() u8 { const value: ?u8 = null; return value.?; }\n");
+    try temp_dir.writeFile("second.zig", "fn second() u8 { const value: ?u8 = null; return value.?; }\n");
+    var first_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const first_path = try std.fmt.bufPrint(
+        &first_path_buffer,
+        "{s}/first.zig",
+        .{temp_dir.path()},
+    );
+    var second_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const second_path = try std.fmt.bufPrint(
+        &second_path_buffer,
+        "{s}/second.zig",
+        .{temp_dir.path()},
+    );
+
+    var failing = testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    {
+        var analyzer = Analyzer.initWithContext(failing.allocator(), &io_context);
+        defer analyzer.deinit();
+        try analyzer.registerChecker(&OptionalUnwrapEngineChecker.checker);
+        try analyzer.diagnostics.ensureTotalCapacityPrecise(analyzer.allocator, 1);
+        var first = try analyzer.analyzeFileResultWithScratchAllocator(first_path, allocator);
+        defer first.deinit(analyzer.allocator);
+        var second = try analyzer.analyzeFileResultWithScratchAllocator(second_path, allocator);
+        defer second.deinit(analyzer.allocator);
+        try testing.expectEqual(@as(usize, 1), first.diagnostics.items.len);
+        try testing.expectEqual(@as(usize, 1), second.diagnostics.items.len);
+        try testing.expect(first.stats.total_runs > 0);
+        try testing.expect(second.stats.total_runs > 0);
+        const first_stats = first.stats;
+        const second_stats = second.stats;
+        var first_diagnostic = try first.diagnostics.items[0].clone(allocator);
+        defer first_diagnostic.deinit(allocator);
+        var second_diagnostic = try second.diagnostics.items[0].clone(allocator);
+        defer second_diagnostic.deinit(allocator);
+
+        try analyzer.mergeResult(&first);
+        try testing.expectEqual(@as(usize, 0), first.diagnostics.items.len);
+        try testing.expectEqualDeep(first_stats, first.stats);
+        try testing.expectEqualDeep(first_stats, analyzer.analysis_stats);
+
+        // Fail growth after one committed result; both owners must remain unchanged.
+        failing.fail_index = failing.alloc_index;
+        try testing.expectError(error.OutOfMemory, analyzer.mergeResult(&second));
+        try testing.expect(failing.has_induced_failure);
+        try testing.expectEqualDeep(first_stats, analyzer.analysis_stats);
+        try testing.expectEqual(@as(usize, 1), analyzer.diagnostics.items.len);
+        try testing.expectEqualDeep(first_diagnostic, analyzer.diagnostics.items[0]);
+        try testing.expectEqual(@as(usize, 1), second.diagnostics.items.len);
+        try testing.expectEqualDeep(second_diagnostic, second.diagnostics.items[0]);
+        try testing.expectEqualDeep(second_stats, second.stats);
+
+        failing.fail_index = std.math.maxInt(usize);
+        try analyzer.mergeResult(&second);
+        var expected_stats = first_stats;
+        expected_stats.merge(second_stats);
+        try testing.expectEqualDeep(expected_stats, analyzer.analysis_stats);
+        try testing.expectEqualDeep(second_stats, second.stats);
+        try testing.expectEqual(@as(usize, 0), second.diagnostics.items.len);
+        try testing.expectEqual(@as(usize, 2), analyzer.diagnostics.items.len);
+        try testing.expectEqualDeep(first_diagnostic, analyzer.diagnostics.items[0]);
+        try testing.expectEqualDeep(second_diagnostic, analyzer.diagnostics.items[1]);
+    }
+    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "Analyzer restores cached declaration types from the live source" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const Cfg = checker_mod.Cfg;
+    const CfgBuilder = checker_mod.CfgBuilder;
+    const IrNode = @import("cfg.zig").IrNode;
+    const TypeInfo = checker_mod.TypeInfo;
+    const content: [:0]const u8 = "const data: []const u8 = \"hello\";";
+    var cold_source = Source.init(allocator, "types.zig", content);
+    defer cold_source.deinit();
+    var cold_types = TypeContext.init(allocator, &cold_source);
+    defer cold_types.deinit();
+    try cold_types.ensureAvailable();
+    const cold_tree = try cold_source.ast();
+    const declaration: u32 = @intFromEnum(cold_tree.rootDecls()[0]);
+    var builder = CfgBuilder.initWithTypes(allocator, &cold_types);
+    var cold_artifacts = CachedArtifacts.init(allocator);
+    defer cold_artifacts.deinit();
+    const cold_cfg = owned: {
+        const cfg = try allocator.create(Cfg);
+        cfg.* = Cfg.init(allocator);
+        errdefer {
+            cfg.deinit();
+            allocator.destroy(cfg);
+        }
+        cfg.entry = try cfg.addNode(IrNode.init(.fn_entry));
+        _ = try cfg.addNode(CfgBuilder.TypeAnnotation.annotateWithType(
+            &builder,
+            IrNode.initWithAst(.var_decl, declaration),
+            &cold_source,
+            declaration,
+        ));
+        _ = try cfg.addNode(IrNode.initWithAst(.try_expr, declaration).withType(TypeInfo.initErrorUnion()));
+        _ = try cfg.addNode(IrNode.initWithAst(.catch_expr, declaration).withType(TypeInfo.initErrorUnion()));
+        cfg.exit = try cfg.addNode(IrNode.init(.fn_exit));
+        try cold_artifacts.addCfg(declaration, cfg);
+        break :owned cfg;
+    };
+    const cold_type = cold_cfg.nodes.items[1].ir_node.type_info orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(TypeInfo.TypeKind.slice, cold_type.kind);
+    try testing.expect(cold_type.payload_node != null);
+    const encoded = try cold_artifacts.serialize(allocator);
+    defer allocator.free(encoded);
+
+    var warm_source = Source.init(allocator, "types.zig", content);
+    defer warm_source.deinit();
+    var warm_artifacts = try CachedArtifacts.deserialize(allocator, encoded);
+    defer warm_artifacts.deinit();
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+    try analyzer.registerChecker(&OptionalUnwrapEngineChecker.checker);
+    var result = AnalysisResult.init();
+    defer result.deinit(allocator);
+    try analyzer.runChecksOnSource(&warm_source, allocator, &warm_artifacts, &result.diagnostics, &result.stats);
+    const warm_cfg = warm_artifacts.getCfg(declaration) orelse return error.TestUnexpectedResult;
+    const warm_type = warm_cfg.nodes.items[1].ir_node.type_info orelse return error.TestUnexpectedResult;
+    var expected = cold_type;
+    expected.type_ast = try warm_source.ast();
+    try testing.expectEqualDeep(expected.type_str, warm_type.type_str);
+    expected.type_str = warm_type.type_str;
+    try testing.expectEqual(expected, warm_type);
+    try testing.expect(warm_type.type_ast.? != cold_type.type_ast.?);
+    try testing.expectEqual(TypeInfo.TypeKind.error_union, warm_cfg.nodes.items[2].ir_node.type_info.?.kind);
+    try testing.expectEqual(TypeInfo.TypeKind.error_union, warm_cfg.nodes.items[3].ir_node.type_info.?.kind);
+}
+
 test "Analyzer project cache invalidates imported source changes" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const OptionalUnwrapEngineChecker =
-        @import("checkers/optional_unwrap_engine.zig").OptionalUnwrapEngineChecker;
 
     var io_context = try compat.Context.init(allocator, 1);
     defer io_context.deinit();

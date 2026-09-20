@@ -201,6 +201,15 @@ pub const ConstraintManager = struct {
             self.null_constraints.deinit(allocator);
             self.bool_constraints.deinit(allocator);
         }
+
+        fn clone(self: *const VarConstraintLists, allocator: std.mem.Allocator) !VarConstraintLists {
+            var result: VarConstraintLists = .{};
+            errdefer result.deinit(allocator);
+            result.int_constraints = try self.int_constraints.clone(allocator);
+            result.null_constraints = try self.null_constraints.clone(allocator);
+            result.bool_constraints = try self.bool_constraints.clone(allocator);
+            return result;
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) ConstraintManager {
@@ -221,13 +230,19 @@ pub const ConstraintManager = struct {
         self.per_var_constraints.deinit();
     }
 
-    pub fn clone(self: *const ConstraintManager) !ConstraintManager {
-        var new_cm = ConstraintManager.init(self.allocator);
+    /// Copy constraints and their indexes without repeating contradiction checks.
+    pub fn clone(self: *const ConstraintManager, allocator: std.mem.Allocator) !ConstraintManager {
+        var new_cm = ConstraintManager.init(allocator);
         errdefer new_cm.deinit();
-        for (self.constraints.items) |c| {
-            try new_cm.addConstraint(c);
-        }
+        new_cm.constraints = try self.constraints.clone(allocator);
         new_cm.has_contradiction = self.has_contradiction;
+
+        try new_cm.per_var_constraints.ensureTotalCapacity(self.per_var_constraints.count());
+        var iter = self.per_var_constraints.iterator();
+        while (iter.next()) |entry| {
+            const lists = try entry.value_ptr.clone(allocator);
+            new_cm.per_var_constraints.putAssumeCapacityNoClobber(entry.key_ptr.*, lists);
+        }
         return new_cm;
     }
 
@@ -701,20 +716,114 @@ test "ConstraintManager basic operations" {
     try testing.expectEqual(@as(usize, 2), cm.size());
 }
 
-test "ConstraintManager cloning" {
+test "ConstraintManager clones keep independent contradiction checks" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
+    var env = Environment.init(allocator);
+    defer env.deinit();
     var cm = ConstraintManager.init(allocator);
     defer cm.deinit();
 
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .gt, 0));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .lt, 10));
+    try cm.addConstraint(Constraint.nullCheck(ids.varId(2), false));
+    try cm.addConstraint(Constraint.boolCheck(ids.varId(3), true));
+    try cm.addConstraint(Constraint.varCompare(ids.varId(1), .le, ids.varId(4)));
+    try cm.addConstraint(Constraint.literalBool(true));
+
+    const conflicts = [_]Constraint{
+        Constraint.intCompare(ids.varId(1), .le, 0),
+        Constraint.intCompare(ids.varId(1), .ge, 10),
+        Constraint.nullCheck(ids.varId(2), true),
+        Constraint.boolCheck(ids.varId(3), false),
+    };
+    for (conflicts) |conflict| {
+        var copy = try cm.clone(allocator);
+        defer copy.deinit();
+        try testing.expect(cm.eql(&copy));
+        try testing.expectEqual(cm.computeHash(), copy.computeHash());
+        try testing.expect(copy.isSatisfiable(&env));
+
+        try copy.addConstraint(conflict);
+        try testing.expect(!copy.isSatisfiable(&env));
+        try testing.expect(cm.isSatisfiable(&env));
+    }
+}
+
+test "ConstraintManager cloning preserves infeasible paths" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var env = Environment.init(allocator);
+    defer env.deinit();
+    var cm = ConstraintManager.init(allocator);
+    defer cm.deinit();
     try cm.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 42));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .ne, 42));
     try cm.addConstraint(Constraint.nullCheck(ids.varId(2), true));
 
-    var cm2 = try cm.clone();
-    defer cm2.deinit();
+    var copy = try cm.clone(allocator);
+    defer copy.deinit();
+    try testing.expect(cm.eql(&copy));
+    try testing.expectEqual(cm.computeHash(), copy.computeHash());
+    try testing.expect(!copy.isSatisfiable(&env));
+    try testing.expect(!cm.isSatisfiable(&env));
+}
 
-    try testing.expect(cm.eql(&cm2));
+test "ConstraintManager clone outlives its source allocator" {
+    const testing = std.testing;
+    var env = Environment.init(testing.allocator);
+    defer env.deinit();
+
+    var copy = blk: {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var source = ConstraintManager.init(arena.allocator());
+        defer source.deinit();
+        try source.addConstraint(Constraint.intCompare(ids.varId(1), .gt, 0));
+        try source.addConstraint(Constraint.intCompare(ids.varId(1), .lt, 10));
+        try source.addConstraint(Constraint.nullCheck(ids.varId(2), false));
+        try source.addConstraint(Constraint.boolCheck(ids.varId(3), true));
+
+        break :blk try source.clone(testing.allocator);
+    };
+    defer copy.deinit();
+
+    try testing.expect(copy.isSatisfiable(&env));
+    try env.set(ids.varId(1), .{ .concrete_int = 12 });
+    try testing.expect(!copy.isSatisfiable(&env));
+    env.remove(ids.varId(1));
+    try copy.addConstraint(Constraint.boolCheck(ids.varId(3), false));
+    try testing.expect(!copy.isSatisfiable(&env));
+}
+
+test "ConstraintManager cloning cleans up partial constraint lists on allocation failure" {
+    const testing = std.testing;
+    var source = ConstraintManager.init(testing.allocator);
+    defer source.deinit();
+    for (1..3) |index| {
+        const var_id = ids.varId(@intCast(index));
+        try source.addConstraint(Constraint.intCompare(var_id, .gt, 0));
+        try source.addConstraint(Constraint.intCompare(var_id, .lt, 10));
+        try source.addConstraint(Constraint.nullCheck(var_id, false));
+        try source.addConstraint(Constraint.boolCheck(var_id, true));
+    }
+    const source_hash = source.computeHash();
+
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, original: *const ConstraintManager) !void {
+            var copy = try original.clone(allocator);
+            defer copy.deinit();
+            try std.testing.expect(original.eql(&copy));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Harness.run, .{&source});
+    try testing.expectEqual(source_hash, source.computeHash());
+    var env = Environment.init(testing.allocator);
+    defer env.deinit();
+    try source.addConstraint(Constraint.nullCheck(ids.varId(2), true));
+    try testing.expect(!source.isSatisfiable(&env));
 }
 
 test "ConstraintManager satisfiability with environment" {

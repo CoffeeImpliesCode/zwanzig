@@ -1,6 +1,6 @@
 # Zig 0.16.0 Migration Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> This document retains the migration history and tracks remaining verification. Do not replay completed implementation steps as current instructions.
 
 **Goal:** Ship zwanzig as two engine binaries built from one source tree — one embedding the Zig 0.15.2 frontend (for analyzing 0.15.2 projects) and one embedding the Zig 0.16.0 frontend (for 0.16.0 projects) — with explicit failure on frontend/language mismatch.
 
@@ -8,35 +8,62 @@
 
 **Tech Stack:** Zig 0.15.2 and 0.16.0, Nix flakes (mitchellh/zig-overlay), just, GitHub Actions.
 
-**Spec:** The "Verified findings" section below — every claim in it was verified against this repository and against the `0.15.2`/`0.16.0` tags of ziglang/zig on 2026-08-21.
+**Evidence:** The historical findings record the 2026-08-21 repository and Zig source investigation. They are not a description of the current checkout.
+
+## Current status
+
+- Version-specific I/O and ZIR adapters, frontend fixtures, and dual-frontend CI and release configurations are implemented.
+- Typed preflight follows enabled checker demand. Frontend failures emit `frontend-error`. Required typed checks skip the file, while optional checks can use AST fallback.
+- Parser errors emit diagnostics and skip malformed files without stopping valid sibling files. Both pinned frontends reject `usingnamespace`.
+- CLI smoke checks passed under both frontends for parser recovery, frontend mismatch reporting, AST-only selections, cold/warm cache equivalence, and one-worker/two-worker diagnostic equivalence.
+- Full `just test` and `just lint` gates passed under both pinned frontends, including analyzer self-checks. Zig 0.15.2 formatting passed.
+- A successful release tag and its published artifacts remain external verification. The open Task 10 checklist still applies.
+
+Both Nix shells currently apply the Darwin SDK workaround. The 2026-08-21 inventory recorded a successful 0.16 build without it on one Darwin host. That result does not establish that every supported Darwin host can omit it. This Linux session cannot verify Darwin behavior. Keep the workaround until supported-host evidence justifies its removal.
+
+## Current developer commands
+
+```bash
+nix develop                             # Default: Zig 0.16.0
+nix develop .#zig015                     # Compatibility: Zig 0.15.2
+nix develop -c just test
+nix develop -c just lint
+nix develop .#zig015 -c just test
+nix develop .#zig015 -c just lint
+nix develop .#zig015 -c just fmt          # Sole canonical formatter
+nix develop .#zig015 -c zig fmt --check src/
+```
+
+Use these commands for future changes. The current gate results are recorded above.
 
 ## Global Constraints
 
-- Default dev toolchain stays **exactly Zig 0.15.2** (`flake.nix` devShell `default`); `build.zig.zon` keeps `.minimum_zig_version = "0.15.2"`. The upper/exact support boundary is enforced by `src/compat.zig`, not by `build.zig.zon`.
-- Every task ends with `just test` and `just lint` green under the default (0.15.2) shell. `just lint` runs zwanzig on its own source.
-- All code formatted with `zig fmt` from Zig 0.15.2, the sole canonical formatter; the 0.16.0 CI leg validates the remaining lint checks and analyzer behavior.
-- ArrayList init uses `.empty`, allocator passed to methods (Zig 0.15.2 style, see CLAUDE.md).
-- No silent degradation: a frontend/language mismatch must produce an explicit failure, never incomplete type information (project rule: no speculative fallbacks).
-- User-visible changes get a `CHANGELOG.md` entry under `## [Unreleased]`.
-- Once dual support lands (Phase 2+), all zwanzig source must stay within the syntax subset parseable by **both** embedded frontends.
+- The default development shell pins Zig 0.16.0. The compatibility shell `.#zig015` pins Zig 0.15.2.
+- `build.zig.zon` keeps `.minimum_zig_version = "0.15.2"`. `src/compat.zig` enforces the exact supported versions.
+- Code changes require `just test` and `just lint` under both pinned shells. `just lint` includes analyzer self-checks.
+- Zig 0.15.2 is the sole canonical formatter. The 0.16.0 lint leg skips formatting but runs the other checks.
+- ArrayLists use `.empty` and receive an allocator in methods that need one. See `CLAUDE.md`.
+- A frontend mismatch must produce an explicit diagnostic. Unavailable typed analysis must not appear complete. Optional AST fallback remains explicit.
+- User-visible changes get an entry under `CHANGELOG.md`'s `## [Unreleased]`. Include an issue or PR number only when one exists.
+- Shared analyzer source must remain parseable by both embedded frontends.
 - Temporary files go to `.tmp/` in the project root, never `/tmp`.
 
-## Verified findings
+## Historical findings (2026-08-21)
 
-Facts this plan is built on. "Verified" means checked against the actual repo code and/or the actual Zig source at tags `0.15.2` and `0.16.0` (Codeberg).
+The following findings describe the repository at the start of the migration. Compiler facts were checked against Zig tags `0.15.2` and `0.16.0`. Paths, line numbers, missing checks, and toolchain pins below are historical. Item 12 records questions that were still open at that point.
 
-1. **ZIR generation is in-process** at `src/zir/bridge.zig:69` (`AstGen.generate`); declaration traversal uses `zir.declIterator` at `src/zir/bridge.zig:302` and `:322`. (`src/zir_bridge.zig` is only a re-export shim.)
-2. **`AstGen.generate` returns only `Allocator.Error`** in both 0.15.2 and 0.16.0 (`pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir`). Language errors are recorded *inside* the returned Zir and only visible via `zir.hasCompileErrors()`. The bridge never calls it, so unsupported syntax currently yields silently incomplete type info. Reproduced locally: `zig ast-check` under 0.15.2 rejects `@Int` ("invalid builtin function") while `@Type` passes.
+1. **ZIR generation was in-process** at `src/zir/bridge.zig:69` (`AstGen.generate`). Declaration traversal used `zir.declIterator` at `src/zir/bridge.zig:302` and `:322`. `src/zir_bridge.zig` was a re-export shim.
+2. **`AstGen.generate` returns only `Allocator.Error`** in both 0.15.2 and 0.16.0 (`pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir`). Language errors are recorded *inside* the returned Zir and only visible via `zir.hasCompileErrors()`. The bridge did not call it then, so unsupported syntax could yield silently incomplete type information. Reproduced locally: `zig ast-check` under 0.15.2 rejects `@Int` ("invalid builtin function") while `@Type` passes.
 3. **`Ast.parse` and `AstGen.generate` signatures are unchanged** between 0.15.2 and 0.16.0 — the bridge entry points are stable.
 4. **Zir decoding API changed**: 0.16.0 removed `declIterator` and added `typeDecls`, `getStructDecl`, `getUnionDecl`, `getEnumDecl`, `getSwitchBlock` (verified by diffing `lib/std/zig/Zir.zig` between tags). `hasCompileErrors` exists in both.
 5. **`@Type` was replaced** in 0.16 by 8 builtins including `@Int` (proposal #10710) — so each frontend rejects the other's metaprogramming syntax at AstGen time.
 6. **0.16 I/O**: all fs/process/time APIs require a `std.Io` instance; `std.fs.cwd()` → `std.Io.Dir.cwd()`; `std.Thread.Pool` is removed in favor of `std.Io.Group`/`Io.async`/`Io.Mutex` with `std.Io.Threaded` as the threaded backend (verified in 0.16.0 release notes and `lib/std/Io.zig`).
-7. **The lowercase `std.io` alias exists in 0.15.2 (`pub const io = Io`) and is gone in 0.16.0.** The new `std.Io.Writer` API is available in 0.15.2, so writer modernization can land now and stay shared.
-8. **Repo footprint**: `std.fs` is used across ~15 files (heaviest: `src/cache.zig`, `src/cli/run.zig`); `std.Thread.Pool`/`WaitGroup` in `src/cli/run.zig:45–75`; `std.io.*` at 8 sites (all listed in Task 2); legacy-style `format` methods at `src/types/type_info.zig:91` and `src/cache.zig:60`.
-9. **Cache key** (`src/cache.zig`) hashes only the zwanzig `tool_version`; `builtin.zig_version` appears nowhere in the codebase. Two zwanzig binaries with different embedded frontends would share `.zwanzig-cache` entries.
-10. **Toolchain pins**: `flake.nix:35` (0.15.2 + macOS 26.x SDK workaround for [ziglang/zig#31756](https://codeberg.org/ziglang/zig/issues/31756)), `.github/workflows/release.yml:20`/`48` (0.15.2), single CI build environment.
-11. **`build.zig` itself uses `std.fs.cwd()`** at lines 87 and 132 and is compiled by whichever toolchain builds the project — it must compile under both, via `comptime` branches, and cannot live behind `src/compat/`.
-12. **Unverified (to be settled by Task 6):** the exact 0.16 compile-error inventory (an external probe reported 19 main-test + 7 fixture-test errors — plausible, not reproduced) and the assumption that AST/token rules need no per-version changes.
+7. **The lowercase `std.io` alias exists in 0.15.2 (`pub const io = Io`) and is gone in 0.16.0.** `std.Io.Writer` was already available in 0.15.2, which allowed a shared writer migration.
+8. **Historical repository footprint:** `std.fs` appeared in about 15 files, with heavy use in `src/cache.zig` and `src/cli/run.zig`. `src/cli/run.zig:45–75` used `std.Thread.Pool`/`WaitGroup`. Task 2 listed eight `std.io.*` sites. Legacy `format` methods appeared at `src/types/type_info.zig:91` and `src/cache.zig:60`.
+9. **Historical cache key:** `src/cache.zig` hashed only `tool_version`, without a frontend identity. Task 3 corrected the resulting cross-frontend cache collision risk.
+10. **Historical toolchain pins:** `flake.nix:35` and `.github/workflows/release.yml:20`/`48` used 0.15.2, with one CI build environment. The Nix shell included the macOS SDK workaround for [ziglang/zig#31756](https://codeberg.org/ziglang/zig/issues/31756).
+11. **Historical build-script dependency:** `build.zig:87` and `:132` used `std.fs.cwd()`. This required build-script compatibility branches, separate from `src/compat/`.
+12. **Open at the time:** the exact 0.16 compile-error inventory and AST/token-rule compatibility. Task 6 later recorded 16 main-target and 8 fixture-target errors, not the external estimate of 19 and 7.
 
 Sources: [0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html), [0.16.0 announcement](https://ziglang.org/news/0.16.0-released/), `Zir.zig`/`AstGen.zig`/`Ast.zig`/`std.zig`/`Io.zig` at tags [0.15.2](https://codeberg.org/ziglang/zig/src/tag/0.15.2/lib/std) and [0.16.0](https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/std).
 
@@ -49,9 +76,13 @@ Sources: [0.16.0 release notes](https://ziglang.org/download/0.16.0/release-note
 
 ---
 
+## Historical implementation record (2026-08-21)
+
+Tasks 1–6 retain their original implementation steps, snippets, and recorded checks. Their commands describe the historical checkout, where the default shell was 0.15.2 and `.#zig016` selected 0.16.0. Use the current developer commands above for this checkout. Historical checkmarks do not establish validation of the current changes.
+
 ### Task 1: Fail explicitly when AstGen records compile errors
 
-The bridge treats `AstGen.generate`'s error return as the failure signal, but that error set is `Allocator.Error` only — real language errors (e.g. 0.16-only syntax analyzed by a 0.15.2 binary) are recorded inside the Zir and currently ignored, producing silently incomplete type info.
+Historical starting point: the bridge checked only `AstGen.generate`'s allocator error return. It ignored language errors stored inside Zir. This task added the compile-error guard. The current analyzer also reports frontend failure and applies each checker's typed-analysis requirement.
 
 **Files:**
 - Modify: `src/zir/bridge.zig:69-71` (guard) and test section (~line 1205)
@@ -87,7 +118,7 @@ test "ZirBridge rejects source with AstGen compile errors" {
 - [x] **Step 2: Run the test to verify it fails**
 
 Run: `nix develop -c zig build test`
-Expected: FAIL — `loadFromSource` currently succeeds on this input, so `expectError` reports "expected error.AstGenFailed, found …void".
+Historical pre-fix expectation: FAIL. `loadFromSource` succeeded on this input, so `expectError` reported "expected error.AstGenFailed, found …void".
 
 - [x] **Step 3: Implement the guard** in `loadFromSource` (`src/zir/bridge.zig:69-71`). Replace:
 
@@ -265,7 +296,7 @@ test "CacheKey version hash includes the embedded Zig frontend version" {
 - [x] **Step 2: Run it to verify it fails**
 
 Run: `nix develop -c zig build test`
-Expected: FAIL — today `version_hash` is exactly `sha256(tool_version)`.
+Historical pre-fix expectation: FAIL. `version_hash` was exactly `sha256(tool_version)`.
 
 - [x] **Step 3: Implement.** Add `const builtin = @import("builtin");` to `src/cache.zig` imports (not currently imported). Replace line 47:
 
@@ -415,7 +446,7 @@ git commit -m "feat: reject untested Zig toolchains at compile time"
 
 If the overlay doesn't know 0.16.0 yet, run `nix flake update zig` first (zig-overlay tracks tagged releases).
 
-Deliberately *without* the macOS SDK workaround: it exists for a 0.15.2 linker limitation ([ziglang/zig#31756](https://codeberg.org/ziglang/zig/issues/31756)); Task 6 determines whether 0.16.0 still needs it.
+The original 0.16 shell omitted the macOS SDK workaround for the Task 6 probe. This snippet is historical. Both current shells apply the workaround for [ziglang/zig#31756](https://codeberg.org/ziglang/zig/issues/31756). A successful build on one Darwin host does not justify removing it for other supported SDKs.
 
 - [x] **Step 2: Verify both shells**
 
@@ -459,7 +490,7 @@ Run: `nix develop .#zig016 -c zig build test 2>&1 | tee .tmp/zig016-inventory.tx
   - Writer/format remnants Task 2 missed
   - Other (anything unexpected — e.g. `Ast` node/token API drift affecting rules, which would invalidate the "rules stay shared" assumption, finding 12)
 
-  Also record: whether the macOS SDK workaround is needed for 0.16.0, the `build.zig` directory-handle idiom from Step 2, and whether the external probe's 19+7 error count was accurate.
+  Also record the host-specific macOS SDK result, the `build.zig` directory-handle idiom from Step 2, and the external error-count comparison. A host-specific SDK result must not become a general promise that 0.16.0 needs no workaround.
 
 - [x] **Step 5: Merge only the inventory**
 
@@ -471,29 +502,19 @@ git commit -m "docs: add Zig 0.16 migration breakage inventory"
 
 ---
 
+## Current checkpoint and remaining verification
+
 ### Task 7 (checkpoint): Expand Phases 2–4 into a detailed plan
 
-**Status: reviewed and closed.** The compat implementation is present on
-`main` from the work covered by Tasks 1–6. Tasks 8 and 9 are complete. Task 10's
-dual-frontend release workflow and documentation are implemented; its criteria
-that require a successful release tag remain open until that release completes.
+**Status: policy review closed.** The compatibility code, frontend fixtures, and CI/release configurations are implemented. Current validation is separate from that implementation status. Full dual-frontend gates and successful-release verification remain pending.
 
-#### Status quo
+#### Current status
 
-- Phase 2 is implemented: `build.zig` selects the 0.15.2/0.16.0 build-script
-  APIs, `src/compat.zig` selects the I/O and ZIR adapters, and the shared
-  analyzer receives an explicit I/O context.
-- The inventory measured 16 main-target and 8 fixture-target compile errors
-  before the spike fixes. It also established that 0.16.0 does not need the
-  macOS SDK workaround and that the 15 `check-fixtures` failures are pre-existing
-  on both toolchains.
-- The shared fixture suite, cache behavior, executor test, and `just test` /
-  `just lint` checks have passed in both shells, and the fixture matrix proves
-  matching and mismatching frontend syntax.
-- `.github/workflows/build.yml` tests both pinned frontends, and
-  `.github/workflows/release.yml` builds one named artifact per platform and
-  frontend. `README.md` and `docs/USAGE.md` identify the matching artifact;
-  release-tag verification is still pending.
+- `build.zig` selects the 0.15.2/0.16.0 build-script APIs. `src/compat.zig` selects the I/O and ZIR adapters. The shared analyzer receives an explicit I/O context.
+- The 2026-08-21 inventory recorded 16 main-target and 8 fixture-target compile errors before spike fixes. Its 15 shared `check-fixtures` failures are a historical baseline.
+- That inventory's Darwin result applied to one host. Both current Nix shells retain the SDK workaround. No current Darwin verification is available from this Linux session.
+- Earlier migration entries recorded passing fixture, cache, executor, test, and lint checks. They do not verify the current repairs.
+- CI configures both pinned frontends. The release workflow configures one named artifact per platform/frontend pair. Successful release-tag verification remains open.
 
 #### Objectives
 
@@ -511,7 +532,7 @@ Complete the migration's remaining user-facing contract:
 
 1. **0.15.2 support lifetime:** retain both frontend artifacts through the
    v0.17.x release line, and make v0.18.0 the first release without a 0.15.2
-   artifact. With the current v0.14.0 package as the baseline, this gives the
+   artifact. The original plan used v0.14.0 as its baseline, allowing the
    first dual-frontend release and two subsequent release lines for migration.
    A fixed sunset limits the ongoing release and CI matrix while giving users a
    specific compatibility window.
@@ -534,17 +555,15 @@ remaining work.
 
 ### Task 8: Add the frontend fixture matrix
 
-#### Status quo
+#### Current status
 
-`test/fixture_tests.zig` runs the existing rule and checker fixtures in the
-current build, while `build.zig:addFixtureChecks` compiles a fixed list of
-fixture directories. `src/zir/bridge.zig` has one conditional unit test for the
-opposite frontend builtin, but the fixture suite does not prove the complete
-matching/mismatching contract.
+The shared, matching, and mismatching frontend fixtures are implemented. The earlier migration checklist recorded successful matrix checks. Full revalidation for the current changes remains pending in the checklist below.
+
+The following implementation contract describes the existing matrix. It is not a claim that its current full-suite gates have passed.
 
 #### Objectives
 
-Add a small, explicit matrix that exercises one shared fixture, one valid
+Maintain a small, explicit matrix that exercises one shared fixture, one valid
 0.15.2-only typed fixture using `@Type`, and one valid 0.16.0-only typed fixture
 using `@Int`. In each build, the matching fixture must retain type information
 and the other fixture must report unavailable type information through the
@@ -601,75 +620,44 @@ the same diagnostic fields under both builds.
 
 #### Acceptance criteria
 
-- [x] `nix develop -c just test` passes, including the matching and mismatching
-  frontend assertions.
-- [x] `nix develop .#zig016 -c just test` passes with the inverse fixture
-  selection.
-- [x] `nix develop -c zig build check-fixtures` and the equivalent 0.16 command
-  produce the same baseline failures recorded in
-  `docs/internal/ZIG_0_16_INVENTORY.md` (15 at the time of writing) and no new
-  failures; the newly added matching fixtures compile successfully. The
-  baseline failures remain visible and are not silently filtered.
-- [x] The shared fixture produces identical expected diagnostic fields in both
-  toolchains, and `nix develop -c zig fmt --check test/fixtures/frontend_matrix`
-  passes (the canonical 0.15.2 formatter parses the 0.16 fixture too — `@Int`
-  fails only at AstGen, not at parse).
+- [ ] `nix develop -c just test` passes for the current changes, including the 0.16 matching and mismatching assertions.
+- [ ] `nix develop .#zig015 -c just test` passes with the inverse fixture selection.
+- [ ] `nix develop -c zig build check-fixtures` and `nix develop .#zig015 -c zig build check-fixtures` introduce no unexplained failures. Compare with the dated inventory's 15-failure baseline rather than silently filtering failures. Matching fixtures must compile.
+- [ ] The shared fixture produces identical expected diagnostic fields in both toolchains. `nix develop .#zig015 -c zig fmt --check test/fixtures/frontend_matrix` passes with the canonical formatter. `@Int` is parseable in 0.15.2 but fails at AstGen.
 
 ---
 
 ### Task 9: Make CI test both embedded frontends
 
-#### Status quo
+#### Current status
 
-`.github/workflows/build.yml` has one `build-matrix` job that invokes
-`nix develop --command just ci`, caches one Zig build tree, and uploads one
-SARIF result. The 0.16.0 shell exists in `flake.nix` but is not used by CI.
+`.github/workflows/build.yml` configures a two-entry frontend matrix. Zig 0.15.2 uses `.#zig015`, and Zig 0.16.0 uses the default shell (`.`). Each leg invokes `just ci`. The earlier checklist recorded passing gates, but current local and CI results require fresh verification.
 
-#### Objectives
+#### Implementation contract
 
-Turn the build job into a two-entry frontend matrix while preserving the
-existing change filtering, Nix/Cachix setup, deterministic lint behavior, and
-one canonical Code Scanning upload.
-
-#### Tech Notes
-
-- Modify the `build-matrix` strategy in `.github/workflows/build.yml` to carry
-  both the frontend version (`0.15.2`, `0.16.0`) and the corresponding Nix shell
-  (`default`, `.#zig016`). Keep the `changes` dependency so documentation-only
-  changes do not spend two build slots.
-- Include the frontend in the Zig cache key. A cache created by one compiler
-  must not be reused by the other compiler even when the source hash is equal.
-- Invoke `just ci` in both matrix legs. Task 7 keeps 0.15.2 authoritative for
-  formatting, so the workflow and Justfile must make that policy explicit
-  rather than allowing a formatter mismatch to become an unexplained 0.16
-  failure.
-- Upload SARIF from one designated frontend (the canonical 0.15.2 leg) to avoid
-  duplicate findings in GitHub Code Scanning; both legs still run analyzer lint.
-- Keep the aggregate `build` job's result checks correct when either matrix leg
-  fails or when the code path is skipped.
+- Preserve change filtering and the Nix/Cachix setup. Documentation-only changes can skip both build legs.
+- Include the frontend in cache keys and restore prefixes. One frontend must not restore the other frontend's cache.
+- Keep Zig 0.15.2 authoritative for formatting. Both legs still run analyzer lint.
+- Upload SARIF only from the 0.15.2 leg to prevent duplicate Code Scanning findings.
+- Keep the aggregate result checks correct when either leg fails or the code path is skipped.
 
 #### Acceptance criteria
 
-- [x] A code-changing pull request shows two build legs, one for each pinned
-  frontend, and the aggregate job fails if either leg fails.
-- [x] Both legs execute `just test` and `just lint`; the canonical leg uploads
-  exactly one SARIF file.
-- [x] The cache key contains the frontend identity and no 0.15.2 cache path is
-  restored for a 0.16.0 job.
-- [x] The workflow YAML remains valid, and the local equivalents
-  `nix develop -c just ci` and `nix develop .#zig016 -c just ci` pass.
+- [x] The workflow defines both pinned frontend legs and invokes `just ci` in each.
+- [x] Only the canonical 0.15.2 leg is configured to upload SARIF.
+- [x] Cache keys and restore prefixes contain the frontend identity.
+- [ ] A current code-changing CI run verifies both legs and the aggregate result.
+- [ ] The workflow YAML validates. Current local equivalents `nix develop -c just ci` and `nix develop .#zig015 -c just ci` pass.
 
 ---
 
 ### Task 10: Publish release artifacts for both frontends
 
-#### Status quo
+#### Current status
 
-`.github/workflows/release.yml` validates and builds both Zig 0.15.2 and Zig
-0.16.0. Its platform matrix covers Linux x86_64, macOS aarch64, and Windows
-x86_64, and the asset name includes the embedded frontend. The v0.15.0 release
-attempt passed both validation legs but failed to link the macOS Zig 0.15.2
-artifact because the release job did not apply the existing SDK workaround.
+`.github/workflows/release.yml` configures validation and builds for both frontends. Its matrix covers Linux x86_64, macOS aarch64, and Windows x86_64. Asset names include the embedded frontend.
+
+Historical release result: the v0.15.0 attempt passed both validation legs but failed to link the macOS Zig 0.15.2 artifact. That job omitted the existing SDK workaround. This does not establish a successful release. The release-tag criteria below remain open and require external verification.
 
 #### Objectives
 
@@ -678,8 +666,8 @@ make the embedded language frontend unambiguous before download.
 
 #### Tech Notes
 
-- Extend the release matrix with a `zig_version` dimension while retaining the
-  existing platform metadata. Install the matrix-selected version with
+- Retain the release matrix's `zig_version` dimension and platform metadata.
+  Install the matrix-selected version with
   `mlugg/setup-zig@v2`; `build.zig` already selects the matching entry point.
 - Use the artifact pattern
   `zwanzig-${{ github.ref_name }}-zig-${{ matrix.zig_version }}-${{ matrix.asset_suffix }}`
@@ -688,17 +676,10 @@ make the embedded language frontend unambiguous before download.
 - Run `scripts/release-check.sh` under both frontend versions in the validation
   job. It must continue to verify the release tag, documentation versions, and
   the full test/lint suite before any upload occurs.
-- Update the platform download table in `README.md` (currently one archive per
-  platform) to list both frontend artifacts, and extend the existing "Zig
-  frontend compatibility" sections in `README.md` and `docs/USAGE.md` — which
-  already explain matching the binary to the project's Zig version — to state
-  that the frontend is encoded in the asset name (a project on Zig 0.15.2
-  downloads the `zig-0.15.2` artifact, and likewise for 0.16.0). `docs/USAGE.md`
-  has no download table; do not add a duplicate of the README one. Keep
-  source-build instructions explicit about selecting `nix develop` versus
-  `nix develop .#zig016`.
-- Add a user-facing `CHANGELOG.md` entry with the issue or PR number when the
-  release workflow lands. Do not add a placeholder number.
+- Keep both frontend artifacts in the `README.md` download table. Compatibility guidance must explain the frontend encoded in each asset name.
+  A Zig 0.15.2 project selects the `zig-0.15.2` artifact, and likewise for 0.16.0. Do not duplicate the table in `docs/USAGE.md`.
+  Source-build instructions must distinguish `nix develop` (0.16.0) from `nix develop .#zig015` (0.15.2).
+- Keep a user-facing changelog entry for release-workflow changes. Include an issue or PR number only when one exists.
 
 #### Acceptance criteria
 
@@ -715,13 +696,9 @@ make the embedded language frontend unambiguous before download.
 
 ### Task 11: Close the migration decisions and update the roadmap
 
-#### Status quo
+#### Current status
 
-Tasks 1–9 are complete and checked off above. Task 10's dual-frontend release
-workflow, artifact naming, and user documentation are implemented, while the
-criteria requiring a successful release tag remain open. Task 7's support lifetime,
-canonical formatter, and launcher decisions are now adopted and recorded in
-its "Review decisions (adopted)" section.
+The implementation and policy decisions are recorded above. The current changes still require full dual-frontend test and lint gates. Task 10's successful-release criteria remain external and unverified. Task 7 records the adopted support lifetime, canonical formatter, and deferred launcher.
 
 #### Objectives
 
@@ -735,9 +712,7 @@ actually passed.
   preserve the old binary-selection guidance until that release. If support is
   indefinite, state the maintenance commitment instead of leaving an implied
   deadline.
-- Record the canonical formatter choice in `CLAUDE.md`, `docs/DEVELOPMENT.md`
-  (which currently states no formatter policy), and the CI workflow so
-  contributors know which `zig fmt` output is expected.
+- Keep the existing canonical formatter policy aligned in `CLAUDE.md`, `docs/DEVELOPMENT.md`, and CI. The default 0.16.0 shell does not change the 0.15.2 formatting authority.
 - If the launcher remains deferred, retain explicit artifact names and record
   the closing rationale in Task 7's "Review decisions (adopted)" section rather
   than restating it elsewhere; per that section, a launcher becomes a separate
@@ -748,8 +723,6 @@ actually passed.
 - [x] The three decisions have a durable record with rationale and no
   contradictory statements in `README.md`, `docs/USAGE.md`, `CLAUDE.md`, or
   `docs/DEVELOPMENT.md`.
-- [x] The checkboxes in this plan — the Task 1–7 steps and the Task 8–11
-  acceptance criteria — match the code, CI, and release workflow that actually
-  shipped.
-- [x] The final implementation run ends with `just test` and `just lint` under
-  both pinned shells.
+- [x] This plan separates historical checkmarks, implemented configuration, current validation, and external release verification.
+- [ ] The current implementation run passes `just test` and `just lint` under both pinned shells.
+- [ ] Any claimed performance improvement has measurements. No speedup is established by this documentation update.

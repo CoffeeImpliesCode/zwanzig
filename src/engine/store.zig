@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const compat = @import("../compat.zig");
 const ast_walk = @import("../ast_walk.zig");
 const ids = @import("../ids.zig");
 
@@ -69,8 +71,9 @@ pub const StoreViolation = struct {
     pub fn hash(self: StoreViolation) u64 {
         var hasher = std.hash.Wyhash.init(0);
         const region_index = ids.varIndex(self.region);
+        const kind: u8 = @intFromEnum(self.kind);
         hasher.update(std.mem.asBytes(&region_index));
-        hasher.update(std.mem.asBytes(&self.kind));
+        hasher.update(std.mem.asBytes(&kind));
         const has_token: u8 = if (self.call_token) |_| 1 else 0;
         hasher.update(std.mem.asBytes(&has_token));
         if (self.call_token) |token| {
@@ -80,9 +83,184 @@ pub const StoreViolation = struct {
     }
 };
 
+/// Insertion-ordered set. Shared histories are immutable until a writer detaches.
+/// Like the enclosing Store, each history and its clones are thread-confined.
+const ViolationSet = struct {
+    shared: ?*Shared,
+
+    const empty: ViolationSet = .{ .shared = null };
+    const Map: type = switch (compat.frontend) {
+        .zig_0_15 => std.ArrayHashMapUnmanaged(StoreViolation, void, Context, true),
+        .zig_0_16 => std.array_hash_map.Custom(StoreViolation, void, Context, true),
+    };
+    const Context = struct {
+        pub fn hash(_: @This(), violation: StoreViolation) u32 {
+            return @truncate(violation.hash());
+        }
+
+        pub fn eql(_: @This(), lhs: StoreViolation, rhs: StoreViolation, _: usize) bool {
+            return lhs.eql(rhs);
+        }
+    };
+    const Shared = struct {
+        allocator: std.mem.Allocator,
+        entries: Map,
+        references: u32,
+        hash: u64,
+    };
+
+    fn deinit(self: *ViolationSet) void {
+        if (self.shared) |shared| {
+            std.debug.assert(shared.references > 0);
+            shared.references -= 1;
+            if (shared.references == 0) {
+                const allocator = shared.allocator;
+                shared.entries.deinit(allocator);
+                allocator.destroy(shared);
+            }
+        }
+        self.* = .empty;
+    }
+
+    fn clone(self: ViolationSet, allocator: std.mem.Allocator) std.mem.Allocator.Error!ViolationSet {
+        const shared = self.shared orelse return .empty;
+        std.debug.assert(shared.references > 0);
+        if (sameAllocator(shared.allocator, allocator)) {
+            if (shared.references < std.math.maxInt(u32)) {
+                shared.references += 1;
+                return self;
+            }
+        }
+        // A saturated reference count takes the independent-copy path as well.
+        return .{ .shared = try self.copyWithCapacity(allocator, self.count()) };
+    }
+
+    fn items(self: ViolationSet) []const StoreViolation {
+        return if (self.shared) |shared| shared.entries.keys() else &.{};
+    }
+
+    fn count(self: ViolationSet) usize {
+        return if (self.shared) |shared| shared.entries.count() else 0;
+    }
+
+    fn computeHash(self: ViolationSet) u64 {
+        return if (self.shared) |shared| shared.hash else 0;
+    }
+
+    fn contains(self: ViolationSet, violation: StoreViolation) bool {
+        return if (self.shared) |shared| shared.entries.contains(violation) else false;
+    }
+
+    fn containsAll(self: ViolationSet, other: ViolationSet) bool {
+        if (self.shared == other.shared) return true;
+        if (self.count() < other.count()) return false;
+        for (other.items()) |violation| {
+            if (!self.contains(violation)) return false;
+        }
+        return true;
+    }
+
+    fn eql(self: ViolationSet, other: ViolationSet) bool {
+        if (self.shared == other.shared) return true;
+        if (self.count() != other.count()) return false;
+        if (self.computeHash() != other.computeHash()) return false;
+        return self.containsAll(other);
+    }
+
+    fn insert(self: *ViolationSet, allocator: std.mem.Allocator, violation: StoreViolation) std.mem.Allocator.Error!void {
+        if (self.contains(violation)) return;
+        const new_count = std.math.add(usize, self.count(), 1) catch return error.OutOfMemory;
+        const shared = try self.ensureUniqueCapacity(allocator, new_count);
+        shared.entries.putAssumeCapacityNoClobber(violation, {});
+        shared.hash ^= violation.hash();
+    }
+
+    fn merge(self: ViolationSet, other: ViolationSet, allocator: std.mem.Allocator) std.mem.Allocator.Error!ViolationSet {
+        if (self.shared == other.shared or other.count() == 0) return self.clone(allocator);
+        if (self.count() == 0) return other.clone(allocator);
+
+        var new_count = self.count();
+        for (other.items()) |violation| {
+            if (!self.contains(violation)) {
+                new_count = std.math.add(usize, new_count, 1) catch return error.OutOfMemory;
+            }
+        }
+        if (new_count == self.count()) return self.clone(allocator);
+
+        const shared = try self.copyWithCapacity(allocator, new_count);
+        for (other.items()) |violation| {
+            if (!self.contains(violation)) {
+                shared.entries.putAssumeCapacityNoClobber(violation, {});
+                shared.hash ^= violation.hash();
+            }
+        }
+        return .{ .shared = shared };
+    }
+
+    fn ensureUniqueCapacity(self: *ViolationSet, allocator: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!*Shared {
+        if (self.shared) |shared| {
+            std.debug.assert(shared.references > 0);
+            if (shared.references == 1 and shared.entries.capacity() >= capacity) return shared;
+        }
+        // Build before publishing: even a failed index allocation keeps borrowed slices valid.
+        const replacement = try self.copyWithCapacity(allocator, capacity);
+        self.deinit();
+        self.shared = replacement;
+        return replacement;
+    }
+
+    fn copyWithCapacity(self: ViolationSet, allocator: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!*Shared {
+        std.debug.assert(capacity >= self.count());
+        std.debug.assert(capacity > 0);
+        const shared = try allocator.create(Shared);
+        shared.* = .{
+            .allocator = allocator,
+            .entries = .empty,
+            .references = 1,
+            .hash = self.computeHash(),
+        };
+        errdefer {
+            shared.entries.deinit(allocator);
+            allocator.destroy(shared);
+        }
+        try shared.entries.ensureTotalCapacity(allocator, capacity);
+        for (self.items()) |violation| {
+            shared.entries.putAssumeCapacityNoClobber(violation, {});
+        }
+        return shared;
+    }
+
+    fn sameAllocator(lhs: std.mem.Allocator, rhs: std.mem.Allocator) bool {
+        if (lhs.vtable != rhs.vtable) return false;
+        // Standard stateless allocators leave their context pointer undefined.
+        const page_vtable = if (builtin.cpu.arch.isWasm())
+            &std.heap.WasmAllocator.vtable
+        else if (compat.frontend == .zig_0_15 and builtin.os.tag == .plan9)
+            &std.heap.SbrkAllocator(std.os.plan9.sbrk).vtable
+        else
+            &std.heap.PageAllocator.vtable;
+        if (lhs.vtable == page_vtable) return true;
+        if (!builtin.single_threaded) {
+            if (lhs.vtable == std.heap.smp_allocator.vtable) return true;
+        }
+        if (builtin.link_libc) {
+            if (lhs.vtable == std.heap.c_allocator.vtable) return true;
+            if (compat.frontend == .zig_0_15) {
+                if (lhs.vtable == std.heap.raw_c_allocator.vtable) return true;
+            }
+        }
+        if (compat.frontend == .zig_0_16 and builtin.single_threaded and
+            (builtin.os.tag == .linux or builtin.cpu.arch.isWasm()))
+        {
+            if (lhs.vtable == std.heap.brk_allocator.vtable) return true;
+        }
+        return lhs.ptr == rhs.ptr;
+    }
+};
+
 pub const Store = struct {
     resources: std.AutoHashMap(VarId, ResourceState),
-    violations: std.ArrayList(StoreViolation),
+    violations: ViolationSet,
     aliases: std.AutoHashMap(VarId, VarId),
     deferred: std.AutoHashMap(VarId, DeferredEntry),
     errdeferred: std.AutoHashMap(VarId, ErrdeferAction),
@@ -103,7 +281,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.resources.deinit();
-        self.violations.deinit(self.allocator);
+        self.violations.deinit();
         self.aliases.deinit();
         self.deferred.deinit();
         self.errdeferred.deinit();
@@ -119,9 +297,7 @@ pub const Store = struct {
             try new_store.resources.put(entry.key_ptr.*, entry.value_ptr.*);
         }
 
-        for (self.violations.items) |violation| {
-            try new_store.violations.append(allocator, violation);
-        }
+        new_store.violations = try self.violations.clone(allocator);
 
         var alias_iter = self.aliases.iterator();
         while (alias_iter.next()) |entry| {
@@ -157,17 +333,7 @@ pub const Store = struct {
             }
         }
 
-        if (self.violations.items.len != other.violations.items.len) return false;
-        for (self.violations.items) |lhs| {
-            var found = false;
-            for (other.violations.items) |rhs| {
-                if (lhs.eql(rhs)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
+        if (!self.violations.eql(other.violations)) return false;
 
         if (self.aliases.count() != other.aliases.count()) return false;
         var alias_iter = self.aliases.iterator();
@@ -224,10 +390,7 @@ pub const Store = struct {
             resources_hash ^= hasher.final();
         }
 
-        var violations_hash: u64 = 0;
-        for (self.violations.items) |violation| {
-            violations_hash ^= violation.hash();
-        }
+        const violations_hash = self.violations.computeHash();
 
         var aliases_hash: u64 = 0;
         var alias_iter = self.aliases.iterator();
@@ -292,7 +455,7 @@ pub const Store = struct {
 
         var hasher = std.hash.Wyhash.init(0);
         const resources_count = self.resources.count();
-        const violations_len = self.violations.items.len;
+        const violations_len = self.violations.count();
         hasher.update(std.mem.asBytes(&resources_hash));
         hasher.update(std.mem.asBytes(&violations_hash));
         hasher.update(std.mem.asBytes(&aliases_hash));
@@ -702,11 +865,12 @@ pub const Store = struct {
     }
 
     pub fn violationCount(self: *const Store) usize {
-        return self.violations.items.len;
+        return self.violations.count();
     }
 
+    /// Borrowed insertion-order view; valid until violations change or this Store is deinitialized.
     pub fn getViolations(self: *const Store) []const StoreViolation {
-        return self.violations.items;
+        return self.violations.items();
     }
 
     /// Return the AST node of the lexical scope owning the pending defer-free
@@ -732,10 +896,7 @@ pub const Store = struct {
             .kind = kind,
             .call_token = call_token,
         };
-        for (self.violations.items) |existing| {
-            if (existing.eql(violation)) return;
-        }
-        try self.violations.append(self.allocator, violation);
+        try self.violations.insert(self.allocator, violation);
     }
 
     fn canonical(self: *const Store, region: VarId) VarId {
@@ -845,32 +1006,7 @@ pub const Store = struct {
             }
         }
 
-        // Violations: union with dedup (never lose observed violations)
-        for (self.violations.items) |violation| {
-            var found = false;
-            for (result.violations.items) |existing| {
-                if (existing.eql(violation)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                try result.violations.append(allocator, violation);
-            }
-        }
-
-        for (other.violations.items) |violation| {
-            var found = false;
-            for (result.violations.items) |existing| {
-                if (existing.eql(violation)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                try result.violations.append(allocator, violation);
-            }
-        }
+        result.violations = try self.violations.merge(other.violations, allocator);
 
         return result;
     }
@@ -918,18 +1054,7 @@ pub const Store = struct {
             if (self_owner != other_owner) return false;
         }
 
-        for (other.violations.items) |violation| {
-            var found = false;
-            for (self.violations.items) |existing| {
-                if (existing.eql(violation)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-
-        return true;
+        return self.violations.containsAll(other.violations);
     }
 };
 
@@ -1228,4 +1353,291 @@ test "Store subsumes preserves violations" {
     try general.markFreed(region, 2);
 
     try testing.expect(general.subsumes(&specific));
+}
+
+test "Store violation clones isolate branches without allocating unchanged history" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var original = Store.init(allocator);
+    defer original.deinit();
+    for (0..64) |index| {
+        try original.recordDeferFreesEscapee(ids.varId(@intCast(index)), @intCast(index));
+    }
+    const original_hash = original.computeHash();
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var branch = try original.clone(allocator);
+    defer branch.deinit();
+    var unchanged = try original.widen(&branch, allocator);
+    defer unchanged.deinit();
+    try branch.recordDeferFreesEscapee(ids.varId(0), 0);
+    try testing.expect(original.eql(&branch));
+    try testing.expectEqual(original_hash, branch.computeHash());
+    try testing.expectError(error.OutOfMemory, branch.recordDeferFreesEscapee(ids.varId(64), 64));
+    try testing.expect(original.eql(&branch));
+    try testing.expectEqual(original_hash, branch.computeHash());
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try branch.recordDeferFreesEscapee(ids.varId(64), 64);
+    try original.recordDeferFreesEscapee(ids.varId(65), 65);
+    try testing.expectEqual(@as(usize, 65), original.violationCount());
+    try testing.expectEqual(@as(usize, 65), branch.violationCount());
+    try testing.expect(!original.subsumes(&branch));
+    try testing.expect(!branch.subsumes(&original));
+    try testing.expectEqual(@as(usize, 64), unchanged.violationCount());
+    try testing.expectEqual(original_hash, unchanged.computeHash());
+}
+
+test "Store violation clone copies when its reference count is saturated" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var original = Store.init(allocator);
+    defer original.deinit();
+    try original.recordDeferFreesEscapee(ids.varId(1), null);
+    const shared = original.violations.shared orelse return error.TestUnexpectedResult;
+    shared.references = std.math.maxInt(u32);
+    defer shared.references = 1;
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, original.clone(allocator));
+    try testing.expectEqual(std.math.maxInt(u32), shared.references);
+    failing.fail_index = std.math.maxInt(usize);
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit();
+    try testing.expectEqual(std.math.maxInt(u32), shared.references);
+    try testing.expect(original.eql(&cloned));
+    try testing.expectEqual(original.computeHash(), cloned.computeHash());
+    try cloned.recordDeferFreesEscapee(ids.varId(2), 0);
+    try testing.expectEqual(@as(usize, 1), original.violationCount());
+    try testing.expectEqual(@as(usize, 2), cloned.violationCount());
+}
+
+test "Store violation clones support a stateless allocator" {
+    const testing = std.testing;
+    const allocator = std.heap.page_allocator;
+    var survivor = Store.init(allocator);
+    defer survivor.deinit();
+    {
+        var source = Store.init(allocator);
+        defer source.deinit();
+        try source.recordDeferFreesEscapee(ids.varId(1), null);
+        survivor = try source.clone(allocator);
+    }
+    try testing.expectEqual(@as(usize, 1), survivor.violationCount());
+    try testing.expectEqualDeep(StoreViolation{
+        .region = ids.varId(1),
+        .kind = .defer_frees_escapee,
+        .call_token = null,
+    }, survivor.getViolations()[0]);
+    try survivor.recordDeferFreesEscapee(ids.varId(2), 0);
+    try testing.expectEqual(@as(usize, 2), survivor.violationCount());
+}
+
+test "Store violation storage survives either clone deinit order" {
+    const testing = std.testing;
+    var survivor = Store.init(testing.allocator);
+    defer survivor.deinit();
+    {
+        var original = Store.init(testing.allocator);
+        defer original.deinit();
+        try original.recordDeferFreesEscapee(ids.varId(9), null);
+        {
+            var first = try original.clone(testing.allocator);
+            defer first.deinit();
+            survivor = try first.clone(testing.allocator);
+        }
+        try testing.expect(original.eql(&survivor));
+    }
+    try testing.expectEqual(@as(usize, 1), survivor.violationCount());
+    try testing.expectEqualDeep(StoreViolation{
+        .region = ids.varId(9),
+        .kind = .defer_frees_escapee,
+        .call_token = null,
+    }, survivor.getViolations()[0]);
+    try survivor.recordDeferFreesEscapee(ids.varId(10), 0);
+    try testing.expectEqual(@as(usize, 2), survivor.violationCount());
+}
+
+test "Store violations distinguish every tuple and ignore insertion order" {
+    const testing = std.testing;
+    const violations = [_]StoreViolation{
+        .{ .region = ids.varId(0), .kind = .double_free, .call_token = null },
+        .{ .region = ids.varId(0), .kind = .double_free, .call_token = 0 },
+        .{ .region = ids.varId(0), .kind = .double_free, .call_token = std.math.maxInt(u32) },
+        .{ .region = ids.varId(0), .kind = .use_after_free, .call_token = 0 },
+        .{ .region = ids.varId(std.math.maxInt(u32)), .kind = .double_free, .call_token = 0 },
+    };
+    var forward = Store.init(testing.allocator);
+    defer forward.deinit();
+    var reverse = Store.init(testing.allocator);
+    defer reverse.deinit();
+    for (violations, 0..) |violation, index| {
+        try forward.recordViolation(violation.region, violation.kind, violation.call_token);
+        const reversed = violations[violations.len - 1 - index];
+        try reverse.recordViolation(reversed.region, reversed.kind, reversed.call_token);
+    }
+    for (violations) |violation| {
+        try forward.recordViolation(violation.region, violation.kind, violation.call_token);
+    }
+    try testing.expectEqual(violations.len, forward.violationCount());
+    try testing.expect(forward.eql(&reverse));
+    try testing.expectEqual(forward.computeHash(), reverse.computeHash());
+    try testing.expect(forward.subsumes(&reverse));
+    try testing.expect(reverse.subsumes(&forward));
+    var widened = try forward.widen(&reverse, testing.allocator);
+    defer widened.deinit();
+    try testing.expect(widened.eql(&forward));
+    try testing.expectEqual(widened.computeHash(), forward.computeHash());
+}
+
+test "Store violation unions retain overlapping large histories" {
+    const testing = std.testing;
+    var left = Store.init(testing.allocator);
+    defer left.deinit();
+    var right = Store.init(testing.allocator);
+    defer right.deinit();
+    for (0..256) |index| {
+        try left.recordDeferFreesEscapee(ids.varId(@intCast(index)), @intCast(index));
+        const reversed: u32 = @intCast(383 - index);
+        try right.recordDeferFreesEscapee(ids.varId(reversed), reversed);
+    }
+    var widened = try left.widen(&right, testing.allocator);
+    defer widened.deinit();
+    var reversed = try right.widen(&left, testing.allocator);
+    defer reversed.deinit();
+    try testing.expectEqual(@as(usize, 384), widened.violationCount());
+    try testing.expect(widened.eql(&reversed));
+    try testing.expectEqual(widened.computeHash(), reversed.computeHash());
+    var observed = [_]bool{false} ** 384;
+    for (widened.getViolations()) |violation| {
+        const region = ids.varIndex(violation.region);
+        try testing.expect(region < observed.len);
+        try testing.expect(!observed[region]);
+        try testing.expectEqual(StoreViolationKind.defer_frees_escapee, violation.kind);
+        try testing.expectEqual(@as(?u32, region), violation.call_token);
+        observed[region] = true;
+    }
+    for (observed) |present| try testing.expect(present);
+    try testing.expect(widened.subsumes(&left));
+    try testing.expect(widened.subsumes(&right));
+    try testing.expect(!left.subsumes(&widened));
+    try testing.expectEqual(@as(usize, 256), left.violationCount());
+    try testing.expectEqual(@as(usize, 256), right.violationCount());
+}
+
+test "Store violation clones and unions outlive their source allocator" {
+    const testing = std.testing;
+    var destination = std.heap.ArenaAllocator.init(testing.allocator);
+    defer destination.deinit();
+    const allocator = destination.allocator();
+    var cloned = Store.init(allocator);
+    defer cloned.deinit();
+    var widened = Store.init(allocator);
+    defer widened.deinit();
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var source = Store.init(arena.allocator());
+        defer source.deinit();
+        for (0..64) |index| {
+            try source.recordDeferFreesEscapee(ids.varId(@intCast(index)), @intCast(index));
+        }
+        cloned = try source.clone(allocator);
+        widened = try source.widen(&source, allocator);
+    }
+    try testing.expect(cloned.eql(&widened));
+    try testing.expectEqual(@as(usize, 64), cloned.violationCount());
+    try testing.expectEqual(cloned.computeHash(), widened.computeHash());
+    try cloned.recordDeferFreesEscapee(ids.varId(64), null);
+    try widened.recordDeferFreesEscapee(ids.varId(65), 0);
+    try testing.expect(!cloned.subsumes(&widened));
+    try testing.expect(!widened.subsumes(&cloned));
+}
+
+test "Store violation changes preserve both inputs on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testViolationAllocationFailures, .{});
+}
+
+fn testViolationAllocationFailures(allocator: std.mem.Allocator) !void {
+    const testing = std.testing;
+    var source = Store.init(allocator);
+    defer source.deinit();
+    for (0..32) |index| {
+        const previous_hash = source.computeHash();
+        const previous_items = source.getViolations();
+        source.recordDeferFreesEscapee(ids.varId(@intCast(index)), @intCast(index)) catch |err| {
+            try testing.expectEqual(index, source.violationCount());
+            try testing.expectEqual(previous_hash, source.computeHash());
+            if (previous_items.len != 0) {
+                try testing.expect(previous_items.ptr == source.getViolations().ptr);
+                for (previous_items, 0..) |violation, expected| {
+                    try testing.expectEqualDeep(StoreViolation{
+                        .region = ids.varId(@intCast(expected)),
+                        .kind = .defer_frees_escapee,
+                        .call_token = @intCast(expected),
+                    }, violation);
+                }
+            }
+            return err;
+        };
+    }
+    try source.aliasRegion(ids.varId(1000), ids.varId(0));
+    const source_hash = source.computeHash();
+    var branch = source.clone(allocator) catch |err| {
+        try testing.expectEqual(source_hash, source.computeHash());
+        try testing.expectEqual(@as(usize, 32), source.violationCount());
+        return err;
+    };
+    defer branch.deinit();
+    branch.recordDeferFreesEscapee(ids.varId(32), 32) catch |err| {
+        try testing.expect(branch.eql(&source));
+        try testing.expectEqual(@as(usize, 32), source.violationCount());
+        try testing.expectEqual(@as(usize, 32), branch.violationCount());
+        try testing.expectEqual(source_hash, source.computeHash());
+        try testing.expectEqual(source_hash, branch.computeHash());
+        return err;
+    };
+    try testing.expectEqual(@as(usize, 32), source.violationCount());
+    try testing.expectEqual(source_hash, source.computeHash());
+    try source.recordDeferFreesEscapee(ids.varId(33), 33);
+    const before_union = source.computeHash();
+    const branch_hash = branch.computeHash();
+    var widened = source.widen(&branch, allocator) catch |err| {
+        try testing.expectEqual(before_union, source.computeHash());
+        try testing.expectEqual(branch_hash, branch.computeHash());
+        try testing.expectEqual(@as(usize, 33), source.violationCount());
+        try testing.expectEqual(@as(usize, 33), branch.violationCount());
+        return err;
+    };
+    defer widened.deinit();
+    try testing.expectEqual(@as(usize, 34), widened.violationCount());
+    try testing.expect(widened.subsumes(&source));
+    try testing.expect(widened.subsumes(&branch));
+}
+
+test "Store cross-allocator violation clone cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testViolationCloneFailures, .{});
+}
+
+fn testViolationCloneFailures(allocator: std.mem.Allocator) !void {
+    const testing = std.testing;
+    var source = Store.init(testing.allocator);
+    defer source.deinit();
+    for (0..64) |index| {
+        try source.recordDeferFreesEscapee(ids.varId(@intCast(index)), @intCast(index));
+    }
+    try source.aliasRegion(ids.varId(1000), ids.varId(0));
+    const source_hash = source.computeHash();
+    var cloned = source.clone(allocator) catch |err| {
+        try testing.expectEqual(@as(usize, 64), source.violationCount());
+        try testing.expectEqual(source_hash, source.computeHash());
+        return err;
+    };
+    defer cloned.deinit();
+    try testing.expect(source.eql(&cloned));
+    try testing.expectEqual(source_hash, cloned.computeHash());
 }

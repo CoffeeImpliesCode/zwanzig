@@ -5,6 +5,7 @@ const call_resolver = @import("analysis/call_resolver.zig");
 const Diagnostic = @import("diagnostic.zig").Diagnostic;
 const import_resolver = @import("analysis/import_resolver.zig");
 const ProjectSources = @import("project_sources.zig").ProjectSources;
+const ProjectReferenceIndex = @import("analysis/project_reference_index.zig").ProjectReferenceIndex;
 const Source = @import("source.zig").Source;
 const suppression = @import("suppression.zig");
 
@@ -68,20 +69,27 @@ const ProjectContext = struct {
     build_file_indices: []const usize,
     api_roots: std.ArrayList(usize) = .empty,
     public_api_files: std.ArrayList(usize) = .empty,
+    api_root_membership: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    public_api_membership: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    references: ProjectReferenceIndex,
 
     fn init(
         allocator: std.mem.Allocator,
         files: []const import_resolver.File,
         build_file_indices: []const usize,
-    ) ProjectContext {
+    ) !ProjectContext {
         return .{
             .allocator = allocator,
             .files = files,
             .build_file_indices = build_file_indices,
+            .references = try ProjectReferenceIndex.init(allocator, files),
         };
     }
 
     fn deinit(self: *ProjectContext) void {
+        self.references.deinit();
+        self.public_api_membership.deinit(self.allocator);
+        self.api_root_membership.deinit(self.allocator);
         self.public_api_files.deinit(self.allocator);
         self.api_roots.deinit(self.allocator);
     }
@@ -101,40 +109,25 @@ const ProjectContext = struct {
         var cursor: usize = 0;
         while (cursor < self.public_api_files.items.len) : (cursor += 1) {
             const importer_index = self.public_api_files.items[cursor];
-            for (self.files, 0..) |file, file_index| {
-                if (self.containsPublicApiFile(file_index)) continue;
-                if (import_resolver.filePubliclyImportsPath(self.files, importer_index, file.path)) {
-                    try self.appendPublicApiFile(file_index);
-                }
+            for (try self.references.publicTargets(importer_index)) |file_index| {
+                try self.appendPublicApiFile(file_index);
             }
         }
     }
 
     fn isPublicApiFile(self: *const ProjectContext, file_index: usize) bool {
-        return self.containsPublicApiFile(file_index);
-    }
-
-    fn containsPublicApiFile(self: *const ProjectContext, file_index: usize) bool {
-        for (self.public_api_files.items) |public_index| {
-            if (public_index == file_index) return true;
-        }
-        return false;
-    }
-
-    fn containsApiRoot(self: *const ProjectContext, file_index: usize) bool {
-        for (self.api_roots.items) |root_index| {
-            if (root_index == file_index) return true;
-        }
-        return false;
+        return self.public_api_membership.contains(file_index);
     }
 
     fn appendApiRoot(self: *ProjectContext, file_index: usize) !void {
-        if (self.containsApiRoot(file_index)) return;
+        const result = try self.api_root_membership.getOrPut(self.allocator, file_index);
+        if (result.found_existing) return;
         try self.api_roots.append(self.allocator, file_index);
     }
 
     fn appendPublicApiFile(self: *ProjectContext, file_index: usize) !void {
-        if (self.containsPublicApiFile(file_index)) return;
+        const result = try self.public_api_membership.getOrPut(self.allocator, file_index);
+        if (result.found_existing) return;
         try self.public_api_files.append(self.allocator, file_index);
     }
     fn collectBuildRootSourceFiles(self: *ProjectContext, build_file_index: usize) !void {
@@ -156,6 +149,7 @@ const ProjectContext = struct {
         build_path: []const u8,
         resolver: call_resolver.ProjectTypeResolver,
     ) !void {
+        if (tree.errors.len != 0) return;
         const build_receiver = buildFunctionReceiver(tree, resolver) orelse return;
         const tags = tree.nodes.items(.tag);
         for (tags, 0..) |tag, node_index| {
@@ -321,6 +315,10 @@ pub fn analyze(
     const resolver_files = project_sources.files();
     const diagnostic_indices = project_sources.diagnosticFileIndices();
     if (diagnostic_indices.len < 2) return;
+    // Incomplete syntax cannot prove the absence of cross-file references.
+    for (resolver_files) |file| {
+        if (file.tree.errors.len != 0) return;
+    }
 
     const files = try allocator.alloc(FileInfo, resolver_files.len);
     var file_count: usize = 0;
@@ -339,7 +337,7 @@ pub fn analyze(
         file_count += 1;
     }
 
-    var project = ProjectContext.init(
+    var project = try ProjectContext.init(
         allocator,
         resolver_files,
         project_sources.buildFileIndices(),
@@ -366,6 +364,7 @@ pub fn analyze(
         files,
         resolver_files,
         decls.items,
+        &project.references,
     );
     defer allocator.free(used);
 
@@ -408,6 +407,7 @@ fn collectPublicRootDecls(
     file_index: usize,
     decls: *std.ArrayList(DeclInfo),
 ) !void {
+    if (tree.errors.len != 0) return;
     const tags = tree.nodes.items(.tag);
     const token_starts = tree.tokens.items(.start);
 
@@ -618,86 +618,173 @@ fn collectProjectUsedDecls(
     files: []const FileInfo,
     resolver_files: []const import_resolver.File,
     decls: []const DeclInfo,
+    references: *ProjectReferenceIndex,
 ) ![]bool {
     const used = try allocator.alloc(bool, decls.len);
+    errdefer allocator.free(used);
     @memset(used, false);
-
+    var usage = DeclUsage{ .allocator = allocator, .decls = decls, .used = used };
+    defer usage.deinit();
     for (decls, 0..) |decl, decl_index| {
-        if (isReferencedWithinDeclFile(files, resolver_files, decl) or
-            isReferencedFromAnotherFile(files, resolver_files, decl))
-        {
-            used[decl_index] = true;
-        }
+        const result = try usage.by_name.getOrPut(allocator, decl.normalized_name);
+        if (!result.found_existing) result.value_ptr.* = .empty;
+        try result.value_ptr.append(allocator, decl_index);
     }
 
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (decls, 0..) |decl, decl_index| {
-            if (!used[decl_index]) continue;
-            if (try markPublicSurfaceReferences(files, decls, used, decl)) changed = true;
-        }
+    for (resolver_files, 0..) |file, file_index| {
+        try usage.scanFile(resolver_files, file, file_index, references);
     }
-
+    var cursor: usize = 0;
+    while (cursor < usage.queue.items.len) : (cursor += 1) {
+        const decl = decls[usage.queue.items[cursor]];
+        var scanner = PublicSurfaceScanner{
+            .tree = files[decl.file_index].tree,
+            .usage = &usage,
+            .file_index = decl.file_index,
+        };
+        try scanner.scanDecl(decl.node_index);
+    }
     return used;
 }
 
-fn isReferencedWithinDeclFile(files: []const FileInfo, resolver_files: []const import_resolver.File, decl: DeclInfo) bool {
-    const file = files[decl.file_index];
-    const tags = file.tree.nodes.items(.tag);
-    const main_tokens = file.tree.nodes.items(.main_token);
-
-    for (tags, 0..) |tag, node_index| {
-        if (node_index == decl.node_index) continue;
-        if (tag != .identifier) continue;
-        if (node_index >= main_tokens.len) continue;
-
-        const name = normalizeIdentifier(file.tree.tokenSlice(main_tokens[node_index]));
-        if (std.mem.eql(u8, name, decl.normalized_name)) return true;
-    }
-
-    if (fileReferencesDeclByTypedReceiver(resolver_files, decl.file_index, decl.file_index, decl.normalized_name)) return true;
-
-    return false;
-}
-
-fn isReferencedFromAnotherFile(
-    files: []const FileInfo,
-    resolver_files: []const import_resolver.File,
-    decl: DeclInfo,
-) bool {
-    const decl_file = files[decl.file_index];
-    for (files, 0..) |*file, file_index| {
-        if (file_index == decl.file_index) continue;
-        if (std.mem.eql(u8, file.path, decl_file.path)) continue;
-        if (fileReferencesDecl(resolver_files, file_index, decl.file_index, decl_file.path, decl.normalized_name)) return true;
-    }
-    return false;
-}
-
-fn markPublicSurfaceReferences(
-    files: []const FileInfo,
+const DeclUsage = struct {
+    allocator: std.mem.Allocator,
     decls: []const DeclInfo,
     used: []bool,
-    decl: DeclInfo,
-) !bool {
-    const file = &files[decl.file_index];
-    var scanner = PublicSurfaceScanner{
-        .tree = file.tree,
-        .decls = decls,
-        .used = used,
-        .file_index = decl.file_index,
-    };
-    try scanner.scanDecl(decl.node_index);
-    return scanner.changed;
+    by_name: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
+    queue: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *DeclUsage) void {
+        var values = self.by_name.valueIterator();
+        while (values.next()) |value| value.deinit(self.allocator);
+        self.by_name.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
+    }
+
+    fn mark(self: *DeclUsage, declaration: usize) !void {
+        if (self.used[declaration]) return;
+        try self.queue.append(self.allocator, declaration);
+        self.used[declaration] = true;
+    }
+
+    fn hasUnused(self: *const DeclUsage, candidates: []const usize) bool {
+        for (candidates) |candidate| {
+            if (!self.used[candidate]) return true;
+        }
+        return false;
+    }
+
+    fn scanFile(
+        self: *DeclUsage,
+        files: []const import_resolver.File,
+        file: import_resolver.File,
+        file_index: usize,
+        references: *ProjectReferenceIndex,
+    ) !void {
+        const tree = file.tree;
+        if (tree.errors.len != 0) return;
+        const namespaces = try references.usingTargets(file_index);
+        const resolver = call_resolver.ProjectTypeResolver{ .files = files, .file_index = file_index };
+        for (tree.nodes.items(.tag), 0..) |tag, node| {
+            switch (tag) {
+                .identifier => {
+                    const name = identifierName(tree, node) orelse continue;
+                    const candidates = self.by_name.get(name) orelse continue;
+                    for (candidates.items) |candidate| {
+                        const decl = self.decls[candidate];
+                        if (decl.file_index == file_index) {
+                            if (node != decl.node_index) try self.mark(candidate);
+                        } else if (!std.mem.eql(u8, file.path, files[decl.file_index].path) and
+                            std.mem.indexOfScalar(usize, namespaces, decl.file_index) != null)
+                        {
+                            try self.mark(candidate);
+                        }
+                    }
+                },
+                .field_access => {
+                    const name = fieldAccessName(tree, node) orelse continue;
+                    const candidates = self.by_name.get(name) orelse continue;
+                    if (!self.hasUnused(candidates.items)) continue;
+                    const receiver = @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]);
+                    const targets = try references.namespaceTargets(file_index, receiver);
+                    const receiver_type = resolver.resolveExprType(receiver);
+                    for (candidates.items) |candidate| {
+                        const decl = self.decls[candidate];
+                        if (decl.file_index != file_index and std.mem.eql(u8, file.path, files[decl.file_index].path)) continue;
+                        if (receiver_type) |actual| {
+                            if (actual.file_index == decl.file_index and actual.container_node == null) {
+                                try self.mark(candidate);
+                                continue;
+                            }
+                        }
+                        if (decl.file_index != file_index and std.mem.indexOfScalar(usize, targets, decl.file_index) != null) {
+                            try self.mark(candidate);
+                        }
+                    }
+                },
+                .enum_literal => {
+                    const name = normalizeIdentifier(tree.tokenSlice(tree.nodes.items(.main_token)[node]));
+                    const candidates = self.by_name.get(name) orelse continue;
+                    if (!self.hasUnused(candidates.items)) continue;
+                    const expected = resolver.resolveResultLocationTypeNode(@intCast(node)) orelse continue;
+                    const owner_resolver = call_resolver.ProjectTypeResolver{
+                        .files = files,
+                        .file_index = expected.file_index,
+                    };
+                    const owner = owner_resolver.resolveTypeNode(expected.node_index) orelse continue;
+                    if (owner.container_node != null) continue;
+                    for (candidates.items) |candidate| {
+                        const decl = self.decls[candidate];
+                        if (decl.file_index != owner.file_index) continue;
+                        if (decl.file_index != file_index and std.mem.eql(u8, file.path, files[decl.file_index].path)) continue;
+                        try self.mark(candidate);
+                    }
+                },
+                .simple_var_decl, .aligned_var_decl, .global_var_decl, .local_var_decl => {
+                    const full = tree.fullVarDecl(@enumFromInt(node)) orelse continue;
+                    const initializer = full.ast.init_node.unwrap() orelse continue;
+                    const name = implicitResultMethodName(tree, @intFromEnum(initializer)) orelse continue;
+                    const candidates = self.by_name.get(name) orelse continue;
+                    if (!self.hasUnused(candidates.items)) continue;
+                    for (candidates.items) |candidate| {
+                        const decl = self.decls[candidate];
+                        if (decl.file_index != file_index and std.mem.eql(u8, file.path, files[decl.file_index].path)) continue;
+                        if (resolver.varDeclInitializerReferencesExpectedTypeMethod(full, decl.file_index, name)) {
+                            try self.mark(candidate);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+fn implicitResultMethodName(tree: *const std.zig.Ast, initial: u32) ?[]const u8 {
+    var node = initial;
+    while (node < tree.nodes.len) {
+        const data = tree.nodes.items(.data)[node];
+        switch (tree.nodes.items(.tag)[node]) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                var buffer: [1]std.zig.Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buffer, @enumFromInt(node)) orelse return null;
+                const callee = @intFromEnum(call.ast.fn_expr);
+                if (callee >= tree.nodes.len or tree.nodes.items(.tag)[callee] != .enum_literal) return null;
+                return normalizeIdentifier(tree.tokenSlice(tree.nodes.items(.main_token)[callee]));
+            },
+            .@"try", .address_of, .deref, .optional_type => node = @intFromEnum(data.node),
+            .grouped_expression, .unwrap_optional => node = @intFromEnum(data.node_and_token[0]),
+            .@"catch" => node = @intFromEnum(data.node_and_node[0]),
+            else => return null,
+        }
+    }
+    return null;
 }
 
 const PublicSurfaceScanner = struct {
     tree: *const std.zig.Ast,
-    decls: []const DeclInfo,
-    used: []bool,
+    usage: *DeclUsage,
     file_index: usize,
-    changed: bool = false,
     stop: bool = false,
 
     fn scanDecl(self: *PublicSurfaceScanner, node: u32) anyerror!void {
@@ -862,113 +949,17 @@ const PublicSurfaceScanner = struct {
 
         const main_tokens = tree.nodes.items(.main_token);
         if (node >= main_tokens.len) return;
-        self.markIdentifier(tree.tokenSlice(main_tokens[node]));
+        try self.markIdentifier(tree.tokenSlice(main_tokens[node]));
     }
 
-    fn markIdentifier(self: *PublicSurfaceScanner, identifier: []const u8) void {
-        const normalized = normalizeIdentifier(identifier);
-        for (self.decls, 0..) |candidate, candidate_index| {
-            if (candidate.file_index != self.file_index) continue;
-            if (self.used[candidate_index]) continue;
-            if (!std.mem.eql(u8, candidate.normalized_name, normalized)) continue;
-
-            self.used[candidate_index] = true;
-            self.changed = true;
+    fn markIdentifier(self: *PublicSurfaceScanner, identifier: []const u8) !void {
+        const candidates = self.usage.by_name.get(normalizeIdentifier(identifier)) orelse return;
+        for (candidates.items) |candidate| {
+            if (self.usage.decls[candidate].file_index != self.file_index) continue;
+            try self.usage.mark(candidate);
         }
     }
 };
-
-fn fileReferencesDecl(
-    files: []const import_resolver.File,
-    file_index: usize,
-    decl_file_index: usize,
-    decl_path: []const u8,
-    normalized_name: []const u8,
-) bool {
-    const file = files[file_index];
-    if (fileReferencesDeclByFieldAccess(files, file.tree, file.path, decl_path, normalized_name)) return true;
-    if (fileReferencesDeclByTypedReceiver(files, file_index, decl_file_index, normalized_name)) return true;
-    if (import_resolver.fileUsingnamespaceImportsPath(files, file.tree, file.path, decl_path) and fileReferencesBareName(file.tree, normalized_name)) return true;
-    return false;
-}
-
-fn fileReferencesDeclByFieldAccess(
-    files: []const import_resolver.File,
-    tree: *const std.zig.Ast,
-    importer_path: []const u8,
-    decl_path: []const u8,
-    normalized_name: []const u8,
-) bool {
-    const tags = tree.nodes.items(.tag);
-    const datas = tree.nodes.items(.data);
-
-    for (tags, 0..) |tag, node_index| {
-        if (tag != .field_access) continue;
-        const field_token = datas[node_index].node_and_token[1];
-        const slice = normalizeIdentifier(tree.tokenSlice(field_token));
-        if (!std.mem.eql(u8, slice, normalized_name)) continue;
-
-        const lhs = @intFromEnum(datas[node_index].node_and_token[0]);
-        if (import_resolver.nodeImportsPath(files, tree, lhs, importer_path, decl_path)) return true;
-    }
-    return false;
-}
-
-fn fileReferencesDeclByTypedReceiver(
-    files: []const import_resolver.File,
-    file_index: usize,
-    decl_file_index: usize,
-    normalized_name: []const u8,
-) bool {
-    const file = files[file_index];
-    const tree = file.tree;
-    const tags = tree.nodes.items(.tag);
-    const datas = tree.nodes.items(.data);
-
-    const resolver = call_resolver.ProjectTypeResolver{
-        .files = files,
-        .file_index = file_index,
-    };
-
-    for (tags, 0..) |tag, node_index| {
-        switch (tag) {
-            .field_access => {
-                const field_access = datas[node_index].node_and_token;
-                const field_name = normalizeIdentifier(tree.tokenSlice(field_access[1]));
-                if (!std.mem.eql(u8, field_name, normalized_name)) continue;
-                const receiver = @intFromEnum(field_access[0]);
-
-                if (resolver.resolveExprType(receiver)) |receiver_type| {
-                    if (receiver_type.file_index == decl_file_index and receiver_type.container_node == null) return true;
-                }
-            },
-            .simple_var_decl,
-            .aligned_var_decl,
-            .global_var_decl,
-            .local_var_decl,
-            => {
-                const full = tree.fullVarDecl(@enumFromInt(node_index)) orelse continue;
-                if (resolver.varDeclInitializerReferencesExpectedTypeMethod(full, decl_file_index, normalized_name)) return true;
-            },
-            else => {},
-        }
-    }
-
-    return false;
-}
-
-fn fileReferencesBareName(tree: *const std.zig.Ast, normalized_name: []const u8) bool {
-    const tags = tree.nodes.items(.tag);
-    const main_tokens = tree.nodes.items(.main_token);
-
-    for (tags, 0..) |tag, node_index| {
-        if (tag != .identifier) continue;
-        if (node_index >= main_tokens.len) continue;
-        const name = normalizeIdentifier(tree.tokenSlice(main_tokens[node_index]));
-        if (std.mem.eql(u8, name, normalized_name)) return true;
-    }
-    return false;
-}
 
 fn isReexportAlias(public_name: []const u8, referenced_name: []const u8) bool {
     const normalized_public = normalizeIdentifier(public_name);
@@ -1182,6 +1173,149 @@ test "project unused rejects a shadowed std build type" {
     try std.testing.expect(found_main);
 }
 
+test "project public API closure follows conditional aliases and cycles" {
+    const allocator = std.testing.allocator;
+    var root = try std.zig.Ast.parse(allocator,
+        \\const selected = @import("left.zig");
+        \\pub const api = if (@import("condition.zig").enabled) selected else @import("right.zig");
+        \\pub const value = make(@import("hidden.zig"));
+    , .zig);
+    defer root.deinit(allocator);
+    var left = try std.zig.Ast.parse(allocator,
+        \\pub const cycle = @import("root.zig");
+        \\pub const leaf = @import("leaf.zig");
+    , .zig);
+    defer left.deinit(allocator);
+    var empty = try std.zig.Ast.parse(allocator, "", .zig);
+    defer empty.deinit(allocator);
+    const files = [_]import_resolver.File{
+        .{ .path = "root.zig", .tree = &root },
+        .{ .path = "left.zig", .tree = &left },
+        .{ .path = "right.zig", .tree = &empty },
+        .{ .path = "leaf.zig", .tree = &empty },
+        .{ .path = "condition.zig", .tree = &empty },
+        .{ .path = "hidden.zig", .tree = &empty },
+    };
+    var project = try ProjectContext.init(allocator, &files, &.{});
+    defer project.deinit();
+    try project.appendApiRoot(0);
+    try project.collectPublicApiFiles();
+    for (0..4) |index| try std.testing.expect(project.isPublicApiFile(index));
+    try std.testing.expect(!project.isPublicApiFile(4));
+    try std.testing.expect(!project.isPublicApiFile(5));
+}
+
+test "project references retain typed reexports without promoting homonyms" {
+    const allocator = std.testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var directory = compat.TestDir.init();
+    defer directory.cleanup();
+    try directory.writeFile("api.zig",
+        \\const Self = @This();
+        \\pub const Leaf = struct {};
+        \\pub const Wrapper = struct { child: Leaf, next: ?*Wrapper };
+        \\pub fn run(_: *Self) Wrapper { return undefined; }
+        \\pub fn unused() void {}
+    );
+    try directory.writeFile("facade.zig", "pub const api = @import(\"api.zig\");\n");
+    try directory.writeFile("decoy.zig", "pub fn run() void {}\n");
+    try directory.writeFile("consumer.zig",
+        \\const facade = @import("facade.zig");
+        \\pub fn main() void {
+        \\    var api: facade.api = .{};
+        \\    _ = api.run();
+        \\}
+        \\fn dynamic(receiver: anytype) void { receiver.unused(); }
+    );
+    const names = [_][]const u8{ "api.zig", "facade.zig", "decoy.zig", "consumer.zig" };
+    var buffers: [names.len][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        paths[index] = try std.fmt.bufPrint(&buffers[index], "{s}/{s}", .{ directory.path(), name });
+    }
+    var project = try ProjectSources.init(&io_context, allocator, &paths);
+    defer project.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*item| item.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try analyze(&project, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    var found_unused = false;
+    var found_homonym = false;
+    for (diagnostics.items) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.file_path, paths[0])) {
+            found_unused = std.mem.indexOf(u8, diagnostic.message, "unused") != null;
+        } else if (std.mem.eql(u8, diagnostic.file_path, paths[2])) {
+            found_homonym = std.mem.indexOf(u8, diagnostic.message, "run") != null;
+        }
+    }
+    try std.testing.expect(found_unused);
+    try std.testing.expect(found_homonym);
+}
+
+test "project contextual constants retain only their expected container" {
+    const allocator = std.testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var directory = compat.TestDir.init();
+    defer directory.cleanup();
+    const constant = "pub const empty: @This() = .{};\n";
+    try directory.writeFile("assigned.zig", constant);
+    try directory.writeFile("returned.zig", constant);
+    try directory.writeFile("initialized.zig", constant);
+    try directory.writeFile("decoy.zig", constant);
+    try directory.writeFile("nested.zig", constant ++
+        "pub const Item = struct { pub const empty: @This() = .{}; };\n");
+    try directory.writeFile(
+        "consumer.zig",
+        "const Assigned = @import(\"assigned.zig\");\n" ++
+            "const Returned = @import(\"returned.zig\");\n" ++
+            "const Initialized = @import(\"initialized.zig\");\n" ++
+            "const Nested = @import(\"nested.zig\").Item;\n" ++
+            "fn reset(value: *Assigned) void { value.* = .empty; }\n" ++
+            "fn make() error{OutOfMemory}!Returned { return .empty; }\n" ++
+            "pub fn main() void {\n" ++
+            "    var assigned: Assigned = .{};\n" ++
+            "    reset(&assigned);\n" ++
+            "    _ = make() catch return;\n" ++
+            "    const initialized: Initialized = .empty;\n" ++
+            "    const nested: Nested = .empty;\n" ++
+            "    _ = initialized;\n" ++
+            "    _ = nested;\n" ++
+            "}\n",
+    );
+    const names = [_][]const u8{
+        "assigned.zig", "returned.zig", "initialized.zig",
+        "decoy.zig",    "nested.zig",   "consumer.zig",
+    };
+    var buffers: [names.len][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        paths[index] = try std.fmt.bufPrint(&buffers[index], "{s}/{s}", .{ directory.path(), name });
+    }
+    var project = try ProjectSources.init(&io_context, allocator, &paths);
+    defer project.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try analyze(&project, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    var found_decoy = false;
+    var found_nested = false;
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expectEqual(@as(usize, 1), diagnostic.range.start.line);
+        if (std.mem.eql(u8, diagnostic.file_path, paths[3])) found_decoy = true;
+        if (std.mem.eql(u8, diagnostic.file_path, paths[4])) found_nested = true;
+    }
+    try std.testing.expect(found_decoy);
+    try std.testing.expect(found_nested);
+}
+
 test "project unused declarations ignore Zig build entrypoint" {
     try std.testing.expect(isIgnoredPublicDecl("build.zig", "build"));
     try std.testing.expect(isIgnoredPublicDecl("workspace/build.zig", "build"));
@@ -1189,32 +1323,56 @@ test "project unused declarations ignore Zig build entrypoint" {
     try std.testing.expect(!isIgnoredPublicDecl("build.zig", "helper"));
 }
 
-test "project unused analysis releases partial state on allocation failure" {
+test "project unused analysis requires complete source and build syntax" {
     const allocator = std.testing.allocator;
     var io_context = try compat.Context.init(allocator, 1);
     defer io_context.deinit();
     var directory = compat.TestDir.init();
     defer directory.cleanup();
-    try directory.writeFile("a.zig", "pub fn unusedA() void {}\n");
-    try directory.writeFile("b.zig", "pub fn unusedB() void {}\n");
-    var a_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var b_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const paths = [_][]const u8{
-        try std.fmt.bufPrint(&a_buffer, "{s}/a.zig", .{directory.path()}),
-        try std.fmt.bufPrint(&b_buffer, "{s}/b.zig", .{directory.path()}),
+    try directory.writeFile("a.zig",
+        \\pub fn unusedA() void {}
+        \\fn use() void {
+        \\    _ = @import("b.zig").used;
+        \\}
+    );
+    try directory.writeFile("b.zig", "pub fn unusedB() void {}\npub const used = 1;\n");
+    const complete_source = "pub fn ignored() void {}\n";
+    const complete_build =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addModule("fixture", .{ .root_source_file = b.path("b.zig") });
+        \\}
+    ;
+    const scenarios = [_]struct { source: []const u8, build: []const u8, expected: usize }{
+        .{ .source = "const broken = ;", .build = complete_build, .expected = 0 },
+        .{ .source = complete_source, .build = "const broken = ;", .expected = 0 },
+        .{ .source = complete_source, .build = complete_build, .expected = 2 },
     };
-    var project = try ProjectSources.init(&io_context, allocator, &paths);
-    defer project.deinit();
+    const names = [_][]const u8{ "a.zig", "malformed.zig", "b.zig" };
+    var buffers: [names.len][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        paths[index] = try std.fmt.bufPrint(&buffers[index], "{s}/{s}", .{ directory.path(), name });
+    }
     const Harness = struct {
-        fn run(failing_allocator: std.mem.Allocator, sources: *const ProjectSources) !void {
+        fn run(failing_allocator: std.mem.Allocator, sources: *const ProjectSources, expected: usize) !void {
             var diagnostics: std.ArrayList(Diagnostic) = .empty;
             defer {
                 for (diagnostics.items) |*item| item.deinit(failing_allocator);
                 diagnostics.deinit(failing_allocator);
             }
             try analyze(sources, failing_allocator, &diagnostics);
-            try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+            try std.testing.expectEqual(expected, diagnostics.items.len);
+            if (expected == 0) return;
+            try std.testing.expectEqualStrings("a.zig", std.fs.path.basename(diagnostics.items[0].file_path));
+            try std.testing.expectEqualStrings("malformed.zig", std.fs.path.basename(diagnostics.items[1].file_path));
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{&project});
+    for (scenarios) |scenario| {
+        try directory.writeFile("malformed.zig", scenario.source);
+        try directory.writeFile("build.zig", scenario.build);
+        var project = try ProjectSources.init(&io_context, allocator, &paths);
+        defer project.deinit();
+        try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{ &project, scenario.expected });
+    }
 }

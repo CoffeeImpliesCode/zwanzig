@@ -249,7 +249,7 @@ fn emitDiagnostic(
     if (token >= token_starts.len) return;
 
     const offset = token_starts[token];
-    const loc = src.byteToLocation(offset) catch return;
+    const loc = try src.byteToLocation(offset);
 
     const severity: checker_mod.Severity = switch (outcome) {
         .definite => .err,
@@ -269,7 +269,7 @@ fn emitDiagnostic(
         },
     };
 
-    const diagnostic = Diagnostic.initAtLocation(
+    var diagnostic = try Diagnostic.initAtLocation(
         allocator,
         src.getFilePath(),
         "divide-by-zero-engine",
@@ -277,6 +277,46 @@ fn emitDiagnostic(
         message,
         loc.line,
         loc.column,
-    ) catch return;
+    );
+    errdefer diagnostic.deinit(allocator);
     try diagnostics.append(allocator, diagnostic);
+}
+
+test "divide-by-zero emission propagates allocation failures without leaks" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, tree: *const std.zig.Ast, site: Site) !void {
+            var source = Source.initParsed(allocator, "divide-emission-oom.zig", tree);
+            defer source.deinit();
+            var result = checker_mod.AnalysisResult.init();
+            defer result.deinit(allocator);
+
+            try emitDiagnostic(&source, allocator, &result.diagnostics, tree, site, .definite);
+            try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+            const diagnostic = result.diagnostics.items[0];
+            try std.testing.expectEqualStrings("divide-by-zero-engine", diagnostic.rule_id);
+            try std.testing.expectEqual(checker_mod.Severity.err, diagnostic.severity);
+            try std.testing.expectEqual(
+                checker_mod.SourceRange.fromSingleLocation(.{ .line = 2, .column = 11 }),
+                diagnostic.range,
+            );
+        }
+    };
+    const code: [:0]const u8 =
+        \\fn foo() void {
+        \\    _ = 1 / 0;
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const site: Site = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .div) continue;
+        break .{
+            .ast_node = @intCast(index),
+            .denominator_node = @intFromEnum(tree.nodes.items(.data)[index].node_and_node[1]),
+            .kind = .division,
+        };
+    } else return error.TestUnexpectedResult;
+
+    // The borrowed AST isolates location, message, and append allocations.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ &tree, site });
 }

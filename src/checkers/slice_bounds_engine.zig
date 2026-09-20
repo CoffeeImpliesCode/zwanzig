@@ -6,13 +6,13 @@ const Diagnostic = checker_mod.Diagnostic;
 const Source = @import("../source.zig").Source;
 const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
-const AnalysisEngine = engine_mod.AnalysisEngine;
 const scan = @import("slice_bounds/scan.zig");
 
 pub const SliceBoundsEngineChecker = struct {
     pub const checker: Checker = .{
         .name = "slice-bounds-engine",
         .default_severity = .err,
+        .type_requirement = .optional,
         .checkAstFn = checkAst,
     };
 
@@ -22,7 +22,7 @@ pub const SliceBoundsEngineChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         var reported: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(allocator);
@@ -43,43 +43,15 @@ pub const SliceBoundsEngineChecker = struct {
         context: checker_mod.CheckerContext,
         reported: *std.AutoHashMap(u32, void),
     ) CheckerError!void {
-        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch return) orelse return;
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return,
+        }) orelse return;
         defer cfg_handle.deinit();
 
-        var engine = AnalysisEngine.initWithSource(allocator, cfg_handle.cfg, src);
-        defer engine.deinit();
-        engine.setCheckerName("slice-bounds-engine");
-        if (context.type_context) |type_ctx| {
-            engine.setTypeContext(type_ctx);
-        }
-        if (context.cached_artifacts) |artifacts| {
-            engine.setCachedArtifacts(artifacts);
-        }
-        if (context.build_metadata) |metadata| {
-            engine.setBuildMetadata(metadata);
-        }
-        if (context.config) |config| {
-            engine.setConfig(config);
-        }
-        if (context.analysis_limits.max_worklist_steps) |steps| {
-            engine.setMaxWorklistSteps(steps);
-        }
-        if (context.analysis_limits.max_states_per_point) |max| {
-            engine.setMaxStatesPerPoint(max);
-        }
-        if (context.analysis_limits.use_widening) |use_w| {
-            engine.setUseWidening(use_w);
-        }
-
-        var run_ok = true;
-        engine.run() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AnalysisLimitExceeded => run_ok = false,
-        };
-        if (context.analysis_stats) |stats| {
-            stats.recordRun();
-            stats.recordWidening(engine.getGraph().getWidenedNodeCount(), engine.getGraph().getWideningConvergedCount());
-        }
+        var analysis = try context.getOrAnalyze(allocator, src, &cfg_handle, checker.name, .configured);
+        defer analysis.deinit();
+        const engine = analysis.engine;
 
         if (context.dump_exploded_graph_dir) |dir| {
             engine_mod.dot.writeExplodedGraphToFile(engine.getGraph(), context.io_context, dir, src.getFilePath(), cfg_handle.cfg.fn_name, allocator);
@@ -91,15 +63,9 @@ pub const SliceBoundsEngineChecker = struct {
             engine_mod.dot.writePathTracesToFile(engine.getGraph(), context.io_context, dir, src.getFilePath(), cfg_handle.cfg.fn_name, allocator);
         }
 
-        if (!run_ok) return;
+        if (!analysis.complete) return;
 
-        const tree = src.ast() catch return;
-        try scan.scanForBoundsViolations(src, allocator, diagnostics, tree, &engine, cfg_handle.cfg, fn_node, reported);
+        const tree = try src.ast();
+        try scan.scanForBoundsViolations(src, allocator, diagnostics, tree, engine, cfg_handle.cfg, fn_node, reported);
     }
 };
-
-test "SliceBoundsEngineChecker initialization" {
-    const testing = std.testing;
-    try testing.expectEqualStrings("slice-bounds-engine", SliceBoundsEngineChecker.checker.name);
-    try testing.expectEqual(checker_mod.Severity.err, SliceBoundsEngineChecker.checker.default_severity);
-}

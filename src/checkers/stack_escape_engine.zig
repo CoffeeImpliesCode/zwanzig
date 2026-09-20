@@ -1,5 +1,4 @@
 const std = @import("std");
-const log = std.log.scoped(.stack_escape_engine);
 const checker_mod = @import("../checker.zig");
 const Checker = checker_mod.Checker;
 const CheckerError = checker_mod.CheckerError;
@@ -12,6 +11,7 @@ const ids = @import("../ids.zig");
 const VarResolver = @import("../engine/var_resolver.zig").VarResolver;
 const Cfg = @import("../cfg.zig").Cfg;
 const EdgeKind = @import("../cfg.zig").EdgeKind;
+const IrNode = @import("../ir.zig").IrNode;
 const call_utils = @import("../analysis/call_utils.zig");
 const allocator_utils = @import("../analysis/allocator_utils.zig");
 
@@ -57,6 +57,7 @@ pub const StackEscapeEngineChecker = struct {
 
         fn clone(self: *const OriginState) !OriginState {
             var copy = OriginState.init(self.allocator);
+            errdefer copy.deinit();
             var iter = self.origins.iterator();
             while (iter.next()) |entry| {
                 try copy.origins.put(entry.key_ptr.*, entry.value_ptr.*);
@@ -141,7 +142,7 @@ pub const StackEscapeEngineChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         for (0..tags.len) |i| {
@@ -158,11 +159,14 @@ pub const StackEscapeEngineChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch return) orelse return;
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return,
+        }) orelse return;
         defer cfg_handle.deinit();
 
-        const tree = src.ast() catch return;
-        var resolver = VarResolver.init(allocator, tree, fn_node) catch return;
+        const tree = try src.ast();
+        var resolver = try VarResolver.init(allocator, tree, fn_node);
         defer resolver.deinit();
 
         var fqn_buffer: [256]u8 = undefined;
@@ -352,7 +356,7 @@ pub const StackEscapeEngineChecker = struct {
 
     fn handleAssignSpawn(
         ctx: *AnalysisContext,
-        ir_node: @import("../ir.zig").IrNode,
+        ir_node: IrNode,
         cfg_node: ids.CfgNodeId,
         call_cfg_map: *const std.AutoHashMap(u32, ids.CfgNodeId),
         spawn_sites: *std.ArrayList(SpawnSite),
@@ -495,6 +499,7 @@ pub const StackEscapeEngineChecker = struct {
             return;
         }
         var list: std.ArrayList(ids.CfgNodeId) = .empty;
+        errdefer list.deinit(allocator);
         try list.append(allocator, node);
         try map.put(var_id, list);
     }
@@ -521,7 +526,7 @@ pub const StackEscapeEngineChecker = struct {
             } else if (site.thread_var) |var_id| {
                 if (detach_nodes.get(var_id) == null) {
                     if (join_nodes.get(var_id)) |list| {
-                        guaranteed = isJoinGuaranteed(
+                        guaranteed = try isJoinGuaranteed(
                             allocator,
                             cfg,
                             succs.items,
@@ -606,8 +611,7 @@ pub const StackEscapeEngineChecker = struct {
             );
 
             if (!new_out.eql(&out_states[idx])) {
-                out_states[idx].deinit();
-                out_states[idx] = try new_out.clone();
+                std.mem.swap(OriginState, &out_states[idx], &new_out);
                 for (succs.items[idx].items) |succ| {
                     try worklist.append(allocator, succ.to);
                 }
@@ -625,6 +629,7 @@ pub const StackEscapeEngineChecker = struct {
         }
         const first_idx: usize = @intCast(ids.cfgIndex(pred_nodes[0]));
         var merged = try out_states[first_idx].clone();
+        errdefer merged.deinit();
         for (pred_nodes[1..]) |pred| {
             const idx: usize = @intCast(ids.cfgIndex(pred));
             try merged.mergeWith(&out_states[idx]);
@@ -820,18 +825,12 @@ pub const StackEscapeEngineChecker = struct {
         const capture_token = main_tokens[capture_node];
         if (capture_token >= token_tags.len) return;
 
-        const capture_loc = ctx.src.tokenLocation(capture_token) catch |err| {
-            log.warn("failed to map capture location: {}", .{err});
-            return;
-        };
+        const capture_loc = try ctx.src.tokenLocation(capture_token);
 
         var related_range: ?checker_mod.SourceRange = null;
         var origin_line: usize = 1;
         var origin_col: usize = 1;
-        const origin_loc = ctx.src.tokenLocation(origin_token) catch |err| {
-            log.warn("failed to map origin location: {}", .{err});
-            return;
-        };
+        const origin_loc = try ctx.src.tokenLocation(origin_token);
         origin_line = origin_loc.line;
         origin_col = origin_loc.column;
         related_range = checker_mod.SourceRange.fromSingleLocation(origin_loc);
@@ -844,7 +843,7 @@ pub const StackEscapeEngineChecker = struct {
         );
         defer allocator.free(message);
 
-        const diag = try Diagnostic.initAtLocationWithRelated(
+        var diag = try Diagnostic.initAtLocationWithRelated(
             allocator,
             ctx.src.getFilePath(),
             "stack-escape-engine",
@@ -854,6 +853,7 @@ pub const StackEscapeEngineChecker = struct {
             capture_loc.column,
             related_range,
         );
+        errdefer diag.deinit(allocator);
         try diagnostics.append(allocator, diag);
     }
 
@@ -1885,27 +1885,33 @@ pub const StackEscapeEngineChecker = struct {
     };
 
     fn buildSuccessorLists(allocator: std.mem.Allocator, cfg: *const Cfg) !EdgeLists {
-        var lists = try allocator.alloc(std.ArrayList(EdgeRef), cfg.nodeCount());
-        for (lists) |*list| {
+        var lists: EdgeLists = .{
+            .items = try allocator.alloc(std.ArrayList(EdgeRef), cfg.nodeCount()),
+        };
+        for (lists.items) |*list| {
             list.* = .empty;
         }
+        errdefer deinitEdgeLists(allocator, &lists);
         for (cfg.edges.items) |edge| {
             const idx: usize = @intCast(ids.cfgIndex(edge.from));
-            try lists[idx].append(allocator, .{ .to = edge.to, .kind = edge.kind });
+            try lists.items[idx].append(allocator, .{ .to = edge.to, .kind = edge.kind });
         }
-        return .{ .items = lists };
+        return lists;
     }
 
     fn buildPredecessorLists(allocator: std.mem.Allocator, cfg: *const Cfg) !NodeLists {
-        var lists = try allocator.alloc(std.ArrayList(ids.CfgNodeId), cfg.nodeCount());
-        for (lists) |*list| {
+        var lists: NodeLists = .{
+            .items = try allocator.alloc(std.ArrayList(ids.CfgNodeId), cfg.nodeCount()),
+        };
+        for (lists.items) |*list| {
             list.* = .empty;
         }
+        errdefer deinitNodeLists(allocator, &lists);
         for (cfg.edges.items) |edge| {
             const idx: usize = @intCast(ids.cfgIndex(edge.to));
-            try lists[idx].append(allocator, edge.from);
+            try lists.items[idx].append(allocator, edge.from);
         }
-        return .{ .items = lists };
+        return lists;
     }
 
     const NodeLists = struct {
@@ -1933,13 +1939,13 @@ pub const StackEscapeEngineChecker = struct {
         spawn_node: ids.CfgNodeId,
         join_nodes: []const ids.CfgNodeId,
         has_try_error_edge: bool,
-    ) bool {
+    ) std.mem.Allocator.Error!bool {
         if (join_nodes.len == 0) return false;
         // For `try spawn`, ignore the try_error edge from the spawn site:
         // no thread is created on that error path, so join isn't required there.
         const skip_try_error_from = if (has_try_error_edge) spawn_node else null;
         // Join is guaranteed only if no path reaches exit while avoiding all join nodes.
-        return !isExitReachableWithoutAnyNode(allocator, cfg, succs, spawn_node, join_nodes, skip_try_error_from);
+        return !(try isExitReachableWithoutAnyNode(allocator, cfg, succs, spawn_node, join_nodes, skip_try_error_from));
     }
 
     fn isExitReachableWithoutAnyNode(
@@ -1949,9 +1955,9 @@ pub const StackEscapeEngineChecker = struct {
         start: ids.CfgNodeId,
         blocked_nodes: []const ids.CfgNodeId,
         skip_try_error_from: ?ids.CfgNodeId,
-    ) bool {
+    ) std.mem.Allocator.Error!bool {
         const node_count = cfg.nodeCount();
-        var blocked = allocator.alloc(bool, node_count) catch return true;
+        var blocked = try allocator.alloc(bool, node_count);
         defer allocator.free(blocked);
         @memset(blocked, false);
         for (blocked_nodes) |node| {
@@ -1963,13 +1969,13 @@ pub const StackEscapeEngineChecker = struct {
 
         if (blocked[@intCast(ids.cfgIndex(start))]) return false;
 
-        var visited = allocator.alloc(bool, node_count) catch return true;
+        var visited = try allocator.alloc(bool, node_count);
         defer allocator.free(visited);
         @memset(visited, false);
 
         var queue: std.ArrayList(ids.CfgNodeId) = .empty;
         defer queue.deinit(allocator);
-        queue.append(allocator, start) catch return true;
+        try queue.append(allocator, start);
         visited[@intCast(ids.cfgIndex(start))] = true;
 
         while (queue.items.len > 0) {
@@ -1985,7 +1991,7 @@ pub const StackEscapeEngineChecker = struct {
                 }
                 if (visited[succ_idx]) continue;
                 visited[succ_idx] = true;
-                queue.append(allocator, succ.to) catch return true;
+                try queue.append(allocator, succ.to);
             }
         }
 
@@ -2066,6 +2072,118 @@ pub const StackEscapeEngineChecker = struct {
         return allocator_utils.isAllocatorExpr(ctx.tree, ctx.type_ctx, allocator_arg);
     }
 };
+
+test "stack_escape_engine - analysis allocations propagate without losing ownership" {
+    const allocator = std.testing.allocator;
+    const Case = struct { code: [:0]const u8, expected: usize };
+    const cases = [_]Case{
+        .{
+            .code =
+            \\fn sample(flag: bool) *u8 {
+            \\    var local: u8 = 0;
+            \\    var pointer = &local;
+            \\    if (flag) { local = 1; }
+            \\    return pointer;
+            \\}
+            ,
+            .expected = 1,
+        },
+        .{
+            .code =
+            \\const std = @import("std");
+            \\extern fn consume(pointer: *u8) void;
+            \\fn sample(flag: bool) !void {
+            \\    var local: u8 = 0;
+            \\    const thread = try std.Thread.spawn(.{}, consume, .{&local});
+            \\    if (flag) { thread.join(); } else { thread.join(); }
+            \\}
+            ,
+            .expected = 0,
+        },
+    };
+    const Harness = struct {
+        fn run(
+            memory: std.mem.Allocator,
+            tree: *const std.zig.Ast,
+            context: checker_mod.CheckerContext,
+            expected: usize,
+        ) !void {
+            var source = Source.initParsed(memory, "stack-oom.zig", tree);
+            defer source.deinit();
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(memory);
+                diagnostics.deinit(memory);
+            }
+            try StackEscapeEngineChecker.checker.checkAst(&source, memory, &diagnostics, context);
+            try std.testing.expectEqual(expected, diagnostics.items.len);
+        }
+    };
+    for (cases) |case| {
+        var source = Source.init(allocator, "stack-oom.zig", case.code);
+        defer source.deinit();
+        var artifacts = checker_mod.CachedArtifacts.init(allocator);
+        defer artifacts.deinit();
+        const context: checker_mod.CheckerContext = .{
+            .build_metadata = null,
+            .cached_artifacts = &artifacts,
+        };
+        const tree = try source.ast();
+        for (tree.nodes.items(.tag), 0..) |tag, index| {
+            if (tag != .fn_decl) continue;
+            var handle = (try context.getOrBuildCfg(allocator, &source, ids.astId(@intCast(index)))) orelse
+                return error.TestUnexpectedResult;
+            handle.deinit();
+        }
+        try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{ tree, context, case.expected });
+    }
+}
+
+test "stack_escape_engine - failed path search does not invent an unjoined exit" {
+    const allocator = std.testing.allocator;
+    const CheckerImpl = StackEscapeEngineChecker;
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    cfg.entry = try cfg.addNode(IrNode.init(.call));
+    const join = try cfg.addNode(IrNode.init(.call));
+    cfg.exit = try cfg.addNode(IrNode.init(.fn_exit));
+    try cfg.addEdge(join, cfg.exit);
+    try cfg.addEdgeWithKind(cfg.entry, cfg.exit, .try_error);
+    // Force queue growth after the initial allocation. Every successful path joins.
+    for (0..40) |_| {
+        const branch = try cfg.addNode(IrNode.init(.branch));
+        try cfg.addEdge(cfg.entry, branch);
+        try cfg.addEdge(branch, join);
+    }
+    var successors = try CheckerImpl.buildSuccessorLists(allocator, &cfg);
+    defer CheckerImpl.deinitEdgeLists(allocator, &successors);
+    const Harness = struct {
+        fn run(
+            memory: std.mem.Allocator,
+            graph: *const Cfg,
+            succs: []std.ArrayList(CheckerImpl.EdgeRef),
+            join_node: ids.CfgNodeId,
+        ) !void {
+            try std.testing.expect(try CheckerImpl.isJoinGuaranteed(
+                memory,
+                graph,
+                succs,
+                graph.entry,
+                &.{join_node},
+                true,
+            ));
+            try std.testing.expect(!(try CheckerImpl.isJoinGuaranteed(
+                memory,
+                graph,
+                succs,
+                graph.entry,
+                &.{join_node},
+                false,
+            )));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{ &cfg, successors.items, join });
+}
 
 fn expectStackEscapeDiagnostics(code: [:0]const u8, expected: usize) !void {
     const allocator = std.testing.allocator;

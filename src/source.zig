@@ -7,6 +7,7 @@ pub const Location = diagnostic.Location;
 pub const SourceRange = diagnostic.SourceRange;
 pub const LocationMapper = diagnostic.LocationMapper;
 pub const ZirBridge = zir_bridge_mod.ZirBridge;
+pub const ZirBridgeError = zir_bridge_mod.ZirBridgeError;
 pub const TypeInfo = zir_bridge_mod.TypeInfo;
 pub const DeclInfo = zir_bridge_mod.DeclInfo;
 
@@ -20,6 +21,7 @@ pub const Source = struct {
     cached_location_mapper: ?LocationMapper = null,
     cached_zir_bridge: ?ZirBridge = null,
     zir_load_attempted: bool = false,
+    zir_load_error: ?ZirBridgeError = null,
 
     pub fn init(allocator: std.mem.Allocator, file_path: []const u8, content: [:0]const u8) Source {
         return Source{
@@ -123,27 +125,30 @@ pub const Source = struct {
     /// Returns null if parsing or AstGen fails, including unsupported syntax.
     /// Subsequent calls return the cached result.
     pub fn zirBridge(self: *Source) ?*const ZirBridge {
-        if (!self.zir_load_attempted) {
-            self.zir_load_attempted = true;
-            self.loadZirBridge();
-        }
-        if (self.cached_zir_bridge) |*bridge| {
-            return bridge;
-        }
-        return null;
+        return self.requireZirBridge() catch null;
     }
 
-    /// Force loading of ZIR bridge (internal use).
-    fn loadZirBridge(self: *Source) void {
-        var bridge = ZirBridge.init(self.allocator);
-        bridge.loadFromSource(self) catch |err| {
-            // Expected for files with parse errors or syntax this binary's
-            // embedded Zig frontend does not support; typed analysis is
-            // disabled for this file and AST/token rules still run.
+    /// Load type information without hiding parse, frontend, or allocation failures.
+    /// A prior best-effort query retains the original failure for required callers.
+    pub fn requireZirBridge(self: *Source) ZirBridgeError!*const ZirBridge {
+        if (self.cached_zir_bridge) |*bridge| return bridge;
+        if (self.zir_load_error) |err| return err;
+
+        self.zir_load_attempted = true;
+        self.loadZirBridge() catch |err| {
+            self.zir_load_error = err;
             log.debug("ZIR bridge unavailable for {s}: {s}", .{ self.file_path, @errorName(err) });
-            bridge.deinit();
-            return;
+            return err;
         };
+        return &self.cached_zir_bridge.?;
+    }
+
+    fn loadZirBridge(self: *Source) ZirBridgeError!void {
+        // Preserve AST allocation errors before the bridge's parse-error boundary.
+        _ = try self.ast();
+        var bridge = ZirBridge.init(self.allocator);
+        errdefer bridge.deinit();
+        try bridge.loadFromSource(self);
         self.cached_zir_bridge = bridge;
     }
 
@@ -384,6 +389,34 @@ test "Source zirBridge caching" {
 
     const bridge2 = source.zirBridge();
     try testing.expect(bridge1 == bridge2);
+}
+
+test "Source required ZIR preserves errors after best-effort queries" {
+    const testing = std.testing;
+    const cases = [_]struct { code: [:0]const u8, expected: ZirBridgeError }{
+        .{ .code = "const x = ;", .expected = error.ParseError },
+        .{ .code = "const x = @zwanzigUnsupportedBuiltin();", .expected = error.AstGenFailed },
+    };
+    for (cases) |case| {
+        var source = Source.init(testing.allocator, "test.zig", case.code);
+        defer source.deinit();
+        try testing.expect(source.zirBridge() == null);
+        try testing.expectError(case.expected, source.requireZirBridge());
+    }
+}
+
+test "Source required ZIR preserves parse and generation allocation failures" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |preparse| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var source = Source.init(failing.allocator(), "test.zig", "const x: u8 = 1;");
+        defer source.deinit();
+        if (preparse) _ = try source.ast();
+        failing.fail_index = failing.alloc_index;
+        failing.resize_fail_index = failing.resize_index;
+        try testing.expect(source.zirBridge() == null);
+        try testing.expectError(error.OutOfMemory, source.requireZirBridge());
+    }
 }
 
 test "Source hasTypeInfo" {

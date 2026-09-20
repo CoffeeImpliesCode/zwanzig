@@ -39,23 +39,25 @@ pub const CachedArtifacts = struct {
     pub fn deinit(self: *CachedArtifacts) void {
         var iter = self.cfgs.valueIterator();
         while (iter.next()) |cfg_ptr| {
-            // Free fn_name if it was allocated during deserialization
-            if (cfg_ptr.*.fn_name) |name| {
-                self.allocator.free(name);
-            }
-            cfg_ptr.*.deinit();
-            self.allocator.destroy(cfg_ptr.*);
+            destroyCfg(self.allocator, cfg_ptr.*);
         }
         self.cfgs.deinit();
     }
 
-    /// Add a CFG for a function to the artifacts.
-    /// Takes ownership of the CFG and normalizes owned fields.
+    /// Take ownership on success; leave the caller's CFG unchanged on failure.
+    /// The CFG must be allocated with self.allocator and not already owned by this cache.
+    /// Its borrowed function name is copied, and any previous CFG for the key is freed.
     pub fn addCfg(self: *CachedArtifacts, fn_ast_node: u32, cfg: *Cfg) !void {
-        if (cfg.fn_name) |name| {
-            cfg.fn_name = try self.allocator.dupe(u8, name);
+        const owned_name = if (cfg.fn_name) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (owned_name) |name| self.allocator.free(name);
+
+        const entry = try self.cfgs.getOrPut(fn_ast_node);
+        if (entry.found_existing) {
+            std.debug.assert(entry.value_ptr.* != cfg);
+            destroyCfg(self.allocator, entry.value_ptr.*);
         }
-        try self.cfgs.put(fn_ast_node, cfg);
+        cfg.fn_name = owned_name;
+        entry.value_ptr.* = cfg;
     }
 
     /// Get a CFG for a function by its AST node index.
@@ -110,10 +112,9 @@ pub const CachedArtifacts = struct {
             return error.VersionMismatch;
         }
 
-        const had_type_info = data[8] != 0;
-
-        var offset: usize = 9;
-        if (data.len < offset + 4) {
+        var offset: usize = 8;
+        const had_type_info = try deserializeBool(data, &offset);
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
 
@@ -126,19 +127,22 @@ pub const CachedArtifacts = struct {
         artifacts.had_type_info = had_type_info;
 
         for (0..cfg_count) |_| {
-            if (data.len < offset + 4) {
+            if (!hasBytes(data, offset, 4)) {
                 return error.InvalidFormat;
             }
 
             const fn_node = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
+            if (artifacts.cfgs.contains(fn_node)) return error.InvalidFormat;
 
             const cfg_result = try deserializeCfg(allocator, data, offset);
+            errdefer destroyCfg(allocator, cfg_result.cfg);
             offset = cfg_result.new_offset;
 
-            try artifacts.cfgs.put(fn_node, cfg_result.cfg);
+            try artifacts.cfgs.putNoClobber(fn_node, cfg_result.cfg);
         }
 
+        if (offset != data.len) return error.InvalidFormat;
         return artifacts;
     }
 
@@ -147,6 +151,34 @@ pub const CachedArtifacts = struct {
         return self.cfgs.count() > 0;
     }
 };
+
+fn destroyCfg(allocator: std.mem.Allocator, cfg: *Cfg) void {
+    if (cfg.fn_name) |name| allocator.free(name);
+    cfg.deinit();
+    allocator.destroy(cfg);
+}
+
+fn hasBytes(data: []const u8, offset: usize, length: usize) bool {
+    return offset <= data.len and length <= data.len - offset;
+}
+
+fn deserializeBool(data: []const u8, offset: *usize) !bool {
+    if (!hasBytes(data, offset.*, 1)) return error.InvalidFormat;
+    const value = data[offset.*];
+    offset.* += 1;
+    return switch (value) {
+        0 => false,
+        1 => true,
+        else => error.InvalidFormat,
+    };
+}
+
+fn deserializeEnum(comptime T: type, value: u8) !T {
+    inline for (std.meta.fields(T)) |field| {
+        if (value == field.value) return @enumFromInt(value);
+    }
+    return error.InvalidFormat;
+}
 
 fn serializeCfg(cfg: *const Cfg, allocator: std.mem.Allocator, buffer: *std.ArrayList(u8)) !void {
     var node_count_bytes: [4]u8 = undefined;
@@ -267,7 +299,7 @@ const DeserializeCfgResult = struct {
 fn deserializeCfg(allocator: std.mem.Allocator, data: []const u8, start_offset: usize) !DeserializeCfgResult {
     var offset = start_offset;
 
-    if (data.len < offset + 4) {
+    if (!hasBytes(data, offset, 4)) {
         return error.InvalidFormat;
     }
     const node_count = std.mem.readInt(u32, data[offset..][0..4], .little);
@@ -275,10 +307,7 @@ fn deserializeCfg(allocator: std.mem.Allocator, data: []const u8, start_offset: 
 
     const cfg = try allocator.create(Cfg);
     cfg.* = Cfg.init(allocator);
-    errdefer {
-        cfg.deinit();
-        allocator.destroy(cfg);
-    }
+    errdefer destroyCfg(allocator, cfg);
 
     for (0..node_count) |i| {
         const node_result = try deserializeIrNode(data, offset);
@@ -288,7 +317,7 @@ fn deserializeCfg(allocator: std.mem.Allocator, data: []const u8, start_offset: 
         std.debug.assert(ids.cfgIndex(idx) == @as(u32, @intCast(i)));
     }
 
-    if (data.len < offset + 4) {
+    if (!hasBytes(data, offset, 4)) {
         return error.InvalidFormat;
     }
     const edge_count = std.mem.readInt(u32, data[offset..][0..4], .little);
@@ -297,47 +326,40 @@ fn deserializeCfg(allocator: std.mem.Allocator, data: []const u8, start_offset: 
     for (0..edge_count) |_| {
         const edge_result = try deserializeEdge(data, offset);
         offset = edge_result.new_offset;
-
-        try cfg.addEdgeWithKind(edge_result.edge.from, edge_result.edge.to, edge_result.edge.kind);
+        const edge = edge_result.edge;
+        if (ids.cfgIndex(edge.from) >= node_count or ids.cfgIndex(edge.to) >= node_count) {
+            return error.InvalidFormat;
+        }
+        try cfg.addEdgeWithKind(edge.from, edge.to, edge.kind);
     }
 
-    if (data.len < offset + 8) {
+    if (!hasBytes(data, offset, 8)) {
         return error.InvalidFormat;
     }
     cfg.entry = ids.cfgId(std.mem.readInt(u32, data[offset..][0..4], .little));
     offset += 4;
     cfg.exit = ids.cfgId(std.mem.readInt(u32, data[offset..][0..4], .little));
     offset += 4;
-
-    if (data.len < offset + 1) {
+    if (ids.cfgIndex(cfg.entry) >= node_count or ids.cfgIndex(cfg.exit) >= node_count) {
         return error.InvalidFormat;
     }
-    const has_fn_name = data[offset] != 0;
-    offset += 1;
 
-    if (has_fn_name) {
-        if (data.len < offset + 4) {
+    if (try deserializeBool(data, &offset)) {
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
         const name_len: usize = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
 
-        if (data.len < offset + name_len) {
+        if (!hasBytes(data, offset, name_len)) {
             return error.InvalidFormat;
         }
         cfg.fn_name = try allocator.dupe(u8, data[offset..][0..name_len]);
         offset += name_len;
     }
-    errdefer if (cfg.fn_name) |name| allocator.free(name);
 
-    if (data.len < offset + 1) {
-        return error.InvalidFormat;
-    }
-    const has_fn_ast_node = data[offset] != 0;
-    offset += 1;
-
-    if (has_fn_ast_node) {
-        if (data.len < offset + 4) {
+    if (try deserializeBool(data, &offset)) {
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
         cfg.fn_ast_node = ids.astId(std.mem.readInt(u32, data[offset..][0..4], .little));
@@ -358,68 +380,46 @@ const DeserializeIrNodeResult = struct {
 fn deserializeIrNode(data: []const u8, start_offset: usize) !DeserializeIrNodeResult {
     var offset = start_offset;
 
-    if (data.len < offset + 2) {
+    if (!hasBytes(data, offset, 1)) {
         return error.InvalidFormat;
     }
 
-    const tag: IrTag = @enumFromInt(data[offset]);
+    const tag = try deserializeEnum(IrTag, data[offset]);
     offset += 1;
 
     var node = IrNode.init(tag);
 
-    const has_ast_node = data[offset] != 0;
-    offset += 1;
-    if (has_ast_node) {
-        if (data.len < offset + 4) {
+    if (try deserializeBool(data, &offset)) {
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
         node.ast_node = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
     }
 
-    if (data.len < offset + 1) {
-        return error.InvalidFormat;
-    }
-    const has_range = data[offset] != 0;
-    offset += 1;
-    if (has_range) {
+    if (try deserializeBool(data, &offset)) {
         const range_result = try deserializeSourceRange(data, offset);
         node.source_range = range_result.range;
         offset = range_result.new_offset;
     }
 
-    if (data.len < offset + 1) {
-        return error.InvalidFormat;
-    }
-    const has_operand = data[offset] != 0;
-    offset += 1;
-    if (has_operand) {
-        if (data.len < offset + 4) {
+    if (try deserializeBool(data, &offset)) {
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
         node.operand_node = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
     }
 
-    if (data.len < offset + 1) {
-        return error.InvalidFormat;
-    }
-    const has_operand2 = data[offset] != 0;
-    offset += 1;
-    if (has_operand2) {
-        if (data.len < offset + 4) {
+    if (try deserializeBool(data, &offset)) {
+        if (!hasBytes(data, offset, 4)) {
             return error.InvalidFormat;
         }
         node.operand2_node = std.mem.readInt(u32, data[offset..][0..4], .little);
         offset += 4;
     }
 
-    if (data.len < offset + 1) {
-        return error.InvalidFormat;
-    }
-    const has_type = data[offset] != 0;
-    offset += 1;
-    if (has_type) {
+    if (try deserializeBool(data, &offset)) {
         const ti_result = try deserializeTypeInfo(data, offset);
         node.type_info = ti_result.type_info;
         offset = ti_result.new_offset;
@@ -437,7 +437,7 @@ const DeserializeSourceRangeResult = struct {
 };
 
 fn deserializeSourceRange(data: []const u8, start_offset: usize) !DeserializeSourceRangeResult {
-    if (data.len < start_offset + 16) {
+    if (!hasBytes(data, start_offset, 16)) {
         return error.InvalidFormat;
     }
 
@@ -461,13 +461,13 @@ const DeserializeEdgeResult = struct {
 };
 
 fn deserializeEdge(data: []const u8, start_offset: usize) !DeserializeEdgeResult {
-    if (data.len < start_offset + 9) {
+    if (!hasBytes(data, start_offset, 9)) {
         return error.InvalidFormat;
     }
 
     const from = ids.cfgId(std.mem.readInt(u32, data[start_offset..][0..4], .little));
     const to = ids.cfgId(std.mem.readInt(u32, data[start_offset + 4 ..][0..4], .little));
-    const kind: EdgeKind = @enumFromInt(data[start_offset + 8]);
+    const kind = try deserializeEnum(EdgeKind, data[start_offset + 8]);
 
     return .{
         .edge = CfgEdge.initWithKind(from, to, kind),
@@ -481,13 +481,14 @@ const DeserializeTypeInfoResult = struct {
 };
 
 fn deserializeTypeInfo(data: []const u8, start_offset: usize) !DeserializeTypeInfoResult {
-    if (data.len < start_offset + 4) {
+    if (!hasBytes(data, start_offset, 4)) {
         return error.InvalidFormat;
     }
 
-    const kind: TypeInfo.TypeKind = @enumFromInt(data[start_offset]);
+    const kind = try deserializeEnum(TypeInfo.TypeKind, data[start_offset]);
     const size_bits = std.mem.readInt(u16, data[start_offset + 1 ..][0..2], .little);
     const flags = data[start_offset + 3];
+    if (flags & ~@as(u8, 3) != 0) return error.InvalidFormat;
 
     return .{
         .type_info = .{
@@ -520,33 +521,43 @@ test "CachedArtifacts: serialize and deserialize empty" {
 test "CachedArtifacts: serialize and deserialize with CFG" {
     const allocator = std.testing.allocator;
 
-    var artifacts = CachedArtifacts.init(allocator);
-    defer artifacts.deinit();
-    artifacts.had_type_info = true;
-
-    const cfg = try allocator.create(Cfg);
-    cfg.* = Cfg.init(allocator);
-    const entry = try cfg.addNode(IrNode.init(.fn_entry));
-    const exit = try cfg.addNode(IrNode.init(.fn_exit));
-    try cfg.addEdge(entry, exit);
-    cfg.entry = entry;
-    cfg.exit = exit;
-
-    try artifacts.addCfg(42, cfg);
-
-    const serialized = try artifacts.serialize(allocator);
+    const serialized = try serializeArtifactTestCfg(allocator);
     defer allocator.free(serialized);
 
     var deserialized = try CachedArtifacts.deserialize(allocator, serialized);
     defer deserialized.deinit();
 
     try std.testing.expectEqual(true, deserialized.had_type_info);
-    try std.testing.expectEqual(@as(usize, 1), deserialized.cfgs.count());
+    try std.testing.expectEqual(@as(usize, 2), deserialized.cfgs.count());
+    const unnamed_cfg = deserialized.getCfg(84) orelse return error.TestExpectedCfg;
+    try std.testing.expect(unnamed_cfg.fn_name == null);
+    try std.testing.expect(unnamed_cfg.fn_ast_node == null);
 
-    const restored_cfg = deserialized.getCfg(42);
-    try std.testing.expect(restored_cfg != null);
-    try std.testing.expectEqual(@as(usize, 2), restored_cfg.?.nodeCount());
-    try std.testing.expectEqual(@as(usize, 1), restored_cfg.?.edgeCount());
+    const restored_cfg = deserialized.getCfg(42) orelse return error.TestExpectedCfg;
+    try std.testing.expectEqualStrings("cached_function", restored_cfg.fn_name.?);
+    try std.testing.expectEqual(ids.astId(42), restored_cfg.fn_ast_node.?);
+    try std.testing.expectEqual(ids.cfgId(0), restored_cfg.entry);
+    try std.testing.expectEqual(ids.cfgId(2), restored_cfg.exit);
+    try std.testing.expectEqual(@as(usize, 3), restored_cfg.nodeCount());
+    try std.testing.expectEqual(@as(usize, 2), restored_cfg.edgeCount());
+
+    const restored_node = restored_cfg.getNode(ids.cfgId(1)) orelse return error.TestUnexpectedResult;
+    const node = restored_node.ir_node;
+    try std.testing.expectEqual(IrTag.var_decl, node.tag);
+    try std.testing.expectEqual(@as(u32, 43), node.ast_node.?);
+    try std.testing.expectEqual(@as(u32, 44), node.operand_node.?);
+    try std.testing.expectEqual(@as(u32, 45), node.operand2_node.?);
+    try std.testing.expectEqual(@as(usize, 2), node.source_range.?.start.line);
+    try std.testing.expectEqual(@as(usize, 3), node.source_range.?.start.column);
+    try std.testing.expectEqual(@as(usize, 4), node.source_range.?.end.line);
+    try std.testing.expectEqual(@as(usize, 5), node.source_range.?.end.column);
+    try std.testing.expectEqual(TypeInfo.TypeKind.int, node.type_info.?.kind);
+    try std.testing.expectEqual(@as(u16, 32), node.type_info.?.size_bits);
+    try std.testing.expect(node.type_info.?.is_signed);
+    try std.testing.expect(node.type_info.?.is_comptime);
+    try std.testing.expectEqual(EdgeKind.branch_true, restored_cfg.edges.items[0].kind);
+    try std.testing.expectEqual(ids.cfgId(0), restored_cfg.edges.items[0].from);
+    try std.testing.expectEqual(ids.cfgId(1), restored_cfg.edges.items[0].to);
 }
 
 test "CachedArtifacts: invalid format handling" {
@@ -561,4 +572,242 @@ test "CachedArtifacts: invalid format handling" {
     var bad_version = [_]u8{ 'Z', 'W', 'C', 'A', 99, 0, 0, 0, 0 };
     const result3 = CachedArtifacts.deserialize(allocator, &bad_version);
     try std.testing.expectError(error.VersionMismatch, result3);
+}
+
+test "CachedArtifacts: addCfg retains caller ownership on allocation failure" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var artifacts = CachedArtifacts.init(allocator);
+            defer artifacts.deinit();
+
+            const cfg = try createArtifactTestCfg(allocator, "original_name");
+            const original_name = cfg.fn_name orelse {
+                cfg.deinit();
+                allocator.destroy(cfg);
+                return error.TestUnexpectedResult;
+            };
+            artifacts.addCfg(42, cfg) catch |err| {
+                defer allocator.destroy(cfg);
+                defer cfg.deinit();
+                try std.testing.expect(cfg.fn_name.?.ptr == original_name.ptr);
+                try std.testing.expectEqualStrings("original_name", cfg.fn_name.?);
+                try std.testing.expectEqual(@as(usize, 3), cfg.nodeCount());
+                try std.testing.expect(artifacts.getCfg(42) == null);
+                return err;
+            };
+
+            try std.testing.expect(artifacts.getCfg(42).? == cfg);
+            try std.testing.expect(cfg.fn_name.?.ptr != original_name.ptr);
+            try std.testing.expectEqualStrings("original_name", cfg.fn_name.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "CachedArtifacts: replacement releases the old CFG only after success" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var artifacts = CachedArtifacts.init(allocator);
+            defer artifacts.deinit();
+
+            const original = try createArtifactTestCfg(allocator, "original");
+            artifacts.addCfg(42, original) catch |err| {
+                original.deinit();
+                allocator.destroy(original);
+                return err;
+            };
+
+            const replacement = try createArtifactTestCfg(allocator, "replacement");
+            const replacement_name = replacement.fn_name orelse {
+                replacement.deinit();
+                allocator.destroy(replacement);
+                return error.TestUnexpectedResult;
+            };
+            replacement.nodes.items[1].ir_node.operand_node = 99;
+            artifacts.addCfg(42, replacement) catch |err| {
+                defer allocator.destroy(replacement);
+                defer replacement.deinit();
+                try std.testing.expect(artifacts.getCfg(42).? == original);
+                try std.testing.expectEqualStrings("original", original.fn_name.?);
+                try std.testing.expect(replacement.fn_name.?.ptr == replacement_name.ptr);
+                return err;
+            };
+
+            const cached = artifacts.getCfg(42) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), artifacts.cfgs.count());
+            try std.testing.expectEqualStrings("replacement", cached.fn_name.?);
+            try std.testing.expectEqual(@as(u32, 99), cached.nodes.items[1].ir_node.operand_node.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "CachedArtifacts: deserialize releases partial CFGs on allocation failure" {
+    const allocator = std.testing.allocator;
+    const serialized = try serializeArtifactTestCfg(allocator);
+    defer allocator.free(serialized);
+
+    const Harness = struct {
+        fn run(failing_allocator: std.mem.Allocator, data: []const u8) !void {
+            var artifacts = try CachedArtifacts.deserialize(failing_allocator, data);
+            defer artifacts.deinit();
+            const cfg = artifacts.getCfg(42) orelse return error.TestExpectedCfg;
+            try std.testing.expectEqualStrings("cached_function", cfg.fn_name.?);
+            try std.testing.expectEqual(@as(usize, 3), cfg.nodeCount());
+            const other = artifacts.getCfg(84) orelse return error.TestExpectedCfg;
+            try std.testing.expect(other.fn_name == null);
+            try std.testing.expectEqual(@as(usize, 2), other.edgeCount());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{serialized});
+}
+
+test "CachedArtifacts: deserialize rejects duplicate function keys without leaks" {
+    const allocator = std.testing.allocator;
+    const serialized = try serializeArtifactTestCfg(allocator);
+    defer allocator.free(serialized);
+
+    var duplicated: std.ArrayList(u8) = .empty;
+    defer duplicated.deinit(allocator);
+    try duplicated.appendSlice(allocator, serialized);
+    try duplicated.appendSlice(allocator, serialized[13..]);
+    std.mem.writeInt(u32, duplicated.items[9..13], 4, .little);
+
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        expectInvalidArtifactData,
+        .{@as([]const u8, duplicated.items)},
+    );
+}
+
+test "CachedArtifacts: deserialize releases every truncated prefix" {
+    const allocator = std.testing.allocator;
+    const serialized = try serializeArtifactTestCfg(allocator);
+    defer allocator.free(serialized);
+
+    for (0..serialized.len) |length| {
+        try expectInvalidArtifactData(allocator, serialized[0..length]);
+    }
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        expectInvalidArtifactData,
+        .{serialized[0 .. serialized.len - 1]},
+    );
+}
+
+test "CachedArtifacts: deserialize rejects trailing bytes and invalid header flags" {
+    const allocator = std.testing.allocator;
+    const serialized = try serializeArtifactTestCfg(allocator);
+    defer allocator.free(serialized);
+
+    const extended = try allocator.alloc(u8, serialized.len + 1);
+    defer allocator.free(extended);
+    @memcpy(extended[0..serialized.len], serialized);
+    extended[serialized.len] = 0;
+    try expectInvalidArtifactData(allocator, extended);
+
+    serialized[8] = 2;
+    try expectInvalidArtifactData(allocator, serialized);
+}
+
+test "CachedArtifacts: deserialize rejects invalid enum and flag bytes" {
+    const invalid_node = [_]u8{ 255, 0, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFormat, deserializeIrNode(&invalid_node, 0));
+    const invalid_presence = [_]u8{ @intFromEnum(IrTag.expr), 2, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFormat, deserializeIrNode(&invalid_presence, 0));
+    const invalid_edge = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 255 };
+    try std.testing.expectError(error.InvalidFormat, deserializeEdge(&invalid_edge, 0));
+    const invalid_type = [_]u8{ 255, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFormat, deserializeTypeInfo(&invalid_type, 0));
+    const invalid_type_flags = [_]u8{ @intFromEnum(TypeInfo.TypeKind.int), 32, 0, 4 };
+    try std.testing.expectError(error.InvalidFormat, deserializeTypeInfo(&invalid_type_flags, 0));
+}
+
+test "CachedArtifacts: deserialize rejects CFG indices outside the node array" {
+    const allocator = std.testing.allocator;
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    const cfg = try createArtifactTestCfg(allocator, "indices");
+    artifacts.addCfg(42, cfg) catch |err| {
+        cfg.deinit();
+        allocator.destroy(cfg);
+        return err;
+    };
+
+    const indices = [_]*ids.CfgNodeId{
+        &cfg.entry,
+        &cfg.exit,
+        &cfg.edges.items[0].from,
+        &cfg.edges.items[0].to,
+    };
+    for (indices) |index| {
+        const original = index.*;
+        defer index.* = original;
+        index.* = ids.cfgId(@intCast(cfg.nodeCount()));
+        const serialized = try artifacts.serialize(allocator);
+        defer allocator.free(serialized);
+        try expectInvalidArtifactData(allocator, serialized);
+    }
+}
+
+fn createArtifactTestCfg(allocator: std.mem.Allocator, name: []const u8) !*Cfg {
+    const cfg = try allocator.create(Cfg);
+    cfg.* = Cfg.init(allocator);
+    errdefer {
+        cfg.deinit();
+        allocator.destroy(cfg);
+    }
+
+    cfg.entry = try cfg.addNode(IrNode.init(.fn_entry));
+    var declaration = IrNode.initFull(
+        .var_decl,
+        43,
+        SourceRange.init(Location.init(2, 3), Location.init(4, 5)),
+    );
+    declaration.operand_node = 44;
+    declaration.operand2_node = 45;
+    declaration.type_info = .{
+        .kind = .int,
+        .size_bits = 32,
+        .is_signed = true,
+        .is_comptime = true,
+    };
+    const body = try cfg.addNode(declaration);
+    cfg.exit = try cfg.addNode(IrNode.init(.fn_exit));
+    try cfg.addEdgeWithKind(cfg.entry, body, .branch_true);
+    try cfg.addEdge(body, cfg.exit);
+    cfg.fn_name = name;
+    cfg.fn_ast_node = ids.astId(42);
+    return cfg;
+}
+
+fn serializeArtifactTestCfg(allocator: std.mem.Allocator) ![]u8 {
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    artifacts.had_type_info = true;
+    const cfg = try createArtifactTestCfg(allocator, "cached_function");
+    artifacts.addCfg(42, cfg) catch |err| {
+        cfg.deinit();
+        allocator.destroy(cfg);
+        return err;
+    };
+
+    const unnamed = try createArtifactTestCfg(allocator, "");
+    unnamed.fn_name = null;
+    unnamed.fn_ast_node = null;
+    artifacts.addCfg(84, unnamed) catch |err| {
+        unnamed.deinit();
+        allocator.destroy(unnamed);
+        return err;
+    };
+    return artifacts.serialize(allocator);
+}
+
+fn expectInvalidArtifactData(allocator: std.mem.Allocator, data: []const u8) !void {
+    var artifacts = CachedArtifacts.deserialize(allocator, data) catch |err| {
+        if (err == error.InvalidFormat) return;
+        return err;
+    };
+    defer artifacts.deinit();
+    return error.TestExpectedInvalidFormat;
 }

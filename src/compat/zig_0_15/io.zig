@@ -34,15 +34,20 @@ fn runTask(task: PendingTask) void {
 
 pub const Executor = struct {
     allocator: std.mem.Allocator,
-    pool: *std.Thread.Pool,
+    pool: ?*std.Thread.Pool,
     wait_group: std.Thread.WaitGroup,
 
     pub fn init(_: *Context, allocator: std.mem.Allocator, thread_count: usize) !Executor {
+        const effective_thread_count = @max(1, thread_count);
+        if (effective_thread_count == 1) {
+            return .{ .allocator = allocator, .pool = null, .wait_group = .{} };
+        }
         const pool = try allocator.create(std.Thread.Pool);
         errdefer allocator.destroy(pool);
         try pool.init(.{
             .allocator = allocator,
-            .n_jobs = @intCast(thread_count),
+            // waitAndWork contributes the calling thread.
+            .n_jobs = effective_thread_count - 1,
             .track_ids = true,
         });
         return .{
@@ -53,13 +58,20 @@ pub const Executor = struct {
     }
 
     pub fn deinit(self: *Executor) void {
-        self.pool.deinit();
-        self.allocator.destroy(self.pool);
+        const pool = self.pool orelse return;
+        // Early exits must supply the caller's worker slot before joining the pool.
+        pool.waitAndWork(&self.wait_group);
+        pool.deinit();
+        self.allocator.destroy(pool);
     }
 
     pub fn spawn(self: *Executor, function: TaskFn, index: usize, context: *anyopaque) !void {
+        const pool = self.pool orelse {
+            function(index, context);
+            return;
+        };
         self.wait_group.start();
-        self.pool.spawn(runTask, .{PendingTask{
+        pool.spawn(runTask, .{PendingTask{
             .function = function,
             .index = index,
             .context = context,
@@ -71,9 +83,125 @@ pub const Executor = struct {
     }
 
     pub fn wait(self: *Executor) !void {
-        self.pool.waitAndWork(&self.wait_group);
+        const pool = self.pool orelse return;
+        pool.waitAndWork(&self.wait_group);
+        // waitAndWork can leave the waiting bit set; later wait/deinit calls must be safe.
+        self.wait_group.reset();
     }
 };
+
+test "Executor respects a single analysis worker" {
+    const Probe = struct {
+        caller_id: std.Thread.Id,
+        used_background_worker: std.atomic.Value(bool) = .init(false),
+        completed: std.atomic.Value(usize) = .init(0),
+
+        fn task(_: usize, opaque_context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_context));
+            if (std.Thread.getCurrentId() != self.caller_id) {
+                self.used_background_worker.store(true, .release);
+            }
+            _ = self.completed.fetchAdd(1, .release);
+        }
+    };
+    for ([_]usize{ 0, 1 }) |thread_count| {
+        var context = try Context.init(std.testing.allocator, thread_count);
+        defer context.deinit();
+        var executor = try Executor.init(&context, std.testing.allocator, thread_count);
+        defer executor.deinit();
+        var probe: Probe = .{ .caller_id = std.Thread.getCurrentId() };
+        for (0..8) |index| {
+            try executor.spawn(Probe.task, index, &probe);
+            try std.testing.expectEqual(index + 1, probe.completed.load(.acquire));
+        }
+        try executor.wait();
+        try std.testing.expect(!probe.used_background_worker.load(.acquire));
+    }
+}
+
+test "Executor deinit drains with at most two workers including the caller" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Probe = struct {
+        caller_id: std.Thread.Id,
+        started: std.Thread.ResetEvent = .{},
+        mutex: std.Thread.Mutex = .{},
+        condition: std.Thread.Condition = .{},
+        arrived: usize = 0,
+        active: usize = 0,
+        peak: usize = 0,
+        completed: usize = 0,
+        caller_participated: bool = false,
+        release_all: bool = false,
+
+        fn task(index: usize, opaque_context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_context));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.active += 1;
+            self.peak = @max(self.peak, self.active);
+            self.caller_participated = self.caller_participated or
+                std.Thread.getCurrentId() == self.caller_id;
+            const pair = self.arrived / 2;
+            self.arrived += 1;
+            if (index == 0) self.started.set();
+            // Pair tasks without sleeps so teardown must supply the second worker.
+            if (self.arrived % 2 == 0) {
+                self.condition.broadcast();
+            } else {
+                while (!self.release_all and self.arrived / 2 == pair) {
+                    self.condition.wait(&self.mutex);
+                }
+            }
+            self.active -= 1;
+            self.completed += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |wait_before_deinit| {
+        var context = try Context.init(std.testing.allocator, 2);
+        defer context.deinit();
+        var probe: Probe = .{ .caller_id = std.Thread.getCurrentId() };
+        {
+            var executor = try Executor.init(&context, std.testing.allocator, 2);
+            defer executor.deinit();
+            errdefer {
+                probe.mutex.lock();
+                probe.release_all = true;
+                probe.condition.broadcast();
+                probe.mutex.unlock();
+            }
+            try executor.spawn(Probe.task, 0, &probe);
+            probe.started.wait();
+            for (1..8) |index| try executor.spawn(Probe.task, index, &probe);
+            if (wait_before_deinit) {
+                try executor.wait();
+                try executor.wait();
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 8), probe.completed);
+        try std.testing.expectEqual(@as(usize, 2), probe.peak);
+        try std.testing.expect(probe.caller_participated);
+    }
+}
+
+test "Executor deinit drains submitted tasks without wait" {
+    const Task = struct {
+        fn run(_: usize, opaque_context: *anyopaque) void {
+            const completed: *std.atomic.Value(usize) = @ptrCast(@alignCast(opaque_context));
+            _ = completed.fetchAdd(1, .release);
+        }
+    };
+    for ([_]usize{ 0, 1, 2 }) |thread_count| {
+        var context = try Context.init(std.testing.allocator, thread_count);
+        defer context.deinit();
+        var completed: std.atomic.Value(usize) = .init(0);
+        {
+            var executor = try Executor.init(&context, std.testing.allocator, thread_count);
+            defer executor.deinit();
+            for (0..8) |index| try executor.spawn(Task.run, index, &completed);
+        }
+        try std.testing.expectEqual(@as(usize, 8), completed.load(.acquire));
+    }
+}
 
 pub const Mutex = std.Thread.Mutex;
 

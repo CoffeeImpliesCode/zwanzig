@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const call_resolver = @import("analysis/call_resolver.zig");
 const import_resolver = @import("analysis/import_resolver.zig");
+const LexicalIndex = @import("analysis/lexical_index.zig").LexicalIndex;
 
 const max_context_depth = 64;
 const build_file_name = "build.zig";
@@ -11,6 +12,7 @@ const Entry = struct {
     path: []u8,
     content: [:0]u8,
     tree: std.zig.Ast,
+    lexical_index: LexicalIndex,
     diagnostic: bool,
 
     fn load(
@@ -26,17 +28,21 @@ const Entry = struct {
         const content = try compat.readFileAlloc(io_context, allocator, path, max_source_size);
         errdefer allocator.free(content.ptr[0 .. content.len + 1]);
 
-        const tree = try std.zig.Ast.parse(allocator, content, .zig);
+        var tree = try std.zig.Ast.parse(allocator, content, .zig);
+        errdefer tree.deinit(allocator);
+        const lexical_index = try LexicalIndex.init(allocator, &tree);
 
         return .{
             .path = owned_path,
             .content = content,
             .tree = tree,
+            .lexical_index = lexical_index,
             .diagnostic = diagnostic,
         };
     }
 
     fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+        self.lexical_index.deinit(allocator);
         self.tree.deinit(allocator);
         allocator.free(self.content.ptr[0 .. self.content.len + 1]);
         allocator.free(self.path);
@@ -49,6 +55,7 @@ pub const ProjectSources = struct {
     entry_storage: []Entry,
     entry_count: usize,
     resolver_files: []import_resolver.File,
+    path_index: *import_resolver.PathIndex,
     diagnostic_indices: []usize,
     build_file_indices: []usize,
     project_fingerprint: [32]u8,
@@ -120,6 +127,7 @@ pub const ProjectSources = struct {
             resolver_files[index] = .{
                 .path = entry.path,
                 .tree = &entry.tree,
+                .lexical_index = &entry.lexical_index,
             };
             if (entry.diagnostic) {
                 diagnostic_indices[diagnostic_index] = index;
@@ -131,11 +139,17 @@ pub const ProjectSources = struct {
             }
         }
 
+        const path_index = try allocator.create(import_resolver.PathIndex);
+        errdefer allocator.destroy(path_index);
+        path_index.* = try import_resolver.PathIndex.init(allocator, resolver_files);
+        for (resolver_files) |*file| file.path_index = path_index;
+
         return .{
             .allocator = allocator,
             .entry_storage = entry_storage,
             .entry_count = entry_count,
             .resolver_files = resolver_files,
+            .path_index = path_index,
             .diagnostic_indices = diagnostic_indices,
             .build_file_indices = build_file_indices,
             .project_fingerprint = calculateFingerprint(entry_storage[0..entry_count]),
@@ -143,6 +157,8 @@ pub const ProjectSources = struct {
     }
 
     pub fn deinit(self: *ProjectSources) void {
+        self.path_index.deinit(self.allocator);
+        self.allocator.destroy(self.path_index);
         self.allocator.free(self.build_file_indices);
         self.allocator.free(self.diagnostic_indices);
         self.allocator.free(self.resolver_files);
@@ -174,8 +190,7 @@ pub const ProjectSources = struct {
         self: *const ProjectSources,
         path: []const u8,
     ) ?import_resolver.File {
-        const file_index = import_resolver.findFileIndexByPath(self.resolver_files, path) orelse
-            return null;
+        const file_index = self.path_index.find(path) orelse return null;
         return self.resolver_files[file_index];
     }
 
@@ -183,8 +198,7 @@ pub const ProjectSources = struct {
         self: *const ProjectSources,
         path: []const u8,
     ) ?call_resolver.ProjectTypeResolver {
-        const file_index = import_resolver.findFileIndexByPath(self.resolver_files, path) orelse
-            return null;
+        const file_index = self.path_index.find(path) orelse return null;
         return .{
             .files = self.resolver_files,
             .file_index = file_index,
@@ -370,7 +384,39 @@ test "ProjectSources fingerprints discovered build context" {
     ));
 }
 
-test "ProjectSources releases partial discovered context state" {
+test "ProjectSources indexes survive entry sorting and value moves" {
+    const allocator = std.testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    try temp_dir.writeFile("z.zig", "const Value = struct {}; fn make() Value { return undefined; } fn run() void { _ = make(); }");
+    try temp_dir.writeFile("a.zig", "pub const Other = struct {};");
+    var z_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var a_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const z_path = try std.fmt.bufPrint(&z_buffer, "{s}/z.zig", .{temp_dir.path()});
+    const a_path = try std.fmt.bufPrint(&a_buffer, "{s}/a.zig", .{temp_dir.path()});
+    var original = try ProjectSources.init(&io_context, allocator, &.{ z_path, a_path });
+    var project = original;
+    original = undefined;
+    defer project.deinit();
+    var query_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const query = try std.fmt.bufPrint(&query_buffer, "{s}/./z.zig/child/..", .{temp_dir.path()});
+    const source = project.sourceForPath(query) orelse return error.MissingSource;
+    const resolver = project.resolverForPath(query) orelse return error.MissingResolver;
+    try std.testing.expectEqualStrings(z_path, source.path);
+    try temp_dir.writeFile("z.zig", "const Changed = struct {};");
+    var checked: usize = 0;
+    for (source.tree.nodes.items(.tag), 0..) |tag, node| {
+        if (!call_resolver.isCallNode(tag)) continue;
+        const result = resolver.resolveCallReturnTypeNode(@intCast(node)) orelse return error.MissingReturnType;
+        try std.testing.expectEqualStrings("Value", source.tree.getNodeSource(@enumFromInt(result.node_index)));
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), checked);
+}
+
+test "ProjectSources preserves malformed file slots across allocation failures" {
     const allocator = std.testing.allocator;
 
     var io_context = try compat.Context.init(allocator, 1);
@@ -385,7 +431,12 @@ test "ProjectSources releases partial discovered context state" {
             "    _ = b.addModule(\"fixture\", .{ .root_source_file = b.path(\"api.zig\") });\n" ++
             "}\n",
     );
-    try temp_dir.writeFile("api.zig", "pub fn exported() void {}\n");
+    try temp_dir.writeFile(
+        "api.zig",
+        "pub const broken = @import(\"broken.zig\");\n" ++
+            "const Value = struct {}; fn make() Value { return undefined; } fn run() void { _ = make(); }\n",
+    );
+    try temp_dir.writeFile("broken.zig", "pub const ignored = 1;\nfn broken(\n");
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const source_path = try std.fmt.bufPrint(
@@ -393,7 +444,13 @@ test "ProjectSources releases partial discovered context state" {
         "{s}/api.zig",
         .{temp_dir.path()},
     );
-    const selected_files = [_][]const u8{source_path};
+    var broken_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const broken_path = try std.fmt.bufPrint(
+        &broken_buffer,
+        "{s}/broken.zig",
+        .{temp_dir.path()},
+    );
+    const selected_files = [_][]const u8{ broken_path, source_path };
 
     const Harness = struct {
         fn run(
@@ -407,8 +464,34 @@ test "ProjectSources releases partial discovered context state" {
                 paths,
             );
             defer project.deinit();
-            try std.testing.expectEqual(@as(usize, 1), project.count());
-            try std.testing.expectEqual(@as(usize, 2), project.files().len);
+            try std.testing.expectEqual(@as(usize, 2), project.count());
+            try std.testing.expectEqual(@as(usize, 3), project.files().len);
+            try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, project.diagnosticFileIndices());
+            try std.testing.expectEqualSlices(usize, &.{2}, project.buildFileIndices());
+            const malformed = project.sourceForPath(paths[0]) orelse return error.MissingSource;
+            const malformed_resolver = project.resolverForPath(paths[0]) orelse return error.MissingResolver;
+            try std.testing.expectEqual(@as(usize, 1), malformed_resolver.file_index);
+            try std.testing.expect(malformed.tree.errors.len != 0);
+            try std.testing.expect(malformed.lexical_index.?.findBinding("ignored", 0) == null);
+            var references = try @import("analysis/project_reference_index.zig").ProjectReferenceIndex.init(
+                failing_allocator,
+                project.files(),
+            );
+            defer references.deinit();
+            try std.testing.expectEqualSlices(usize, &.{1}, try references.publicTargets(0));
+            try std.testing.expectEqual(@as(usize, 0), (try references.publicTargets(1)).len);
+            const source = project.sourceForPath(paths[1]) orelse return error.MissingSource;
+            const resolver = project.resolverForPath(paths[1]) orelse return error.MissingResolver;
+            try std.testing.expectEqual(@as(usize, 0), resolver.file_index);
+            try std.testing.expectEqual(source.tree, resolver.files[resolver.file_index].tree);
+            var calls: usize = 0;
+            for (source.tree.nodes.items(.tag), 0..) |tag, node| {
+                if (!call_resolver.isCallNode(tag)) continue;
+                const result = resolver.resolveCallReturnTypeNode(@intCast(node)) orelse return error.MissingReturnType;
+                try std.testing.expectEqualStrings("Value", source.tree.getNodeSource(@enumFromInt(result.node_index)));
+                calls += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), calls);
         }
     };
     try std.testing.checkAllAllocationFailures(

@@ -282,6 +282,7 @@ pub const Cache = struct {
         while (try compat.nextDir(self.io_context, &directory)) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".cache")) {
                 const name_copy = try self.allocator.dupe(u8, entry.name);
+                errdefer self.allocator.free(name_copy);
                 try files_to_delete.append(self.allocator, name_copy);
             }
         }
@@ -474,6 +475,41 @@ test "Cache: clear removes all entries" {
 
     try std.testing.expectEqual(@as(?[]u8, null), result1);
     try std.testing.expectEqual(@as(?[]u8, null), result2);
+}
+
+test "Cache: clear releases collected names on allocation failure" {
+    const allocator = std.testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+
+    const Harness = struct {
+        fn run(
+            failing_allocator: std.mem.Allocator,
+            context: *compat.Context,
+            path: []const u8,
+        ) !void {
+            var setup = try Cache.initAt(std.testing.allocator, context, path);
+            defer setup.deinit();
+            const rules = [_][]const u8{"rule1"};
+            const key = CacheKey.init("clear allocation failure", null, "1.0.0", false, &rules, null);
+            try setup.put(key, "cached data");
+
+            var cache = try Cache.initAt(failing_allocator, context, path);
+            defer cache.deinit();
+            try cache.clear();
+
+            const remaining = try setup.get(key);
+            defer if (remaining) |data| std.testing.allocator.free(data);
+            try std.testing.expect(remaining == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        Harness.run,
+        .{ &io_context, temp_dir.path() },
+    );
 }
 
 test "Cache: handles access denied gracefully" {

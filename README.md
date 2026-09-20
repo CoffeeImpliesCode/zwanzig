@@ -128,9 +128,9 @@ Pinning the version keeps CI reproducible. Update `ZWANZIG_VERSION` when you wan
 ## Features
 
 - Rule/checker registration with shared `--do`/`--skip` filtering
-- Lazy parsing with cached AST/tokens per file
-- Type-aware analysis via ZIR
-- CFG-based, path-sensitive checkers
+- Cached AST/tokens with syntax validation before checks
+- Best-effort type-aware analysis via ZIR and project sources
+- CFG-based, path-sensitive checkers with shared compatible analyses
 - Graphviz DOT dumps for CFGs, exploded graphs, and path traces
 - Parallel analysis across files
 
@@ -153,7 +153,7 @@ AST/token rules:
 
 Engine-backed checkers:
 
-- unreachable-code-engine: constant-condition unreachable code
+- unreachable-code-engine: constant-condition branches and proven contradictions under immutable scalar guards
 - optional-unwrap: forced optional unwraps with `.?`
 - empty-catch-engine: empty `catch {}` blocks
 - swallowed-error: catch blocks that ignore errors without rethrowing or logging
@@ -162,13 +162,19 @@ Engine-backed checkers:
 - divide-by-zero-engine: path-sensitive divide/modulo-by-zero detection
 - slice-bounds-engine: array/slice out-of-bounds access detection
 
+## Analysis behavior
+
+Syntax errors produce `parse-error` diagnostics. Zwanzig skips checks for malformed files and continues with valid sibling files. Enabled native checkers control type preflight. If the embedded frontend rejects a file during that preflight, Zwanzig emits `frontend-error`. Required typed checks skip the file, while optional checks use AST fallback. AST-only selections avoid ZIR preflight.
+
+`--threads` includes the calling thread on both frontends. Engine state caps include all call contexts at each program point. If analysis cannot continue within a cap, Zwanzig warns and stops that function analysis. Independent constant-condition and structural checks can still report diagnostics.
+
 ## Limitations
 
-- ZIR/type info requires valid, parseable Zig code
-- Full type resolution needs complete build context; standalone analysis has limited type inference
-- Nested-scope type info is still limited to module-level declarations
-- Interprocedural analysis is limited to simple direct calls in a single file; cross-file calls are treated as external
-- Incremental cache stores metadata only; CFG caching is planned but not yet wired in
+- Type queries are best-effort for module declarations, locals, parameters, nested scopes, and available project sources. Zwanzig does not perform complete compiler type resolution.
+- Interprocedural execution supports simple direct calls within one file. Project-aware type and reference lookup does not execute cross-file calls.
+- Path-sensitive unreachable reports require complete analysis and proof from immutable scalar enclosing guards. An absent graph node alone does not prove unreachable code.
+- Integer guard refinement requires a proven domain that fits signed 64-bit values. Floating-point, unknown, and wider domains remain conservative.
+- The disk cache reuses CFGs, not complete ZIR, typed metadata, function summaries, or diagnostics. Each run recomputes diagnostics.
 
 ## Docs
 

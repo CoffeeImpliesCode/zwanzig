@@ -11,7 +11,7 @@ const WideningKey = state_mod.WideningKey;
 
 /// Default maximum number of unique states per program point.
 /// Beyond this, new states at the same point are widened into an existing node
-/// with the same calling context (widening approximation).
+/// with the same calling context, or analysis stops if no such node exists.
 const default_max_states_per_point: u32 = 50;
 
 /// A node in the exploded graph, keyed by (ProgramPoint, ProgramState).
@@ -150,7 +150,6 @@ pub const ExplodedGraph = struct {
 
     const CapWideningResult = struct {
         index: u32,
-        applied: bool,
         converged: bool,
         state_updated: bool,
     };
@@ -191,10 +190,7 @@ pub const ExplodedGraph = struct {
 
     fn widenOnCap(self: *ExplodedGraph, point_key: u64, state: *ProgramState) EngineError!CapWideningResult {
         const list = self.point_nodes.getPtr(point_key) orelse
-            return .{ .index = std.math.maxInt(u32), .applied = false, .converged = false, .state_updated = false };
-        if (list.items.len == 0) {
-            return .{ .index = std.math.maxInt(u32), .applied = false, .converged = false, .state_updated = false };
-        }
+            return error.AnalysisLimitExceeded;
 
         var target_index: ?u32 = null;
         for (list.items) |index| {
@@ -205,8 +201,7 @@ pub const ExplodedGraph = struct {
             }
         }
 
-        const cap_index = target_index orelse
-            return .{ .index = std.math.maxInt(u32), .applied = false, .converged = false, .state_updated = false };
+        const cap_index = target_index orelse return error.AnalysisLimitExceeded;
         var target_node = &self.nodes.items[cap_index];
 
         var widened = target_node.state.widen(state) catch |err| switch (err) {
@@ -215,14 +210,14 @@ pub const ExplodedGraph = struct {
         if (widened.eql(&target_node.state)) {
             widened.deinit();
             self.widening_converged += 1;
-            return .{ .index = cap_index, .applied = true, .converged = true, .state_updated = false };
+            return .{ .index = cap_index, .converged = true, .state_updated = false };
         }
 
         const new_key = ExplodedNode.computeKey(target_node.point, &widened);
         if (self.node_map.get(new_key)) |existing_index| {
             if (existing_index != cap_index) {
                 widened.deinit();
-                return .{ .index = existing_index, .applied = true, .converged = true, .state_updated = false };
+                return .{ .index = existing_index, .converged = true, .state_updated = false };
             }
         }
 
@@ -236,7 +231,7 @@ pub const ExplodedGraph = struct {
         }
 
         self.widened_nodes += 1;
-        return .{ .index = cap_index, .applied = true, .converged = false, .state_updated = true };
+        return .{ .index = cap_index, .converged = false, .state_updated = true };
     }
 
     /// Get or create a node for the given point and state.
@@ -253,14 +248,17 @@ pub const ExplodedGraph = struct {
     /// 1. Apply optional widening at the current program point.
     /// 2. Deduplicate by (point, state) hash as usual.
     /// 3. Drop states subsumed by an existing node at this point.
-    /// 4. If max_states_per_point is reached, widen into an existing node.
+    /// 4. At the state cap, widen in the same context or return AnalysisLimitExceeded.
     /// 5. Otherwise, create a new node.
+    /// On error, the caller retains ownership of the input state.
     pub fn getOrCreateNodeWithWidening(
         self: *ExplodedGraph,
         point: ProgramPoint,
         state: *ProgramState,
         options: WideningOptions,
     ) EngineError!GetOrCreateResult {
+        if (self.max_states_per_point == 0) return error.AnalysisLimitExceeded;
+
         var current_state = state;
         var widened_state: ?ProgramState = null;
         errdefer if (widened_state) |*ws| ws.deinit();
@@ -282,6 +280,7 @@ pub const ExplodedGraph = struct {
                 } else {
                     // Subsequent visits: widen incoming state with stored state
                     if (self.widening_states.getPtr(widening_key)) |stored_state| {
+                        if (!sameContext(stored_state, state)) return error.AnalysisLimitExceeded;
                         const ws = stored_state.widen(state) catch |err| switch (err) {
                             error.OutOfMemory => return EngineError.OutOfMemory,
                         };
@@ -348,19 +347,17 @@ pub const ExplodedGraph = struct {
         const current_count = self.point_state_counts.get(point_key) orelse 0;
         if (current_count >= self.max_states_per_point) {
             const cap_result = try self.widenOnCap(point_key, current_state);
-            if (cap_result.applied) {
-                if (widened_state) |*ws| {
-                    ws.deinit();
-                }
-                return .{
-                    .index = cap_result.index,
-                    .is_new = false,
-                    .widening_applied = widening_applied or cap_result.applied,
-                    .converged = converged or cap_result.converged,
-                    .state_updated = cap_result.state_updated,
-                    .caller_should_deinit = true,
-                };
+            if (widened_state) |*ws| {
+                ws.deinit();
             }
+            return .{
+                .index = cap_result.index,
+                .is_new = false,
+                .widening_applied = true,
+                .converged = converged or cap_result.converged,
+                .state_updated = cap_result.state_updated,
+                .caller_should_deinit = true,
+            };
         }
 
         const index: u32 = @intCast(self.nodes.items.len);
@@ -427,6 +424,7 @@ pub const ExplodedGraph = struct {
         return self.nodes.items.len;
     }
 
+    /// A zero cap rejects all states with AnalysisLimitExceeded.
     pub fn setMaxStatesPerPoint(self: *ExplodedGraph, max: u32) void {
         self.max_states_per_point = max;
     }
@@ -823,17 +821,19 @@ test "ExplodedGraph widen-on-cap respects context" {
     try testing.expect(result1.is_new);
 
     var state2 = ProgramState.init(allocator);
+    defer state2.deinit();
     try state2.setVar(ids.varId(1), .{ .concrete_int = 20 });
     try state2.pushCallSite(state_mod.CallSite{ .call_node = ids.cfgId(0), .caller_cfg = &cfg, .return_node = ids.cfgId(1) });
 
-    const result2 = try graph.getOrCreateNodeWithWidening(point, &state2, .{});
-    try testing.expect(result2.is_new);
-    try testing.expect(!result2.widening_applied);
-    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
-
-    if (result2.caller_should_deinit) {
-        state2.deinit();
-    }
+    try testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &state2, .{}));
+    try testing.expectEqual(@as(usize, 1), graph.nodeCount());
+    const stored = graph.getNode(result1.index) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), stored.state.call_stack.items.len);
+    const stored_value = stored.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 10), stored_value.concrete_int);
+    try testing.expectEqual(@as(usize, 1), state2.call_stack.items.len);
+    const incoming_value = state2.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 20), incoming_value.concrete_int);
 }
 
 test "ExplodedGraph without widening options works as before" {
@@ -859,6 +859,84 @@ test "ExplodedGraph without widening options works as before" {
     try testing.expect(!result.widening_applied);
     try testing.expect(!result.converged);
     try testing.expectEqual(@as(u32, 0), graph.getWidenedNodeCount());
+}
+
+test "ExplodedGraph zero cap rejects states without taking ownership" {
+    const allocator = std.testing.allocator;
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    const entry = try cfg.addNode(IrNode.init(.fn_entry));
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(0);
+
+    var state = ProgramState.init(allocator);
+    var owns_state = true;
+    defer if (owns_state) state.deinit();
+    try state.setVar(ids.varId(1), .{ .concrete_int = 42 });
+    const point = ProgramPoint.initPre(entry, &cfg);
+    try std.testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &state, .{
+        .apply_widening = true,
+        .widening_key = WideningKey.init(point, &state),
+    }));
+    try std.testing.expectEqual(@as(usize, 0), graph.nodeCount());
+    try std.testing.expectEqual(@as(u32, 0), graph.getTrackedWideningPointCount());
+    const value = state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 42), value.concrete_int);
+
+    graph.setMaxStatesPerPoint(1);
+    const result = try graph.getOrCreateNode(point, &state);
+    owns_state = result.caller_should_deinit;
+    try std.testing.expect(result.is_new);
+}
+
+test "ExplodedGraph cap one widens the same context with transactional allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCapAllocationFailure, .{});
+}
+
+fn testCapAllocationFailure(allocator: std.mem.Allocator) !void {
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    const entry = try cfg.addNode(IrNode.init(.fn_entry));
+    const exit = try cfg.addNode(IrNode.init(.fn_exit));
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(1);
+    const point = ProgramPoint.initPre(entry, &cfg);
+
+    var first = ProgramState.init(allocator);
+    var owns_first = true;
+    defer if (owns_first) first.deinit();
+    try first.setVar(ids.varId(1), .{ .concrete_int = 10 });
+    first.incrementInlineDepth();
+    try first.pushCallSite(.{ .call_node = entry, .caller_cfg = &cfg, .return_node = exit });
+    const initial = try graph.getOrCreateNode(point, &first);
+    owns_first = initial.caller_should_deinit;
+
+    const initial_node = graph.getNode(initial.index) orelse return error.TestUnexpectedResult;
+    var incoming = try initial_node.state.clone(allocator);
+    defer incoming.deinit();
+    try incoming.setVar(ids.varId(1), .{ .concrete_int = 20 });
+    const result = graph.getOrCreateNode(point, &incoming) catch |err| {
+        try std.testing.expectEqual(@as(usize, 1), graph.nodeCount());
+        const unchanged = graph.getNode(initial.index) orelse return error.TestUnexpectedResult;
+        const unchanged_value = unchanged.state.getVar(ids.varId(1)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(i64, 10), unchanged_value.concrete_int);
+        const incoming_value = incoming.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(i64, 20), incoming_value.concrete_int);
+        return err;
+    };
+    try std.testing.expect(result.widening_applied);
+    try std.testing.expect(result.state_updated);
+    try std.testing.expect(result.caller_should_deinit);
+    try std.testing.expectEqual(initial.index, result.index);
+    try std.testing.expectEqual(@as(usize, 1), graph.nodeCount());
+    const widened = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
+    const widened_value = widened.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(widened_value.isUnknown());
+    try std.testing.expectEqual(@as(u32, 1), widened.state.getInlineDepth());
+    try std.testing.expectEqual(entry, widened.state.call_stack.items[0].call_node);
 }
 
 test "ExplodedGraph insertion preserves ownership on allocation failure" {

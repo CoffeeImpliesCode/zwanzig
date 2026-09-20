@@ -1,5 +1,7 @@
 const std = @import("std");
 const import_resolver = @import("import_resolver.zig");
+const lexical_index = @import("lexical_index.zig");
+const LexicalIndex = lexical_index.LexicalIndex;
 const ast_walk = @import("../ast_walk.zig");
 const TypeContext = @import("../type_context.zig").TypeContext;
 const TypeInfo = @import("../zir_bridge.zig").TypeInfo;
@@ -243,9 +245,13 @@ fn resolveCallArgumentType(
     expr_node: u32,
     parent_map: []const u32,
 ) ?TypeInfo {
-    const files = [_]import_resolver.File{
+    var files = [_]import_resolver.File{
         .{ .path = "", .tree = tree },
     };
+    if (type_ctx.project_resolver) |project| {
+        const file = project.files[project.file_index];
+        if (file.tree == tree) files[0].lexical_index = file.lexical_index;
+    }
     const resolver = ProjectTypeResolver{
         .files = &files,
         .file_index = 0,
@@ -275,18 +281,7 @@ const BindingResolution = struct {
     is_type_namespace: bool = false,
 };
 
-const ScopeRange = struct {
-    first_token: u32,
-    last_token: u32,
-
-    fn span(self: ScopeRange) u32 {
-        return self.last_token - self.first_token;
-    }
-
-    fn contains(self: ScopeRange, token: u32) bool {
-        return token >= self.first_token and token <= self.last_token;
-    }
-};
+const ScopeRange = lexical_index.ScopeRange;
 
 const CallableInfo = struct {
     proto_node: u32,
@@ -294,6 +289,7 @@ const CallableInfo = struct {
     implicit_self_count: usize,
 };
 
+/// Malformed source files retain their IDs but do not provide declarations or types.
 pub const ProjectTypeResolver = struct {
     files: []const import_resolver.File,
     file_index: usize,
@@ -339,8 +335,27 @@ pub const ProjectTypeResolver = struct {
         return self.files[self.file_index];
     }
 
+    fn parentNode(self: ProjectTypeResolver, node: u32) ?u32 {
+        const file = self.currentFile();
+        if (file.lexical_index) |index| return index.parent(node);
+        return findParentNode(file.tree, node);
+    }
+
+    fn enclosingFunctionAt(self: ProjectTypeResolver, token: u32) ?u32 {
+        const file = self.currentFile();
+        if (file.lexical_index) |index| return index.enclosingFunction(token);
+        return findEnclosingFunction(file.tree, file.tree.nodes.items(.tag), token);
+    }
+
+    fn isRootDeclaration(self: ProjectTypeResolver, node: usize) bool {
+        const file = self.currentFile();
+        if (file.lexical_index) |index| return index.isRootDeclaration(node);
+        return isRootDeclNode(file.tree, node);
+    }
+
     pub fn resolveExprType(self: ProjectTypeResolver, node: usize) ?ResolvedType {
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         if (node >= tags.len) return null;
 
@@ -383,6 +398,7 @@ pub const ProjectTypeResolver = struct {
 
     pub fn resolveTypeNode(self: ProjectTypeResolver, node: usize) ?ResolvedType {
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         if (node >= tags.len) return null;
         if (isContainerTag(tags[node])) return .{ .file_index = self.file_index, .container_node = @intCast(node) };
@@ -420,6 +436,7 @@ pub const ProjectTypeResolver = struct {
     }
     pub fn resolveTypeAliasNode(self: ProjectTypeResolver, node: u32) ?ResolvedTypeNode {
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         if (node >= tree.nodes.len) return null;
         switch (tree.nodeTag(@enumFromInt(node))) {
             .identifier => {
@@ -478,6 +495,7 @@ pub const ProjectTypeResolver = struct {
         parent_map: []const u32,
     ) ?u32 {
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         if (parent_call >= tags.len or !isCallNode(tags[parent_call])) return null;
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
@@ -504,11 +522,12 @@ pub const ProjectTypeResolver = struct {
     fn resolveExpectedTypeNode(self: ProjectTypeResolver, expression: u32, depth: u8) ?ResolvedTypeNode {
         if (depth >= 64) return null;
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         const datas = tree.nodes.items(.data);
         var node = expression;
         for (0..64) |_| {
-            const parent = findParentNode(tree, node) orelse return null;
+            const parent = self.parentNode(node) orelse return null;
             switch (tags[parent]) {
                 .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
                     const full = tree.fullVarDecl(@enumFromInt(parent)) orelse return null;
@@ -535,7 +554,7 @@ pub const ProjectTypeResolver = struct {
                 },
                 .@"return" => {
                     const token = tokenForNode(tree, parent) orelse return null;
-                    const function = findEnclosingFunction(tree, tags, token) orelse return null;
+                    const function = self.enclosingFunctionAt(token) orelse return null;
                     const proto = functionProtoNode(tree, function) orelse return null;
                     return self.callableReturnType(.{
                         .file_index = self.file_index,
@@ -571,7 +590,9 @@ pub const ProjectTypeResolver = struct {
     }
 
     pub fn resolveDeclarationNode(self: ProjectTypeResolver, node: usize) ?u32 {
-        const name = import_resolver.identifierName(self.currentFile().tree, node) orelse return null;
+        const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
+        const name = import_resolver.identifierName(tree, node) orelse return null;
         return self.findNearestBinding(name, node).declaration_node;
     }
 
@@ -633,6 +654,7 @@ pub const ProjectTypeResolver = struct {
     fn resolveCallableAtCallDepth(self: ProjectTypeResolver, call_node: u32, depth: u8) ?CallableInfo {
         if (depth >= 64) return null;
         const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         if (call_node >= tags.len or !isCallNode(tags[call_node])) return null;
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
@@ -689,6 +711,7 @@ pub const ProjectTypeResolver = struct {
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
         const reference = tokenForNode(tree, reference_node) orelse return null;
+        if (self.currentFile().lexical_index) |index| return index.findFunction(name, reference);
         var best: ?u32 = null;
         var best_span: u32 = std.math.maxInt(u32);
         for (tags, 0..) |tag, index| {
@@ -710,6 +733,7 @@ pub const ProjectTypeResolver = struct {
         base_type: ResolvedType,
         member_name: []const u8,
     ) ?u32 {
+        if (self.files[base_type.file_index].tree.errors.len != 0) return null;
         if (base_type.container_node) |container_node| {
             return self.findContainerFunctionProto(
                 base_type.file_index,
@@ -790,6 +814,20 @@ pub const ProjectTypeResolver = struct {
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
         const reference_token = tokenForNode(tree, reference_node) orelse return .{};
+        if (self.currentFile().lexical_index) |index| {
+            const candidate = index.findBinding(name, reference_token) orelse return .{};
+            if (candidate.kind == .variable) return .{ .found = true, .declaration_node = candidate.node };
+            const type_node = parameterTypeNode(tree, tags, candidate.node) orelse return .{};
+            return .{
+                .found = true,
+                .declaration_node = candidate.node,
+                .resolved = if (tree.fullVarDecl(@enumFromInt(candidate.node))) |full|
+                    self.resolveVarDeclType(full, candidate.node, name)
+                else
+                    self.resolveTypeNode(type_node),
+                .is_type_namespace = isTypeKeywordNode(tree, tags, type_node),
+            };
+        }
         const reference_function = findEnclosingFunction(tree, tags, reference_token);
         var best: ?BindingCandidate = null;
 
@@ -1162,7 +1200,7 @@ pub const ProjectTypeResolver = struct {
         if (isContainerTag(tags[init_index])) {
             return .{ .file_index = self.file_index, .type_name = decl_name, .container_node = @intCast(init_index) };
         }
-        if (isRootDeclNode(tree, node_index) and !resolver.varDeclIsTypeNamespace(full)) return null;
+        if (self.isRootDeclaration(node_index) and !resolver.varDeclIsTypeNamespace(full)) return null;
         return resolver.resolveInitializerType(init_index);
     }
 
@@ -1695,6 +1733,7 @@ pub const ProjectTypeResolver = struct {
     }
 
     pub fn resolveFieldTypeNode(self: ProjectTypeResolver, base_type: ResolvedType, field_name: []const u8) ?ResolvedTypeNode {
+        if (self.files[base_type.file_index].tree.errors.len != 0) return null;
         const target = self.forFile(base_type.file_index);
         if (base_type.container_node) |container_node| {
             return target.resolveContainerFieldTypeNode(
@@ -1789,6 +1828,7 @@ pub const ProjectTypeResolver = struct {
         const tree = self.currentFile().tree;
         if (import_resolver.importPathFromBuiltinCall(tree, node)) |import_path| {
             if (import_resolver.resolveImportToFileIndex(self.files, self.currentFile().path, import_path)) |file_index| {
+                if (self.files[file_index].tree.errors.len != 0) return null;
                 return .{ .file_index = file_index };
             }
         }
@@ -1813,6 +1853,7 @@ pub const ProjectTypeResolver = struct {
     }
 
     fn resolveMemberType(self: ProjectTypeResolver, base_type: ResolvedType, member_name: []const u8) ?ResolvedType {
+        if (self.files[base_type.file_index].tree.errors.len != 0) return null;
         const member_resolver = self.forFile(base_type.file_index);
         if (base_type.container_node) |container_node| {
             return member_resolver.resolveContainerFieldType(
@@ -1831,6 +1872,15 @@ pub const ProjectTypeResolver = struct {
         const file = self.files[file_index];
         const tree = file.tree;
         const tags = tree.nodes.items(.tag);
+        if (file.lexical_index) |index| {
+            const resolver = self.forFile(file_index);
+            for (index.namedCandidates(name)) |candidate| {
+                if (candidate.kind != .variable or !candidate.is_root) continue;
+                const full = tree.fullVarDecl(@enumFromInt(candidate.node)) orelse continue;
+                if (resolver.resolveVarDeclType(full, candidate.node, candidate.name)) |resolved| return resolved;
+            }
+            return null;
+        }
 
         for (tree.rootDecls()) |decl_idx| {
             const node_index = @intFromEnum(decl_idx);
@@ -2157,6 +2207,228 @@ fn findParentNode(tree: *const std.zig.Ast, child: u32) ?u32 {
     return null;
 }
 
+test "project resolution rejects malformed imports without hiding valid siblings" {
+    const allocator = std.testing.allocator;
+    var source = try std.zig.Ast.parse(allocator,
+        \\const malformed = @import("malformed.zig");
+        \\const valid = @import("valid.zig");
+        \\const bad_value: malformed = undefined;
+        \\const good_value: valid = undefined;
+        \\const bad_field = bad_value.wrapped;
+        \\const good_field = good_value.wrapped;
+        \\const bad_type = malformed.Container;
+        \\const good_type = valid.Container;
+        \\const bad_alias = malformed.Alias;
+        \\const good_alias = valid.Alias;
+        \\const bad_call = malformed.make();
+        \\const good_call = valid.make();
+        \\const bad_method = malformed.Container.make();
+        \\const good_method = valid.Container.make();
+        \\const bad_cycle = valid.Cycle;
+    , .zig);
+    defer source.deinit(allocator);
+    var malformed = try std.zig.Ast.parse(allocator,
+        \\wrapped: @import("valid.zig"),
+        \\pub const Container = struct {
+        \\    wrapped: @import("valid.zig"),
+        \\    pub fn make() @import("valid.zig") { return undefined; }
+        \\};
+        \\pub const Alias = Container;
+        \\pub const Cycle = @import("valid.zig").Cycle;
+        \\pub fn make() @import("valid.zig") { return undefined; }
+        \\const broken = ;
+    , .zig);
+    defer malformed.deinit(allocator);
+    var valid = try std.zig.Ast.parse(allocator,
+        \\wrapped: Container,
+        \\pub const Container = struct {
+        \\    wrapped: u8,
+        \\    pub fn make() Container { return undefined; }
+        \\};
+        \\pub const Alias = Container;
+        \\pub const Cycle = @import("malformed.zig").Cycle;
+        \\pub fn make() Container { return undefined; }
+    , .zig);
+    defer valid.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), source.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), valid.errors.len);
+    try std.testing.expect(malformed.errors.len != 0);
+
+    var source_index = try LexicalIndex.init(allocator, &source);
+    defer source_index.deinit(allocator);
+    var malformed_index = try LexicalIndex.init(allocator, &malformed);
+    defer malformed_index.deinit(allocator);
+    var valid_index = try LexicalIndex.init(allocator, &valid);
+    defer valid_index.deinit(allocator);
+    var files = [_]import_resolver.File{
+        .{ .path = "source.zig", .tree = &source },
+        .{ .path = "malformed.zig", .tree = &malformed },
+        .{ .path = "valid.zig", .tree = &valid },
+    };
+    var paths = try import_resolver.PathIndex.init(allocator, &files);
+    defer paths.deinit(allocator);
+    for ([_]bool{ false, true }) |indexed| {
+        files[0].lexical_index = if (indexed) &source_index else null;
+        files[1].lexical_index = if (indexed) &malformed_index else null;
+        files[2].lexical_index = if (indexed) &valid_index else null;
+        for (&files) |*file| file.path_index = if (indexed) &paths else null;
+        const resolver: ProjectTypeResolver = .{ .files = &files, .file_index = 0 };
+        try std.testing.expectEqual(@as(?usize, 1), import_resolver.findFileIndexByPath(&files, "malformed.zig"));
+        try std.testing.expectEqual(@as(?usize, 2), import_resolver.findFileIndexByPath(&files, "valid.zig"));
+
+        for (source.rootDecls()[4..]) |declaration| {
+            const full = source.fullVarDecl(declaration) orelse return error.TestUnexpectedResult;
+            const name = source.tokenSlice(full.ast.mut_token + 1);
+            const node = @intFromEnum(full.ast.init_node.unwrap() orelse return error.TestUnexpectedResult);
+            const resolved = resolver.resolveExprType(node);
+            if (std.mem.startsWith(u8, name, "good_")) {
+                const result = resolved orelse return error.MissingValidType;
+                try std.testing.expectEqual(@as(usize, 2), result.file_index);
+                try std.testing.expectEqualStrings("Container", result.type_name orelse return error.TestUnexpectedResult);
+            } else {
+                try std.testing.expect(resolved == null);
+            }
+            if (isCallNode(source.nodeTag(@enumFromInt(node)))) {
+                const returned = resolver.resolveCallReturnTypeNode(node);
+                if (std.mem.startsWith(u8, name, "good_")) {
+                    const result = returned orelse return error.MissingValidReturnType;
+                    try std.testing.expectEqual(@as(usize, 2), result.file_index);
+                    try std.testing.expectEqualStrings("Container", valid.getNodeSource(@enumFromInt(result.node_index)));
+                } else {
+                    try std.testing.expect(returned == null);
+                }
+            } else if (std.mem.endsWith(u8, name, "_type") or std.mem.endsWith(u8, name, "_alias")) {
+                const alias = resolver.resolveTypeAliasNode(node);
+                if (std.mem.startsWith(u8, name, "good_")) {
+                    try std.testing.expectEqual(@as(usize, 2), (alias orelse return error.MissingValidAlias).file_index);
+                } else {
+                    try std.testing.expect(alias == null);
+                }
+            }
+        }
+
+        const bad_root: ResolvedType = .{ .file_index = 1 };
+        try std.testing.expect(resolver.resolveFieldTypeNode(bad_root, "wrapped") == null);
+        try std.testing.expect(resolver.resolveMemberReturnTypeNode(bad_root, "make") == null);
+        const good_root: ResolvedType = .{ .file_index = 2 };
+        const field = resolver.resolveFieldTypeNode(good_root, "wrapped") orelse return error.MissingValidField;
+        try std.testing.expectEqual(@as(usize, 2), field.file_index);
+        try std.testing.expectEqualStrings("Container", valid.getNodeSource(@enumFromInt(field.node_index)));
+
+        const invalid: ProjectTypeResolver = .{ .files = &files, .file_index = 1 };
+        for (malformed.nodes.items(.tag), 0..) |tag, node| {
+            try std.testing.expect(invalid.resolveExprType(node) == null);
+            try std.testing.expect(invalid.resolveTypeNode(node) == null);
+            try std.testing.expect(invalid.resolveTypeAliasNode(@intCast(node)) == null);
+            try std.testing.expect(invalid.resolveDeclarationNode(node) == null);
+            try std.testing.expect(invalid.resolveCallReturnTypeNode(@intCast(node)) == null);
+            try std.testing.expect(invalid.resolveCallArgumentTypeNode(@intCast(node), @intCast(node), &.{}) == null);
+            try std.testing.expect(invalid.resolveResultLocationTypeNode(@intCast(node)) == null);
+            if (isContainerTag(tag)) {
+                const container: ResolvedType = .{ .file_index = 1, .container_node = @intCast(node) };
+                try std.testing.expect(resolver.resolveFieldTypeNode(container, "wrapped") == null);
+                try std.testing.expect(resolver.resolveMemberReturnTypeNode(container, "make") == null);
+            }
+        }
+    }
+}
+
+test "indexed lexical bindings preserve unindexed scope and alias resolution" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const forward = Later;
+        \\const Later = struct {};
+        \\const Other = struct {};
+        \\const CycleA = CycleB;
+        \\const CycleB = CycleA;
+        \\fn run(value: Later, @"quoted value": Other, cycle: CycleA) void {
+        \\    value.outer();
+        \\    @"quoted value".quoted();
+        \\    cycle.cyclic();
+        \\    {
+        \\        value.before();
+        \\        const value: Other = undefined;
+        \\        value.inner();
+        \\    }
+        \\    value.after();
+        \\    forward.forwarded();
+        \\    const Nested = struct {
+        \\        fn nested(value: Other) void { value.nested(); }
+        \\    };
+        \\    _ = Nested;
+        \\}
+        \\fn unrelated(value: Other) void { value.unrelated(); }
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    const indexed_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree, .lexical_index = &index }};
+    const plain_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree }};
+    const indexed: ProjectTypeResolver = .{ .files = &indexed_files, .file_index = 0 };
+    const plain: ProjectTypeResolver = .{ .files = &plain_files, .file_index = 0 };
+    var checked: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (tag != .field_access) continue;
+        const access = tree.nodes.items(.data)[node].node_and_token;
+        const receiver = @intFromEnum(access[0]);
+        const method = tree.tokenSlice(access[1]);
+        try std.testing.expectEqual(plain.resolveDeclarationNode(receiver), indexed.resolveDeclarationNode(receiver));
+        const expected = plain.resolveExprType(receiver);
+        const actual = indexed.resolveExprType(receiver);
+        if (std.mem.eql(u8, method, "cyclic")) {
+            try std.testing.expectEqual(@as(?ResolvedType, null), actual);
+        } else {
+            const resolved = actual orelse return error.MissingIndexedType;
+            try std.testing.expect(resolvedTypesEqual(expected orelse return error.MissingUnindexedType, resolved));
+            const uses_other = std.mem.eql(u8, method, "quoted") or std.mem.eql(u8, method, "inner") or
+                std.mem.eql(u8, method, "nested") or std.mem.eql(u8, method, "unrelated");
+            try std.testing.expectEqualStrings(if (uses_other) "Other" else "Later", resolved.type_name orelse return error.TestUnexpectedResult);
+        }
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 9), checked);
+}
+
+test "indexed result locations preserve scoped calls and return types" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Value = struct {
+        \\    fn init() Value { return undefined; }
+        \\};
+        \\fn accept(value: Value) void { _ = value; }
+        \\fn run() Value {
+        \\    const value: Value = .init();
+        \\    accept(.init());
+        \\    _ = value;
+        \\    return .init();
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    const indexed_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree, .lexical_index = &index }};
+    const plain_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree }};
+    const indexed: ProjectTypeResolver = .{ .files = &indexed_files, .file_index = 0 };
+    const plain: ProjectTypeResolver = .{ .files = &plain_files, .file_index = 0 };
+    var checked: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (!isCallNode(tag)) continue;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, @enumFromInt(node)) orelse return error.TestUnexpectedResult;
+        if (tree.nodeTag(call.ast.fn_expr) != .enum_literal) continue;
+        const expected = plain.resolveResultLocationTypeNode(@intCast(node)) orelse return error.MissingUnindexedResult;
+        const actual = indexed.resolveResultLocationTypeNode(@intCast(node)) orelse return error.MissingIndexedResult;
+        try std.testing.expectEqualDeep(expected, actual);
+        try std.testing.expectEqualStrings("Value", tree.getNodeSource(@enumFromInt(actual.node_index)));
+        const result = indexed.resolveCallReturnTypeNode(@intCast(node)) orelse return error.MissingReturnType;
+        try std.testing.expectEqualDeep(plain.resolveCallReturnTypeNode(@intCast(node)) orelse return error.TestUnexpectedResult, result);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), checked);
+}
+
 test "ProjectTypeResolver rejects cyclic aliases without hiding valid receivers" {
     const allocator = std.testing.allocator;
     const code: [:0]const u8 =
@@ -2179,7 +2451,7 @@ test "ProjectTypeResolver rejects cyclic aliases without hiding valid receivers"
             try std.testing.expectEqual(@as(?ResolvedType, null), resolved);
         } else {
             const good = resolved orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("Good", good.type_name.?);
+            try std.testing.expectEqualStrings("Good", good.type_name orelse return error.TestUnexpectedResult);
         }
         checked += 1;
     }
@@ -2199,9 +2471,13 @@ test "ProjectTypeResolver rejects cross-file member alias cycles" {
         \\pub const B = a.A;
     , .zig);
     defer second.deinit(allocator);
+    var first_index = try LexicalIndex.init(allocator, &first);
+    defer first_index.deinit(allocator);
+    var second_index = try LexicalIndex.init(allocator, &second);
+    defer second_index.deinit(allocator);
     const files = [_]import_resolver.File{
-        .{ .path = "a.zig", .tree = &first },
-        .{ .path = "b.zig", .tree = &second },
+        .{ .path = "a.zig", .tree = &first, .lexical_index = &first_index },
+        .{ .path = "b.zig", .tree = &second, .lexical_index = &second_index },
     };
     const resolver: ProjectTypeResolver = .{ .files = &files, .file_index = 0 };
     for (first.nodes.items(.tag), 0..) |tag, node| {

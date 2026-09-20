@@ -6,23 +6,23 @@ const Diagnostic = checker_mod.Diagnostic;
 const SourceRange = checker_mod.SourceRange;
 const Source = @import("../source.zig").Source;
 const value = @import("../engine/value.zig");
+const ids = @import("../ids.zig");
+const cfg_mod = @import("../cfg.zig");
+const engine_mod = @import("../engine.zig");
+const AnalysisEngine = engine_mod.AnalysisEngine;
+const Constraint = engine_mod.Constraint;
+const ConstraintManager = engine_mod.ConstraintManager;
+const VarResolver = @import("../engine/var_resolver.zig").VarResolver;
 
-/// Engine-based checker that detects unreachable code using CFG and exploded graph reachability.
-///
-/// This checker handles path-sensitive unreachable code detection:
-/// - Code inside `if (false)` or `while (false)` blocks
-/// - Code inside branches that are never taken due to constant conditions
-///
-/// It complements the AST-based unreachable-code rule which handles:
-/// - Code after return statements
-/// - Code after fully-terminating branches
-///
-/// The checker is conservative: it only reports code as unreachable when the
-/// condition is a compile-time constant.
+/// Reports constant branches and contradictions under immutable scalar guards.
+/// New path-sensitive reports require a complete analysis and an executed condition.
+/// Only enclosing guards provide proof premises: arbitrary engine facts may be stale
+/// after unsupported effects. The AST rule owns code after terminating statements.
 pub const UnreachableCodeChecker = struct {
     pub const checker: Checker = .{
         .name = "unreachable-code-engine",
         .default_severity = .warning,
+        .type_requirement = .none,
         .checkAstFn = checkAst,
     };
 
@@ -32,8 +32,7 @@ pub const UnreachableCodeChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        _ = context;
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         for (0..tags.len) |i| {
@@ -44,6 +43,349 @@ pub const UnreachableCodeChecker = struct {
                 try checkWhileStatement(src, allocator, diagnostics, @intCast(i));
             }
         }
+
+        for (tags, 0..) |tag, i| {
+            if (tag == .fn_decl or tag == .test_decl) {
+                try checkFunction(src, allocator, diagnostics, context, ids.astId(@intCast(i)));
+            }
+        }
+    }
+
+    const Scalar = enum { integer, boolean };
+    const ScalarMap = std.AutoHashMap(ids.VarId, Scalar);
+    const Guard = struct {
+        point: ids.CfgNodeId,
+        constraint: Constraint,
+        then_node: u32,
+        else_node: ?u32,
+    };
+    const GuardMap = std.AutoHashMap(u32, Guard);
+    const Blocker = struct {
+        premise: Constraint,
+        blocks_true: bool,
+        blocks_false: bool,
+    };
+
+    fn checkFunction(
+        src: *Source,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        context: checker_mod.CheckerContext,
+        fn_node: ids.AstNodeId,
+    ) CheckerError!void {
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return,
+        }) orelse return;
+        defer cfg_handle.deinit();
+        var condition_count: usize = 0;
+        for (cfg_handle.cfg.nodes.items) |node| {
+            if (node.ir_node.tag == .branch or node.ir_node.tag == .loop_header) {
+                condition_count += 1;
+            }
+        }
+        if (condition_count < 2) return;
+
+        var analysis = try context.getOrAnalyze(allocator, src, &cfg_handle, checker.name, .configured);
+        defer analysis.deinit();
+        if (!analysis.complete) return;
+
+        const engine = analysis.engine;
+        const cfg = cfg_handle.cfg;
+        const tree = try src.ast();
+        const resolver = (try AnalysisEngine.VarResolution.getOrBuildVarResolver(engine, fn_node)) orelse return;
+        var parameters = ScalarMap.init(allocator);
+        defer parameters.deinit();
+        try collectScalarParameters(tree, fn_node, &parameters);
+
+        var guards = GuardMap.init(allocator);
+        defer guards.deinit();
+        for (cfg.nodes.items) |*node| {
+            if (node.ir_node.tag != .branch and node.ir_node.tag != .loop_header) continue;
+            const ast_node = node.ir_node.ast_node orelse continue;
+            if (makeGuard(tree, engine, cfg, node, resolver, &parameters)) |guard| {
+                try guards.put(ast_node, guard);
+            }
+        }
+        if (guards.count() < 2) return;
+        const parents = try engine.getParentMap(tree);
+        var blockers: std.ArrayList(Blocker) = .empty;
+        defer blockers.deinit(allocator);
+
+        // CFG order visits enclosing branches first. Each condition uses the graph's
+        // point index; neither branch bodies nor the whole graph are rescanned.
+        for (cfg.nodes.items) |node| {
+            const ast_node = node.ir_node.ast_node orelse continue;
+            const guard = guards.get(ast_node) orelse continue;
+            if (node.index != guard.point) continue;
+            blockers.clearRetainingCapacity();
+            try collectBlockers(allocator, ast_node, guard.constraint, parents, &guards, &blockers);
+            if (blockers.items.len == 0) continue;
+
+            const graph = engine.getGraph();
+            const point = engine_mod.ProgramPoint.initPost(guard.point, cfg);
+            const at_condition = graph.point_nodes.get(point.hash()) orelse continue;
+            var executed = false;
+            var impossible_true = true;
+            var impossible_false = true;
+            for (at_condition.items) |index| {
+                const reached = graph.getNode(index) orelse continue;
+                if (!reached.point.eql(point) or reached.state.inline_depth != 0) continue;
+                if (!reached.state.isSatisfiable()) continue;
+                executed = true;
+                var blocked_true = false;
+                var blocked_false = false;
+                for (blockers.items) |blocker| {
+                    if (!containsPremise(&reached.state.constraints, blocker.premise)) continue;
+                    blocked_true = blocked_true or blocker.blocks_true;
+                    blocked_false = blocked_false or blocker.blocks_false;
+                }
+                impossible_true = impossible_true and blocked_true;
+                impossible_false = impossible_false and blocked_false;
+            }
+            // A missing post-node can mean a pruned predecessor or a noreturn call.
+            // It is never evidence that this branch, or every statement in it, is dead.
+            if (!executed) continue;
+            if (impossible_true) {
+                try reportInfeasibleBranch(src, allocator, diagnostics, guard.then_node);
+            } else if (impossible_false) {
+                if (guard.else_node) |else_node| {
+                    try reportInfeasibleBranch(src, allocator, diagnostics, else_node);
+                }
+            }
+        }
+    }
+
+    fn makeGuard(
+        tree: *const std.zig.Ast,
+        engine: *AnalysisEngine,
+        cfg: *const cfg_mod.Cfg,
+        node: *const cfg_mod.CfgNode,
+        resolver: *const VarResolver,
+        parameters: *const ScalarMap,
+    ) ?Guard {
+        const ast_node = node.ir_node.ast_node orelse return null;
+        var condition: u32 = undefined;
+        var then_node: u32 = undefined;
+        var else_node: ?u32 = null;
+        if (tree.fullIf(@enumFromInt(ast_node))) |full| {
+            if (full.payload_token != null or full.error_token != null) return null;
+            condition = @intFromEnum(full.ast.cond_expr);
+            then_node = @intFromEnum(full.ast.then_expr);
+            if (full.ast.else_expr.unwrap()) |other| else_node = @intFromEnum(other);
+        } else if (tree.fullWhile(@enumFromInt(ast_node))) |full| {
+            if (full.payload_token != null or full.error_token != null) return null;
+            condition = @intFromEnum(full.ast.cond_expr);
+            then_node = @intFromEnum(full.ast.then_expr);
+        } else return null;
+        // Constant diagnostics retain their existing messages and ranges.
+        if (evaluateConditionValue(tree, condition) != null) return null;
+
+        var negate = false;
+        for (0..32) |_| {
+            const data = tree.nodes.items(.data)[condition];
+            switch (tree.nodes.items(.tag)[condition]) {
+                .grouped_expression => condition = @intFromEnum(data.node_and_token[0]),
+                .bool_not => {
+                    negate = !negate;
+                    condition = @intFromEnum(data.node);
+                },
+                else => break,
+            }
+        }
+        const tag = tree.nodes.items(.tag)[condition];
+        switch (tag) {
+            .identifier,
+            .equal_equal,
+            .bang_equal,
+            .less_than,
+            .less_or_equal,
+            .greater_than,
+            .greater_or_equal,
+            => {},
+            else => return null,
+        }
+        var canonical_node = node.*;
+        canonical_node.ir_node.operand_node = condition;
+        var constraint = AnalysisEngine.BranchConstraints.extractBranchConstraint(engine, &canonical_node, cfg) orelse return null;
+        const scalar: Scalar = switch (constraint) {
+            .int_compare => .integer,
+            .bool_check => if (tag == .identifier) .boolean else return null,
+            else => return null,
+        };
+        const var_id = constraintVariable(constraint);
+        if (!isImmutableScalar(tree, resolver, parameters, var_id, scalar, 0)) return null;
+        if (negate) constraint = constraint.negate();
+        return .{
+            .point = node.index,
+            .constraint = constraint,
+            .then_node = then_node,
+            .else_node = else_node,
+        };
+    }
+
+    fn collectScalarParameters(tree: *const std.zig.Ast, fn_node: ids.AstNodeId, result: *ScalarMap) !void {
+        const node = ids.astIndex(fn_node);
+        if (tree.nodes.items(.tag)[node] != .fn_decl) return;
+        const proto_node = tree.nodes.items(.data)[node].node_and_node[0];
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, proto_node) orelse return;
+        var parameters = proto.iterate(tree);
+        while (parameters.next()) |parameter| {
+            const name = parameter.name_token orelse continue;
+            const type_node = parameter.type_expr orelse continue;
+            const scalar = scalarType(tree, @intFromEnum(type_node)) orelse continue;
+            try result.put(ids.varId(name), scalar);
+        }
+    }
+
+    fn scalarType(tree: *const std.zig.Ast, node: u32) ?Scalar {
+        if (tree.nodes.items(.tag)[node] != .identifier) return null;
+        const name = tree.tokenSlice(tree.nodes.items(.main_token)[node]);
+        if (std.mem.eql(u8, name, "bool")) return .boolean;
+        if (std.mem.eql(u8, name, "usize") or std.mem.eql(u8, name, "isize") or
+            std.mem.eql(u8, name, "comptime_int"))
+        {
+            return .integer;
+        }
+        if (name.len < 2 or (name[0] != 'i' and name[0] != 'u')) return null;
+        for (name[1..]) |digit| {
+            if (!std.ascii.isDigit(digit)) return null;
+        }
+        return .integer;
+    }
+
+    fn isImmutableScalar(
+        tree: *const std.zig.Ast,
+        resolver: *const VarResolver,
+        parameters: *const ScalarMap,
+        var_id: ids.VarId,
+        scalar: Scalar,
+        depth: u8,
+    ) bool {
+        if (depth == 16) return false;
+        if (parameters.get(var_id)) |known| return scalar == known;
+        const info = resolver.decl_mappings.get(var_id) orelse return false;
+        if (info.is_top_level) return false;
+        const full = tree.fullVarDecl(@enumFromInt(info.decl_node)) orelse return false;
+        if (tree.tokens.items(.tag)[full.ast.mut_token] != .keyword_const) return false;
+        if (full.ast.type_node.unwrap()) |type_node| {
+            return scalar == (scalarType(tree, @intFromEnum(type_node)) orelse return false);
+        }
+        var init = @intFromEnum(full.ast.init_node.unwrap() orelse return false);
+        for (0..16) |_| {
+            if (tree.nodes.items(.tag)[init] != .grouped_expression) break;
+            init = @intFromEnum(tree.nodes.items(.data)[init].node_and_token[0]);
+        }
+        if (value.evaluateBoolLiteral(tree, init) != null) return scalar == .boolean;
+        if (parseIntLiteral(tree, init) != null) return scalar == .integer;
+        if (tree.nodes.items(.tag)[init] != .identifier) return false;
+        const original = resolver.resolve(init) orelse return false;
+        return isImmutableScalar(tree, resolver, parameters, original, scalar, depth + 1);
+    }
+
+    fn constraintVariable(constraint: Constraint) ids.VarId {
+        return switch (constraint) {
+            .int_compare => |comparison| comparison.var_id,
+            .bool_check => |check| check.var_id,
+            else => unreachable,
+        };
+    }
+
+    fn collectBlockers(
+        allocator: std.mem.Allocator,
+        ast_node: u32,
+        constraint: Constraint,
+        parents: []const u32,
+        guards: *const GuardMap,
+        result: *std.ArrayList(Blocker),
+    ) !void {
+        var child = ast_node;
+        for (0..256) |_| {
+            const parent = parents[child];
+            if (parent == 0) return;
+            if (guards.get(parent)) |guard| {
+                const premise = if (child == guard.then_node)
+                    guard.constraint
+                else if (guard.else_node != null and child == guard.else_node.?)
+                    guard.constraint.negate()
+                else {
+                    child = parent;
+                    continue;
+                };
+                if (constraintVariable(premise) == constraintVariable(constraint)) {
+                    const blocks_true = try contradicts(allocator, premise, constraint);
+                    const blocks_false = try contradicts(allocator, premise, constraint.negate());
+                    if (blocks_true or blocks_false) {
+                        try result.append(allocator, .{
+                            .premise = premise,
+                            .blocks_true = blocks_true,
+                            .blocks_false = blocks_false,
+                        });
+                    }
+                }
+            }
+            child = parent;
+        }
+    }
+
+    fn contradicts(allocator: std.mem.Allocator, premise: Constraint, branch: Constraint) !bool {
+        var constraints = ConstraintManager.init(allocator);
+        defer constraints.deinit();
+        try constraints.addConstraint(premise);
+        try constraints.addConstraint(branch);
+        // Do not consult abstract values: calls and assignments can invalidate them.
+        // The canonical constraint index checks these two immutable guard premises.
+        return constraints.has_contradiction;
+    }
+
+    fn containsPremise(constraints: *const ConstraintManager, premise: Constraint) bool {
+        const indexed = constraints.per_var_constraints.get(constraintVariable(premise)) orelse return false;
+        const candidates = switch (premise) {
+            .int_compare => indexed.int_constraints.items,
+            .bool_check => indexed.bool_constraints.items,
+            else => unreachable,
+        };
+        for (candidates) |candidate| {
+            if (candidate.eql(premise)) return true;
+        }
+        return false;
+    }
+
+    fn reportInfeasibleBranch(
+        src: *Source,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        body: u32,
+    ) !void {
+        const range = (try getNodeRange(src, body)) orelse return;
+        for (diagnostics.items) |diag| {
+            if (!std.mem.eql(u8, diag.rule_id, checker.name) and
+                !std.mem.eql(u8, diag.rule_id, "unreachable-code"))
+            {
+                continue;
+            }
+            if (!std.mem.eql(u8, diag.file_path, src.getFilePath())) continue;
+            if (!locationBefore(range.end, diag.range.start) and
+                !locationBefore(diag.range.end, range.start))
+            {
+                return;
+            }
+        }
+        var diag = try Diagnostic.init(
+            allocator,
+            src.getFilePath(),
+            checker.name,
+            .warning,
+            "unreachable code: branch contradicts an enclosing condition",
+            range,
+        );
+        errdefer diag.deinit(allocator);
+        try diagnostics.append(allocator, diag);
+    }
+
+    fn locationBefore(lhs: checker_mod.Location, rhs: checker_mod.Location) bool {
+        return lhs.line < rhs.line or (lhs.line == rhs.line and lhs.column < rhs.column);
     }
 
     fn checkIfStatement(
@@ -52,7 +394,7 @@ pub const UnreachableCodeChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         if_node: u32,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const full_if = tree.fullIf(@enumFromInt(if_node)) orelse return;
 
         const cond_node: u32 = @intFromEnum(full_if.ast.cond_expr);
@@ -62,31 +404,33 @@ pub const UnreachableCodeChecker = struct {
             if (is_true) {
                 if (full_if.ast.else_expr.unwrap()) |else_expr| {
                     const else_node: u32 = @intFromEnum(else_expr);
-                    const range = getNodeRange(src, else_node) catch return;
+                    const range = try getNodeRange(src, else_node);
                     if (range) |r| {
-                        const diag = Diagnostic.init(
+                        var diag = try Diagnostic.init(
                             allocator,
                             src.getFilePath(),
                             "unreachable-code-engine",
                             .warning,
                             "unreachable code: else branch is never executed because condition is always true",
                             r,
-                        ) catch return;
+                        );
+                        errdefer diag.deinit(allocator);
                         try diagnostics.append(allocator, diag);
                     }
                 }
             } else {
                 const then_node: u32 = @intFromEnum(full_if.ast.then_expr);
-                const range = getNodeRange(src, then_node) catch return;
+                const range = try getNodeRange(src, then_node);
                 if (range) |r| {
-                    const diag = Diagnostic.init(
+                    var diag = try Diagnostic.init(
                         allocator,
                         src.getFilePath(),
                         "unreachable-code-engine",
                         .warning,
                         "unreachable code: if body is never executed because condition is always false",
                         r,
-                    ) catch return;
+                    );
+                    errdefer diag.deinit(allocator);
                     try diagnostics.append(allocator, diag);
                 }
             }
@@ -99,7 +443,7 @@ pub const UnreachableCodeChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         while_node: u32,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const full_while = tree.fullWhile(@enumFromInt(while_node)) orelse return;
 
         const cond_node: u32 = @intFromEnum(full_while.ast.cond_expr);
@@ -108,16 +452,17 @@ pub const UnreachableCodeChecker = struct {
         if (cond_value) |is_true| {
             if (!is_true) {
                 const body_node: u32 = @intFromEnum(full_while.ast.then_expr);
-                const range = getNodeRange(src, body_node) catch return;
+                const range = try getNodeRange(src, body_node);
                 if (range) |r| {
-                    const diag = Diagnostic.init(
+                    var diag = try Diagnostic.init(
                         allocator,
                         src.getFilePath(),
                         "unreachable-code-engine",
                         .warning,
                         "unreachable code: while body is never executed because condition is always false",
                         r,
-                    ) catch return;
+                    );
+                    errdefer diag.deinit(allocator);
                     try diagnostics.append(allocator, diag);
                 }
             }
@@ -371,7 +716,7 @@ pub const UnreachableCodeChecker = struct {
     }
 
     fn getNodeRange(src: *Source, node: u32) !?SourceRange {
-        const tree = src.ast() catch return null;
+        const tree = try src.ast();
         const main_tokens = tree.nodes.items(.main_token);
         const token_starts = tree.tokens.items(.start);
 
@@ -385,7 +730,7 @@ pub const UnreachableCodeChecker = struct {
         const start_byte = token_starts[first_token];
         const end_byte = token_starts[last_token] + tokenLen(tree, last_token);
 
-        return src.byteRangeToSourceRange(start_byte, end_byte) catch return null;
+        return try src.byteRangeToSourceRange(start_byte, end_byte);
     }
 
     fn tokenLen(tree: *const std.zig.Ast, token: u32) u32 {
@@ -413,6 +758,291 @@ pub const UnreachableCodeChecker = struct {
         };
     }
 };
+
+test "unreachable_code_engine - constant emission propagates allocation failures" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "constant-oom.zig",
+        \\fn sample() void {
+        \\    if (true) {} else { dead(); }
+        \\    if (false) { dead(); }
+        \\    while (false) { dead(); }
+        \\}
+    );
+    defer source.deinit();
+    const tree = try source.ast();
+    const Harness = struct {
+        fn run(
+            memory: std.mem.Allocator,
+            ast: *const std.zig.Ast,
+            node: u32,
+            line: usize,
+        ) !void {
+            var input = Source.initParsed(memory, "constant-oom.zig", ast);
+            defer input.deinit();
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(memory);
+                diagnostics.deinit(memory);
+            }
+            switch (ast.nodes.items(.tag)[node]) {
+                .@"if", .if_simple => try UnreachableCodeChecker.checkIfStatement(
+                    &input,
+                    memory,
+                    &diagnostics,
+                    node,
+                ),
+                .@"while", .while_simple, .while_cont => try UnreachableCodeChecker.checkWhileStatement(
+                    &input,
+                    memory,
+                    &diagnostics,
+                    node,
+                ),
+                else => unreachable,
+            }
+            try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+            try std.testing.expectEqual(line, diagnostics.items[0].range.start.line);
+        }
+    };
+    var line: usize = 2;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        switch (tag) {
+            .@"if", .if_simple, .@"while", .while_simple, .while_cont => {
+                try std.testing.checkAllAllocationFailures(
+                    allocator,
+                    Harness.run,
+                    .{ tree, @as(u32, @intCast(index)), line },
+                );
+                line += 1;
+            },
+            else => {},
+        }
+    }
+}
+
+fn expectUnreachableLines(
+    code: [:0]const u8,
+    context: checker_mod.CheckerContext,
+    expected_lines: []const usize,
+) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    defer for (diagnostics.items) |*diag| diag.deinit(allocator);
+
+    try UnreachableCodeChecker.checker.checkAst(&source, allocator, &diagnostics, context);
+    try std.testing.expectEqual(expected_lines.len, diagnostics.items.len);
+    for (expected_lines) |line| {
+        var matches: usize = 0;
+        for (diagnostics.items) |diag| {
+            if (diag.range.start.line == line) matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
+}
+
+test "unreachable_code_engine - contradictory immutable integer guards" {
+    const code: [:0]const u8 =
+        \\fn foo(input: i32) i32 {
+        \\    const value = input;
+        \\    if (0 < value) {
+        \\        if (value <= 0) {
+        \\            const dead = value + 1;
+        \\            return dead;
+        \\        }
+        \\        while (value < 0) {
+        \\            return 2;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{ 4, 8 });
+}
+
+test "unreachable_code_engine - contradictory immutable boolean guards" {
+    const code: [:0]const u8 =
+        \\fn foo(flag: bool) i32 {
+        \\    if (flag) {
+        \\        if (!flag) {
+        \\            return 1;
+        \\        }
+        \\        if (flag) {
+        \\            return 2;
+        \\        } else {
+        \\            return 3;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{ 3, 8 });
+}
+
+test "unreachable_code_engine - reachable paths are not dead regions" {
+    const code: [:0]const u8 =
+        \\fn foo(value: i32, flag: bool) i32 {
+        \\    if (value > 0) {
+        \\        if (value == 1) return 1;
+        \\        if (flag) return 2;
+        \\    }
+        \\    if (value < 0) return 3;
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{});
+}
+
+test "unreachable_code_engine - mutation does not prove a branch impossible" {
+    const code: [:0]const u8 =
+        \\extern fn mutate(pointer: *i32) void;
+        \\fn throughPointer(pointer: *i32) i32 {
+        \\    if (pointer.* > 0) {
+        \\        mutate(pointer);
+        \\        if (pointer.* < 0) return 1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn throughAlias(input: i32) i32 {
+        \\    var value = input;
+        \\    if (value > 0) {
+        \\        mutate(&value);
+        \\        if (value < 0) return 1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn reassigned(input: i32) i32 {
+        \\    var value = input;
+        \\    if (value > 0) {
+        \\        value = -1;
+        \\        if (value < 0) return 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{});
+}
+
+test "unreachable_code_engine - unrelated effects preserve immutable guards" {
+    const code: [:0]const u8 =
+        \\extern fn mutate(pointer: *i32) void;
+        \\fn foo(value: i32, pointer: *i32) i32 {
+        \\    if (value > 0) {
+        \\        mutate(pointer);
+        \\        if (value < 0) return 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{5});
+}
+
+test "unreachable_code_engine - unsupported floating point guards stay unknown" {
+    const code: [:0]const u8 =
+        \\fn foo(value: f64) i32 {
+        \\    if (value < 0) {
+        \\        return 0;
+        \\    } else {
+        \\        if (value >= 0) return 1;
+        \\        return 2;
+        \\    }
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{});
+}
+
+test "unreachable_code_engine - dead calls and noreturn calls are not evidence" {
+    const code: [:0]const u8 =
+        \\fn stop() noreturn { unreachable; }
+        \\fn reached(flag: bool) void {
+        \\    if (flag) { stop(); }
+        \\}
+        \\fn stopped(value: i32) i32 {
+        \\    if (value > 0) {
+        \\        stop();
+        \\        if (value < 0) return 1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn returned(value: i32) i32 {
+        \\    if (value > 0) {
+        \\        return 1;
+        \\        if (value < 0) return 2;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{});
+}
+
+test "unreachable_code_engine - incomplete analyses preserve constant-only results" {
+    const code: [:0]const u8 =
+        \\fn foo(value: i32) i32 {
+        \\    if (false) return 1;
+        \\    if (value > 0) {
+        \\        if (value < 0) return 2;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{
+        .build_metadata = null,
+        .analysis_limits = .{ .max_worklist_steps = 1 },
+    }, &.{2});
+    try expectUnreachableLines(code, .{
+        .build_metadata = null,
+        .analysis_limits = .{ .max_states_per_point = 0 },
+    }, &.{2});
+}
+
+test "unreachable_code_engine - constant branches do not gain duplicate reports" {
+    const code: [:0]const u8 =
+        \\fn foo(value: i32) i32 {
+        \\    if (false) {
+        \\        if (value > 0) {
+        \\            if (value < 0) return 1;
+        \\        }
+        \\    }
+        \\    if (value > 0) {
+        \\        if (true) {
+        \\            return 2;
+        \\        } else {
+        \\            if (value < 0) return 3;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{ 2, 10 });
+}
+
+test "unreachable_code_engine - AST terminator reports own overlapping regions" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn foo(value: i32) i32 {
+        \\    if (value > 0) {
+        \\        if (value < 0) {
+        \\            return 1;
+        \\            consume(value);
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    defer for (diagnostics.items) |*diag| diag.deinit(allocator);
+
+    const ast_rule = @import("../rules/unreachable_code.zig").UnreachableCodeRule.rule;
+    try ast_rule.check(&source, allocator, &diagnostics);
+    try UnreachableCodeChecker.checker.checkAst(&source, allocator, &diagnostics, .{ .build_metadata = null });
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("unreachable-code", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 5), diagnostics.items[0].range.start.line);
+}
 
 test "unreachable_code_engine - detects if(false) body" {
     const testing = std.testing;

@@ -206,14 +206,14 @@ fn emitDiagnostic(
     is_definite: bool,
 ) CheckerError!void {
     const token = tree.nodes.items(.main_token)[site.ast_node];
-    const loc = src.tokenLocation(token) catch return;
+    const loc = try src.tokenLocation(token);
 
     const message = if (is_definite)
         "Array/slice index is definitely out of bounds"
     else
         "Array/slice index may be out of bounds";
 
-    const diag = try Diagnostic.initAtLocation(
+    var diag = try Diagnostic.initAtLocation(
         allocator,
         src.getFilePath(),
         "slice-bounds-engine",
@@ -222,5 +222,46 @@ fn emitDiagnostic(
         loc.line,
         loc.column,
     );
+    errdefer diag.deinit(allocator);
     try diagnostics.append(allocator, diag);
+}
+
+test "slice-bounds emission propagates allocation failures without leaks" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, tree: *const std.zig.Ast, site: BoundsSite) !void {
+            var source = Source.initParsed(allocator, "bounds-emission-oom.zig", tree);
+            defer source.deinit();
+            var result = checker_mod.AnalysisResult.init();
+            defer result.deinit(allocator);
+
+            try emitDiagnostic(&source, allocator, &result.diagnostics, tree, site, true);
+            try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
+            const diagnostic = result.diagnostics.items[0];
+            try std.testing.expectEqualStrings("slice-bounds-engine", diagnostic.rule_id);
+            try std.testing.expectEqual(checker_mod.Severity.err, diagnostic.severity);
+            try std.testing.expectEqual(
+                checker_mod.SourceRange.fromSingleLocation(.{ .line = 2, .column = 14 }),
+                diagnostic.range,
+            );
+        }
+    };
+    const code: [:0]const u8 =
+        \\fn foo(items: []const u8) void {
+        \\    _ = items[5];
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const site: BoundsSite = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .array_access) continue;
+        const pair = tree.nodes.items(.data)[index].node_and_node;
+        break .{
+            .ast_node = @intCast(index),
+            .array_or_slice_node = @intFromEnum(pair[0]),
+            .index_node = @intFromEnum(pair[1]),
+        };
+    } else return error.TestUnexpectedResult;
+
+    // The borrowed AST isolates location, message, and append allocations.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ &tree, site });
 }

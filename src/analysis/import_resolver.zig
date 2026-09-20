@@ -1,13 +1,64 @@
 const std = @import("std");
 const ast_walk = @import("../ast_walk.zig");
 const ProjectTypeResolver = @import("call_resolver.zig").ProjectTypeResolver;
+const LexicalIndex = @import("lexical_index.zig").LexicalIndex;
 
 pub const File = struct {
     path: []const u8,
     tree: *const std.zig.Ast,
+    /// Optional immutable metadata borrowed from the owner of this AST.
+    lexical_index: ?*const LexicalIndex = null,
+    path_index: ?*const PathIndex = null,
+};
+
+/// Owns normalized keys and borrows the immutable file slice and exact paths.
+pub const PathIndex = struct {
+    files: []const File,
+    exact: std.StringHashMapUnmanaged(usize) = .empty,
+    normalized: std.StringHashMapUnmanaged(usize) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, files: []const File) !PathIndex {
+        var index = PathIndex{ .files = files };
+        errdefer index.deinit(allocator);
+        for (files, 0..) |file, file_index| {
+            const first_equivalent = normalized: {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const path = normalizePath(&buffer, file.path) catch break :normalized file_index;
+                if (index.normalized.get(path)) |existing| break :normalized existing;
+                const owned = try allocator.dupe(u8, path);
+                errdefer allocator.free(owned);
+                try index.normalized.put(allocator, owned, file_index);
+                break :normalized file_index;
+            };
+            const exact = try index.exact.getOrPut(allocator, file.path);
+            if (!exact.found_existing) exact.value_ptr.* = first_equivalent;
+        }
+        return index;
+    }
+
+    pub fn deinit(self: *PathIndex, allocator: std.mem.Allocator) void {
+        var keys = self.normalized.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        self.normalized.deinit(allocator);
+        self.exact.deinit(allocator);
+    }
+
+    pub fn find(self: *const PathIndex, path: []const u8) ?usize {
+        // Exact spellings already point to the first normalized equivalent.
+        if (self.exact.get(path)) |file_index| return file_index;
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const normalized = normalizePath(&buffer, path) catch return null;
+        return self.normalized.get(normalized);
+    }
 };
 
 pub fn findFileIndexByPath(files: []const File, path: []const u8) ?usize {
+    if (files.len != 0) {
+        if (files[0].path_index) |index| {
+            // A borrowed File may also appear in a caller's subset or fixture.
+            if (index.files.ptr == files.ptr and index.files.len == files.len) return index.find(path);
+        }
+    }
     for (files, 0..) |file, file_index| {
         if (std.mem.eql(u8, file.path, path) or pathsEquivalent(file.path, path)) return file_index;
     }
@@ -32,13 +83,14 @@ fn filePubliclyImportsPathVisited(
     if (file_index >= files.len) return false;
 
     const file = files[file_index];
+    if (file.tree.errors.len != 0) return false;
     const tags = file.tree.nodes.items(.tag);
 
     for (file.tree.rootDecls()) |decl_idx| {
         const idx = @intFromEnum(decl_idx);
         if (idx >= tags.len) continue;
         if (!isVarDeclTag(tags[idx])) continue;
-        if (publicVarDeclImportsPath(file.tree, @intCast(idx), file.path, target_path)) return true;
+        if (publicVarDeclImportsPath(file, @intCast(idx), target_path)) return true;
     }
     return usingnamespaceImportsPathVisited(files, file.tree, file.path, target_path, true, visited, depth + 1);
 }
@@ -50,11 +102,17 @@ pub fn nodeImportsPath(
     importer_path: []const u8,
     target_path: []const u8,
 ) bool {
+    if (tree.errors.len != 0) return false;
     const tags = tree.nodes.items(.tag);
     if (node >= tags.len) return false;
 
     switch (tags[node]) {
-        .identifier => return initNodeImportsPath(tree, node, importer_path, target_path),
+        .identifier => {
+            if (findFileIndexByPath(files, importer_path)) |file_index| {
+                if (files[file_index].tree == tree) return initNodeImportsFile(files[file_index], node, target_path);
+            }
+            return initNodeImportsPath(tree, node, importer_path, target_path);
+        },
         .builtin_call,
         .builtin_call_comma,
         .builtin_call_two,
@@ -97,6 +155,7 @@ fn usingnamespaceImportsPathVisited(
     visited: *[64]usize,
     depth: usize,
 ) bool {
+    if (tree.errors.len != 0) return false;
     const token_tags = tree.tokens.items(.tag);
 
     for (token_tags, 0..) |_, token_index| {
@@ -126,18 +185,23 @@ pub fn initNodeImportsPath(
     importer_path: []const u8,
     target_path: []const u8,
 ) bool {
+    return initNodeImportsFile(.{ .path = importer_path, .tree = tree }, node, target_path);
+}
+
+fn initNodeImportsFile(file: File, node: usize, target_path: []const u8) bool {
     var visited: [64]u32 = undefined;
-    return initNodeImportsPathVisited(tree, node, importer_path, target_path, &visited, 0);
+    return initNodeImportsPathVisited(file, node, target_path, &visited, 0);
 }
 
 fn initNodeImportsPathVisited(
-    tree: *const std.zig.Ast,
+    file: File,
     node: usize,
-    importer_path: []const u8,
     target_path: []const u8,
     visited: *[64]u32,
     depth: usize,
 ) bool {
+    const tree = file.tree;
+    if (tree.errors.len != 0) return false;
     const tags = tree.nodes.items(.tag);
     if (node >= tags.len or depth >= visited.len) return false;
 
@@ -148,14 +212,13 @@ fn initNodeImportsPathVisited(
         .builtin_call_two_comma,
         => {
             const import_path = importPathFromBuiltinCall(tree, node) orelse return false;
-            return importMayResolveToPath(importer_path, import_path, target_path);
+            return importMayResolveToPath(file.path, import_path, target_path);
         },
         .identifier => {
             const alias_node: u32 = @intCast(node);
             return aliasInitImportsPath(
-                tree,
+                file,
                 alias_node,
-                importer_path,
                 target_path,
                 visited,
                 depth,
@@ -184,7 +247,7 @@ fn initNodeImportsPathVisited(
         => return false,
         else => {
             var scanner = InitPathScanner{
-                .importer_path = importer_path,
+                .file = file,
                 .target_path = target_path,
                 .visited = visited,
                 .depth = depth,
@@ -203,14 +266,14 @@ fn initNodeImportsPathVisited(
 }
 
 fn aliasInitImportsPath(
-    tree: *const std.zig.Ast,
+    file: File,
     alias_node: u32,
-    importer_path: []const u8,
     target_path: []const u8,
     visited: *[64]u32,
     depth: usize,
 ) bool {
-    const files = [_]File{.{ .path = importer_path, .tree = tree }};
+    const tree = file.tree;
+    const files = [_]File{file};
     const resolver = ProjectTypeResolver{ .files = &files, .file_index = 0 };
     const decl_node = resolver.resolveDeclarationNode(alias_node) orelse return false;
     if (std.mem.indexOfScalar(u32, visited[0..depth], decl_node) != null) return false;
@@ -218,9 +281,8 @@ fn aliasInitImportsPath(
     const init_node = full.ast.init_node.unwrap() orelse return false;
     visited[depth] = decl_node;
     return initNodeImportsPathVisited(
-        tree,
+        file,
         @intFromEnum(init_node),
-        importer_path,
         target_path,
         visited,
         depth + 1,
@@ -429,11 +491,11 @@ pub fn fieldAccessName(tree: *const std.zig.Ast, node: usize) ?[]const u8 {
 }
 
 fn publicVarDeclImportsPath(
-    tree: *const std.zig.Ast,
+    file: File,
     node_idx: u32,
-    importer_path: []const u8,
     target_path: []const u8,
 ) bool {
+    const tree = file.tree;
     const full = tree.fullVarDecl(@enumFromInt(node_idx)) orelse return false;
     if (!isPubToken(tree, full.visib_token)) return false;
 
@@ -442,30 +504,31 @@ fn publicVarDeclImportsPath(
     const tags = tree.nodes.items(.tag);
     if (init_idx >= tags.len) return false;
 
-    return initNodeImportsPath(tree, init_idx, importer_path, target_path);
+    return initNodeImportsFile(file, init_idx, target_path);
 }
 
 fn filePublicMemberImportsPath(files: []const File, file_index: usize, member_name: []const u8, target_path: []const u8) bool {
     if (file_index >= files.len) return false;
     const file = files[file_index];
+    if (file.tree.errors.len != 0) return false;
     const tags = file.tree.nodes.items(.tag);
 
     for (file.tree.rootDecls()) |decl_idx| {
         const idx = @intFromEnum(decl_idx);
         if (idx >= tags.len) continue;
         if (!isVarDeclTag(tags[idx])) continue;
-        if (publicVarDeclNamedImportsPath(file.tree, @intCast(idx), file.path, member_name, target_path)) return true;
+        if (publicVarDeclNamedImportsPath(file, @intCast(idx), member_name, target_path)) return true;
     }
     return false;
 }
 
 fn publicVarDeclNamedImportsPath(
-    tree: *const std.zig.Ast,
+    file: File,
     node_idx: u32,
-    importer_path: []const u8,
     expected_name: []const u8,
     target_path: []const u8,
 ) bool {
+    const tree = file.tree;
     const full = tree.fullVarDecl(@enumFromInt(node_idx)) orelse return false;
     if (!isPubToken(tree, full.visib_token)) return false;
     const name_token = full.ast.mut_token + 1;
@@ -475,7 +538,7 @@ fn publicVarDeclNamedImportsPath(
     if (!std.mem.eql(u8, name, expected_name)) return false;
 
     const init_node = full.ast.init_node.unwrap() orelse return false;
-    return initNodeImportsPath(tree, @intFromEnum(init_node), importer_path, target_path);
+    return initNodeImportsFile(file, @intFromEnum(init_node), target_path);
 }
 
 fn isPubToken(tree: *const std.zig.Ast, token: ?std.zig.Ast.TokenIndex) bool {
@@ -484,19 +547,18 @@ fn isPubToken(tree: *const std.zig.Ast, token: ?std.zig.Ast.TokenIndex) bool {
 }
 
 const InitPathScanner = struct {
-    importer_path: []const u8,
+    file: File,
     target_path: []const u8,
     visited: *[64]u32,
     depth: usize,
     found: bool = false,
     stop: bool = false,
 
-    pub fn visit(tree: *const std.zig.Ast, node: u32, self: *InitPathScanner) anyerror!void {
+    pub fn visit(_: *const std.zig.Ast, node: u32, self: *InitPathScanner) anyerror!void {
         if (self.stop) return;
         self.found = initNodeImportsPathVisited(
-            tree,
+            self.file,
             node,
-            self.importer_path,
             self.target_path,
             self.visited,
             self.depth,
@@ -525,6 +587,95 @@ test "skript residual: public conditional imports expose both branches" {
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/no_dynlib.zig"));
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/ffi.zig"));
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/no_ffi.zig"));
+}
+
+test "import resolution rejects malformed exports and preserves valid aliases" {
+    const allocator = std.testing.allocator;
+    var source = try std.zig.Ast.parse(allocator,
+        \\const malformed = @import("malformed.zig");
+        \\const valid = @import("valid.zig");
+        \\pub const hidden = malformed.leaf;
+        \\pub const visible = valid.leaf;
+    , .zig);
+    defer source.deinit(allocator);
+    var malformed = try std.zig.Ast.parse(allocator,
+        \\pub const leaf = @import("hidden.zig");
+        \\pub const cycle = alias;
+        \\const alias = cycle;
+        \\const broken = ;
+    , .zig);
+    defer malformed.deinit(allocator);
+    var valid = try std.zig.Ast.parse(allocator,
+        \\pub const leaf = selected;
+        \\const selected = @import("visible.zig");
+        \\pub const cycle = alias;
+        \\const alias = cycle;
+    , .zig);
+    defer valid.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), source.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), valid.errors.len);
+    try std.testing.expect(malformed.errors.len != 0);
+    var source_index = try LexicalIndex.init(allocator, &source);
+    defer source_index.deinit(allocator);
+    var malformed_index = try LexicalIndex.init(allocator, &malformed);
+    defer malformed_index.deinit(allocator);
+    var valid_index = try LexicalIndex.init(allocator, &valid);
+    defer valid_index.deinit(allocator);
+    var files = [_]File{
+        .{ .path = "source.zig", .tree = &source },
+        .{ .path = "malformed.zig", .tree = &malformed },
+        .{ .path = "valid.zig", .tree = &valid },
+    };
+    var paths = try PathIndex.init(allocator, &files);
+    defer paths.deinit(allocator);
+    for ([_]bool{ false, true }) |indexed| {
+        files[0].lexical_index = if (indexed) &source_index else null;
+        files[1].lexical_index = if (indexed) &malformed_index else null;
+        files[2].lexical_index = if (indexed) &valid_index else null;
+        for (&files) |*file| file.path_index = if (indexed) &paths else null;
+        try std.testing.expect(!filePubliclyImportsPath(&files, 1, "hidden.zig"));
+        try std.testing.expect(filePubliclyImportsPath(&files, 2, "visible.zig"));
+        try std.testing.expect(!filePubliclyImportsPath(&files, 2, "missing.zig"));
+
+        const hidden_decl = source.fullVarDecl(source.rootDecls()[2]) orelse return error.TestUnexpectedResult;
+        const hidden = hidden_decl.ast.init_node.unwrap() orelse return error.TestUnexpectedResult;
+        const visible_decl = source.fullVarDecl(source.rootDecls()[3]) orelse return error.TestUnexpectedResult;
+        const visible = visible_decl.ast.init_node.unwrap() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(!nodeImportsPath(&files, &source, @intFromEnum(hidden), "source.zig", "hidden.zig"));
+        try std.testing.expect(nodeImportsPath(&files, &source, @intFromEnum(visible), "source.zig", "visible.zig"));
+        const imported_decl = source.fullVarDecl(source.rootDecls()[0]) orelse return error.TestUnexpectedResult;
+        const imported = imported_decl.ast.init_node.unwrap() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nodeImportsPath(&files, &source, @intFromEnum(imported), "source.zig", "malformed.zig"));
+        for (0..malformed.nodes.len) |node| {
+            try std.testing.expect(!nodeImportsPath(&files, &malformed, node, "malformed.zig", "hidden.zig"));
+            try std.testing.expect(!initNodeImportsPath(&malformed, node, "malformed.zig", "hidden.zig"));
+        }
+    }
+}
+
+test "indexed imports preserve forward aliases and local shadowing" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\pub const exposed = @"selected module";
+        \\const @"selected module" = @import("selected.zig");
+        \\const hidden = @import("hidden.zig");
+        \\pub const value = blk: { const hidden = 1; break :blk hidden; };
+        \\pub const cycle = alias;
+        \\const alias = cycle;
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    for ([_]?*const LexicalIndex{ null, &index }) |metadata| {
+        const files = [_]File{.{ .path = "src/root.zig", .tree = &tree, .lexical_index = metadata }};
+        try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/selected.zig"));
+        try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/hidden.zig"));
+        const declaration = tree.fullVarDecl(tree.rootDecls()[0]) orelse return error.TestUnexpectedResult;
+        const initializer = declaration.ast.init_node.unwrap() orelse return error.TestUnexpectedResult;
+        try std.testing.expect(nodeImportsPath(&files, &tree, @intFromEnum(initializer), files[0].path, "src/selected.zig"));
+        try std.testing.expect(!nodeImportsPath(&files, &tree, @intFromEnum(initializer), files[0].path, "src/hidden.zig"));
+    }
 }
 
 test "public import aliases ignore unrelated local bindings" {
@@ -591,23 +742,91 @@ test "conditional namespace aliases do not reexport their condition" {
     try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/condition.zig"));
 }
 
-test "cyclic namespace imports still find reachable files" {
+test "unsupported usingnamespace syntax does not expose imports" {
     const allocator = std.testing.allocator;
     var first = try std.zig.Ast.parse(allocator, "pub usingnamespace @import(\"b.zig\");", .zig);
     defer first.deinit(allocator);
     var second = try std.zig.Ast.parse(allocator,
         \\pub usingnamespace @import("a.zig");
+        \\pub usingnamespace @import("malformed.zig");
         \\pub usingnamespace @import("c.zig");
     , .zig);
     defer second.deinit(allocator);
+    var malformed = try std.zig.Ast.parse(allocator,
+        \\pub usingnamespace @import("hidden.zig");
+        \\const broken = ;
+    , .zig);
+    defer malformed.deinit(allocator);
+    try std.testing.expect(malformed.errors.len != 0);
     const files = [_]File{
         .{ .path = "a.zig", .tree = &first },
         .{ .path = "b.zig", .tree = &second },
+        .{ .path = "malformed.zig", .tree = &malformed },
     };
     try std.testing.expect(!filePubliclyImportsPath(&files, 0, "missing.zig"));
-    try std.testing.expect(filePubliclyImportsPath(&files, 0, "c.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "hidden.zig"));
     try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "missing.zig"));
-    try std.testing.expect(fileUsingnamespaceImportsPath(&files, &first, "a.zig", "c.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "hidden.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &malformed, "malformed.zig", "hidden.zig"));
+    try std.testing.expect(first.errors.len != 0);
+    try std.testing.expect(second.errors.len != 0);
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "b.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "c.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 1, "a.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 1, "malformed.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 1, "c.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "b.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "c.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &second, "b.zig", "a.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &second, "b.zig", "c.zig"));
+}
+
+test "path index preserves POSIX equivalence and first matching file" {
+    const allocator = std.testing.allocator;
+    var tree = try std.zig.Ast.parse(allocator, "", .zig);
+    defer tree.deinit(allocator);
+    var files = [_]File{
+        .{ .path = "./src/value.zig", .tree = &tree },
+        .{ .path = "src/value.zig", .tree = &tree },
+        .{ .path = "other/value.zig", .tree = &tree },
+        .{ .path = "C:value.zig", .tree = &tree },
+        .{ .path = "src/back\\slash.zig", .tree = &tree },
+    };
+    const plain = files;
+    var index = try PathIndex.init(allocator, &files);
+    defer index.deinit(allocator);
+    for (&files) |*file| file.path_index = &index;
+    const paths = [_][]const u8{
+        "src/value.zig",          "/src//value.zig",     "src/value.zig/.",
+        "src/value.zig/child/..", "src/value.zig/",      "other/value.zig",
+        "./C:value.zig",          "src/back\\slash.zig", "src/missing.zig",
+    };
+    for (paths) |path| {
+        try std.testing.expectEqual(findFileIndexByPath(&plain, path), findFileIndexByPath(&files, path));
+    }
+    try std.testing.expectEqual(@as(?usize, 0), findFileIndexByPath(&files, "src/value.zig"));
+    try std.testing.expectEqual(@as(?usize, 0), findFileIndexByPath(files[2..3], "other/value.zig"));
+    try std.testing.expectEqual(@as(?usize, null), findFileIndexByPath(files[2..3], "src/value.zig"));
+}
+
+test "path index releases duplicate and partial normalized keys" {
+    const allocator = std.testing.allocator;
+    var tree = try std.zig.Ast.parse(allocator, "", .zig);
+    defer tree.deinit(allocator);
+    const files = [_]File{
+        .{ .path = "src/value.zig", .tree = &tree },
+        .{ .path = "./src/value.zig", .tree = &tree },
+        .{ .path = "src/other.zig", .tree = &tree },
+    };
+    const Harness = struct {
+        fn run(failing_allocator: std.mem.Allocator, source_files: []const File) !void {
+            var index = try PathIndex.init(failing_allocator, source_files);
+            defer index.deinit(failing_allocator);
+            try std.testing.expectEqual(@as(?usize, 0), index.find("./src/value.zig"));
+            try std.testing.expectEqual(@as(?usize, 2), index.find("src/other.zig/child/.."));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{@as([]const File, &files)});
 }
 
 test "import path comparisons preserve normalization and package precedence" {

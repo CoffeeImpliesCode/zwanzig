@@ -1,9 +1,16 @@
+const std = @import("std");
 const ids = @import("../../ids.zig");
 const Cfg = @import("../../cfg.zig").Cfg;
 const VarResolver = @import("../var_resolver.zig").VarResolver;
 
 pub fn Mixin(comptime _Engine: type) type {
     return struct {
+        /// Prepare this function before any allocation-free variable queries.
+        pub fn prepare(self: *_Engine, cfg: *const Cfg) std.mem.Allocator.Error!void {
+            const fn_node = cfg.fn_ast_node orelse return;
+            _ = try getOrBuildVarResolver(self, fn_node);
+        }
+
         pub fn resolveVarIdFromVarDecl(self: *_Engine, var_decl_node: u32) ?ids.VarId {
             const src = self.source orelse return null;
             const tree = src.ast() catch return null;
@@ -27,7 +34,7 @@ pub fn Mixin(comptime _Engine: type) type {
             if (token >= token_tags.len or token_tags[token] != .identifier) return null;
 
             if (current_cfg.fn_ast_node) |fn_node| {
-                if (getOrBuildVarResolver(self, fn_node)) |resolver| {
+                if (self.var_resolvers.get(fn_node)) |resolver| {
                     if (resolver.resolve(identifier_node)) |var_id| {
                         return var_id;
                     }
@@ -45,7 +52,7 @@ pub fn Mixin(comptime _Engine: type) type {
             if (identifier_node >= tags.len or tags[identifier_node] != .identifier) return null;
 
             if (current_cfg.fn_ast_node) |fn_node| {
-                if (getOrBuildVarResolver(self, fn_node)) |resolver| {
+                if (self.var_resolvers.get(fn_node)) |resolver| {
                     return resolver.resolveDeclInfo(identifier_node);
                 }
             }
@@ -155,22 +162,17 @@ pub fn Mixin(comptime _Engine: type) type {
             return ids.varId(hash);
         }
 
-        pub fn getOrBuildVarResolver(self: *_Engine, fn_node: ids.AstNodeId) ?*VarResolver {
+        pub fn getOrBuildVarResolver(self: *_Engine, fn_node: ids.AstNodeId) std.mem.Allocator.Error!?*VarResolver {
             if (self.var_resolvers.get(fn_node)) |resolver| return resolver;
             const src = self.source orelse return null;
-            const tree = src.ast() catch return null;
+            const tree = try src.ast();
 
-            const resolver_ptr = self.allocator.create(VarResolver) catch return null;
-            resolver_ptr.* = VarResolver.init(self.allocator, tree, fn_node) catch {
-                self.allocator.destroy(resolver_ptr);
-                return null;
-            };
+            const resolver_ptr = try self.allocator.create(VarResolver);
+            errdefer self.allocator.destroy(resolver_ptr);
+            resolver_ptr.* = try VarResolver.init(self.allocator, tree, fn_node);
+            errdefer resolver_ptr.deinit();
 
-            self.var_resolvers.put(fn_node, resolver_ptr) catch {
-                resolver_ptr.deinit();
-                self.allocator.destroy(resolver_ptr);
-                return null;
-            };
+            try self.var_resolvers.put(fn_node, resolver_ptr);
             return resolver_ptr;
         }
 

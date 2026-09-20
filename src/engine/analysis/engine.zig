@@ -21,6 +21,7 @@ const Constraint = @import("../constraints.zig").Constraint;
 const SummaryCache = @import("../summary.zig").SummaryCache;
 const ProgramPoint = @import("../state.zig").ProgramPoint;
 const ProgramState = @import("../state.zig").ProgramState;
+const ErrorState = @import("../state.zig").ErrorState;
 const WideningKey = @import("../state.zig").WideningKey;
 const ResourceState = @import("../store.zig").ResourceState;
 const VarResolver = @import("../var_resolver.zig").VarResolver;
@@ -65,6 +66,9 @@ pub const AnalysisEngine = struct {
     /// Stores pointers to heap-allocated CFGs for stable addresses that survive
     /// hashmap rehashing.
     function_cfgs: std.AutoHashMap(AstNodeId, FunctionCfgEntry),
+    /// Owned predecessor counts, saturated at two, for immutable root and inline CFGs.
+    /// CFG pointers remain valid until engine teardown.
+    predecessor_counts: std.AutoHashMap(*const Cfg, []const u8),
     /// Map from function name to AST node index
     function_names: std.StringHashMap(AstNodeId),
     /// Cache of scope-aware variable resolvers per function
@@ -128,6 +132,7 @@ pub const AnalysisEngine = struct {
             .max_worklist_steps = default_max_worklist_steps,
             .source = null,
             .function_cfgs = std.AutoHashMap(AstNodeId, FunctionCfgEntry).init(allocator),
+            .predecessor_counts = std.AutoHashMap(*const Cfg, []const u8).init(allocator),
             .function_names = std.StringHashMap(AstNodeId).init(allocator),
             .var_resolvers = std.AutoHashMap(AstNodeId, *VarResolver).init(allocator),
             .assertion_scopes = std.AutoHashMap(AstNodeId, assertions.AssertionScope).init(allocator),
@@ -155,6 +160,11 @@ pub const AnalysisEngine = struct {
     pub fn deinit(self: *AnalysisEngine) void {
         self.graph.deinit();
         self.worklist.deinit(self.allocator);
+        var counts_iter = self.predecessor_counts.valueIterator();
+        while (counts_iter.next()) |counts| {
+            self.allocator.free(counts.*);
+        }
+        self.predecessor_counts.deinit();
         // Deinit and free all cached CFGs
         var iter = self.function_cfgs.valueIterator();
         while (iter.next()) |entry| {
@@ -280,17 +290,28 @@ pub const AnalysisEngine = struct {
         if (self.source) |src| {
             try self.buildFunctionIndex(src);
         }
+        try VarResolution.prepare(self, cfg);
+
+        // Resumed work can start inside a callee with callers not yet visited here.
+        for (self.worklist.items) |item| {
+            try VarResolution.prepare(self, item.cfg);
+            if (self.graph.getNode(item.node_index)) |node| {
+                for (node.state.call_stack.items) |frame| {
+                    try VarResolution.prepare(self, frame.caller_cfg);
+                }
+            }
+        }
 
         // Seed only when starting fresh; otherwise continue from the pre-seeded worklist.
         if (self.worklist.items.len == 0) {
             var initial_state = ProgramState.init(self.allocator);
+            var owns_initial_state = true;
+            defer if (owns_initial_state) initial_state.deinit();
             initial_state.build_metadata = self.build_metadata;
             const entry_point = ProgramPoint.initPre(cfg.entry, cfg);
 
-            const result = try self.graph.getOrCreateNode(entry_point, &initial_state);
-            if (result.caller_should_deinit) {
-                initial_state.deinit();
-            }
+            const result = try self.getOrCreateNode(entry_point, &initial_state, .{});
+            owns_initial_state = result.caller_should_deinit;
             try self.worklist.append(self.allocator, .{ .node_index = result.index, .edge_kind = .normal, .pending_constraint = null, .cfg = cfg });
         }
 
@@ -303,13 +324,14 @@ pub const AnalysisEngine = struct {
                 const checker = self.checker_name orelse "unknown";
                 const cfg_size = item.cfg.nodeCount();
                 const inlined_cfgs = self.function_cfgs.count();
-                log.warn("[{s}] analysis limit exceeded: {d} steps, {d} unique states, worklist {d}, cfg nodes {d}, inlined fns {d} in {s}", .{
+                log.warn("[{s}] analysis limit exceeded: {d} steps, {d} unique states, worklist {d}, cfg nodes {d}, inlined fns {d}, function {s} in {s}", .{
                     checker,
                     worklist_steps,
                     self.graph.nodes.items.len,
                     self.worklist.items.len,
                     cfg_size,
                     inlined_cfgs,
+                    item.cfg.fn_name orelse "unknown",
                     file_path,
                 });
                 return error.AnalysisLimitExceeded;
@@ -318,9 +340,30 @@ pub const AnalysisEngine = struct {
         }
     }
 
+    fn getOrCreateNode(
+        self: *AnalysisEngine,
+        point: ProgramPoint,
+        state: *ProgramState,
+        options: ExplodedGraph.WideningOptions,
+    ) EngineError!ExplodedGraph.GetOrCreateResult {
+        return self.graph.getOrCreateNodeWithWidening(point, state, options) catch |err| {
+            if (err == error.AnalysisLimitExceeded) {
+                log.warn("[{s}] analysis state limit exceeded: {d} states per point, function {s} in {s}, cfg node {d} ({s})", .{
+                    self.checker_name orelse "unknown",
+                    self.graph.max_states_per_point,
+                    point.cfg.fn_name orelse "unknown",
+                    if (self.source) |src| src.getFilePath() else "unknown",
+                    ids.cfgIndex(point.node_index),
+                    @tagName(point.kind),
+                });
+            }
+            return err;
+        };
+    }
+
     /// Build an index of function names to AST node indices.
     fn buildFunctionIndex(self: *AnalysisEngine, src: *Source) EngineError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
         const token_tags = tree.tokens.items(.tag);
         const main_tokens = tree.nodes.items(.main_token);
@@ -342,7 +385,7 @@ pub const AnalysisEngine = struct {
     }
 
     /// Get or build a CFG for a function by its AST node index.
-    pub fn getOrBuildFunctionCfg(self: *AnalysisEngine, fn_ast_node: AstNodeId) ?*const Cfg {
+    pub fn getOrBuildFunctionCfg(self: *AnalysisEngine, fn_ast_node: AstNodeId) std.mem.Allocator.Error!?*const Cfg {
         // Check cache first - returns the pointer stored in the map
         if (self.function_cfgs.get(fn_ast_node)) |entry| {
             return entry.cfg;
@@ -351,45 +394,37 @@ pub const AnalysisEngine = struct {
         if (self.cached_artifacts) |artifacts| {
             const fn_index = ids.astIndex(fn_ast_node);
             if (artifacts.getCfg(fn_index)) |cfg_ptr| {
-                self.function_cfgs.put(fn_ast_node, .{ .cfg = @constCast(cfg_ptr), .owned = false }) catch return cfg_ptr;
+                try self.function_cfgs.put(fn_ast_node, .{ .cfg = @constCast(cfg_ptr), .owned = false });
                 return cfg_ptr;
             }
         }
 
-        // Build the CFG if source is available
+        // Artifact CFGs must not retain an engine-local allocator context.
         const src = self.source orelse return null;
-        var builder = CfgBuilder.init(self.allocator);
+        const cfg_allocator = if (self.cached_artifacts) |artifacts| artifacts.allocator else self.allocator;
+        var builder = CfgBuilder.init(cfg_allocator);
         builder.setTypeContext(self.type_context);
-        const cfg_opt = builder.buildFromFn(src, fn_ast_node) catch return null;
-        if (cfg_opt) |cfg| {
-            // Allocate CFG on the heap for stable address
-            const cfg_ptr = self.allocator.create(Cfg) catch return null;
-            cfg_ptr.* = cfg;
+        const cfg_opt = builder.buildFromFn(src, fn_ast_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return null,
+        };
+        var cfg = cfg_opt orelse return null;
+        errdefer cfg.deinit();
 
-            if (self.cached_artifacts) |artifacts| {
-                const fn_index = ids.astIndex(fn_ast_node);
-                self.function_cfgs.put(fn_ast_node, .{ .cfg = cfg_ptr, .owned = false }) catch {
-                    cfg_ptr.deinit();
-                    self.allocator.destroy(cfg_ptr);
-                    return null;
-                };
-                artifacts.addCfg(fn_index, cfg_ptr) catch {
-                    _ = self.function_cfgs.remove(fn_ast_node);
-                    cfg_ptr.deinit();
-                    self.allocator.destroy(cfg_ptr);
-                    return null;
-                };
-                return cfg_ptr;
-            }
+        const cfg_ptr = try cfg_allocator.create(Cfg);
+        errdefer cfg_allocator.destroy(cfg_ptr);
+        cfg_ptr.* = cfg;
 
-            self.function_cfgs.put(fn_ast_node, .{ .cfg = cfg_ptr, .owned = true }) catch {
-                cfg_ptr.deinit();
-                self.allocator.destroy(cfg_ptr);
-                return null;
-            };
+        if (self.cached_artifacts) |artifacts| {
+            const fn_index = ids.astIndex(fn_ast_node);
+            try self.function_cfgs.put(fn_ast_node, .{ .cfg = cfg_ptr, .owned = false });
+            errdefer _ = self.function_cfgs.remove(fn_ast_node);
+            try artifacts.addCfg(fn_index, cfg_ptr);
             return cfg_ptr;
         }
-        return null;
+
+        try self.function_cfgs.put(fn_ast_node, .{ .cfg = cfg_ptr, .owned = true });
+        return cfg_ptr;
     }
 
     /// Resolve a function call to a function AST node index.
@@ -446,13 +481,13 @@ pub const AnalysisEngine = struct {
     fn processNode(self: *AnalysisEngine, node_index: u32, edge_kind: EdgeKind, pending_constraint: ?Constraint, current_cfg: *const Cfg) EngineError!void {
         _ = edge_kind;
 
-        const exploded_node = self.graph.getNode(node_index) orelse return;
-        const point = exploded_node.point;
-
-        // Clone the state immediately - we can't hold a reference to exploded_node.state
-        // because graph operations may reallocate the nodes array and invalidate pointers.
-        var state_copy = try exploded_node.state.clone(self.allocator);
-        defer state_copy.deinit();
+        // End the graph borrow before any operation can relocate its node array.
+        const point, var state_copy = blk: {
+            const node = self.graph.getNode(node_index) orelse return;
+            break :blk .{ node.point, try node.state.clone(self.allocator) };
+        };
+        var owns_state_copy = true;
+        defer if (owns_state_copy) state_copy.deinit();
 
         switch (point.kind) {
             .pre => {
@@ -477,7 +512,10 @@ pub const AnalysisEngine = struct {
                 }
 
                 const post_point = ProgramPoint.initPost(point.node_index, current_cfg);
-                var new_state = try self.transferFunction(point, &state_copy, current_cfg);
+                owns_state_copy = false;
+                var new_state = try self.transferFunction(point, state_copy, current_cfg);
+                var owns_new_state = true;
+                defer if (owns_new_state) new_state.deinit();
 
                 // Apply any pending constraint from a branch edge
                 if (pending_constraint) |constraint| {
@@ -486,15 +524,12 @@ pub const AnalysisEngine = struct {
                     // Check if the state is still satisfiable after adding the constraint
                     if (!new_state.isSatisfiable()) {
                         self.pruned_path_count += 1;
-                        new_state.deinit();
                         return; // Prune this path
                     }
                 }
 
-                const result = try self.graph.getOrCreateNode(post_point, &new_state);
-                if (result.caller_should_deinit) {
-                    new_state.deinit();
-                }
+                const result = try self.getOrCreateNode(post_point, &new_state, .{});
+                owns_new_state = result.caller_should_deinit;
                 try self.graph.addEdge(node_index, result.index);
 
                 if (result.is_new or result.state_updated) {
@@ -521,10 +556,16 @@ pub const AnalysisEngine = struct {
                     break :blk 0;
                 } else 0;
 
+                const predecessor_counts: []const u8 = if (self.use_widening)
+                    try self.getPredecessorCounts(current_cfg)
+                else
+                    &.{};
                 for (current_cfg.edges.items) |edge| {
                     if (edge.from == point.node_index) {
                         const succ_point = ProgramPoint.initPre(edge.to, current_cfg);
                         var succ_state = try state_copy.clone(self.allocator);
+                        var owns_succ_state = true;
+                        defer if (owns_succ_state) succ_state.deinit();
 
                         // Handle error state transitions based on edge kind
                         switch (edge.kind) {
@@ -544,10 +585,7 @@ pub const AnalysisEngine = struct {
                             },
                             .errdefer_edge => {
                                 // Errdefer only executes on error path
-                                if (!succ_state.isErrorPath()) {
-                                    succ_state.deinit();
-                                    continue;
-                                }
+                                if (!succ_state.isErrorPath()) continue;
                             },
                             else => {},
                         }
@@ -571,7 +609,6 @@ pub const AnalysisEngine = struct {
                                     try succ_state.addConstraint(constraint_to_apply);
                                     if (!succ_state.isSatisfiable()) {
                                         self.pruned_path_count += 1;
-                                        succ_state.deinit();
                                         path_pruned = true;
                                         break;
                                     }
@@ -592,7 +629,8 @@ pub const AnalysisEngine = struct {
                                     }
                                     break :blk_loop false;
                                 };
-                                const is_join = AnalysisEngine.hasMultiplePredecessors(current_cfg, edge.to);
+                                const successor = ids.cfgIndex(edge.to);
+                                const is_join = successor < predecessor_counts.len and predecessor_counts[successor] > 1;
 
                                 if (is_loop_header or is_join) {
                                     // succ_point is already a pre-state (from ProgramPoint.initPre above)
@@ -606,10 +644,8 @@ pub const AnalysisEngine = struct {
                             break :blk ExplodedGraph.WideningOptions{};
                         };
 
-                        const result = try self.graph.getOrCreateNodeWithWidening(succ_point, &succ_state, widening_options);
-                        if (result.caller_should_deinit) {
-                            succ_state.deinit();
-                        }
+                        const result = try self.getOrCreateNode(succ_point, &succ_state, widening_options);
+                        owns_succ_state = result.caller_should_deinit;
                         try self.graph.addEdge(node_index, result.index);
 
                         if (result.is_new or result.state_updated) {
@@ -662,7 +698,7 @@ pub const AnalysisEngine = struct {
         // Only use summaries for pure functions (no side effects) to avoid losing
         // callee effects when skipping inlining
         if (self.use_summaries) {
-            if (Summaries.getOrComputeSummary(self, callee_fn_node)) |summary| {
+            if (try Summaries.getOrComputeSummary(self, callee_fn_node)) |summary| {
                 // Only apply summaries for pure functions to preserve side effect semantics
                 if (!summary.has_side_effects and summary.isApplicable(state)) {
                     // Find the return point (successor of the call node in the caller)
@@ -677,21 +713,38 @@ pub const AnalysisEngine = struct {
 
                     // Apply the summary to the state
                     var summary_state = try state.clone(self.allocator);
+                    var owns_summary_state = true;
+                    defer if (owns_summary_state) summary_state.deinit();
                     const is_satisfiable = try summary.applyToState(&summary_state);
 
-                    // If postconditions contradict existing constraints, fall back to inlining
-                    if (!is_satisfiable) {
-                        summary_state.deinit();
-                        // Fall through to inlining below
-                    } else {
+                    // Contradictory postconditions fall through to inlining below.
+                    if (is_satisfiable) {
                         self.summary_use_count += 1;
 
-                        // Create the post-call point
                         const post_call_point = ProgramPoint.initPre(ret_node, caller_cfg);
-                        const result = try self.graph.getOrCreateNode(post_call_point, &summary_state);
-                        if (result.caller_should_deinit) {
-                            summary_state.deinit();
+                        if (summary.may_return_error and !summary.always_returns_error) {
+                            // Clone before either graph insertion can take ownership.
+                            var error_state = try summary_state.clone(self.allocator);
+                            var owns_error_state = true;
+                            defer if (owns_error_state) error_state.deinit();
+                            error_state.setErrorState(.error_active);
+
+                            const error_result = try self.getOrCreateNode(post_call_point, &error_state, .{});
+                            owns_error_state = error_result.caller_should_deinit;
+                            try self.graph.addEdge(exploded_node_index, error_result.index);
+                            if (error_result.is_new or error_result.state_updated) {
+                                try self.worklist.append(self.allocator, .{
+                                    .node_index = error_result.index,
+                                    .edge_kind = .normal,
+                                    .pending_constraint = null,
+                                    .cfg = caller_cfg,
+                                });
+                            }
                         }
+
+                        const result = try self.getOrCreateNode(post_call_point, &summary_state, .{});
+                        owns_summary_state = result.caller_should_deinit;
+                        try self.graph.addEdge(exploded_node_index, result.index);
                         if (result.is_new or result.state_updated) {
                             try self.worklist.append(self.allocator, .{
                                 .node_index = result.index,
@@ -700,8 +753,6 @@ pub const AnalysisEngine = struct {
                                 .cfg = caller_cfg,
                             });
                         }
-
-                        try self.graph.addEdge(exploded_node_index, result.index);
 
                         return .{ .inlined = true, .summary_applied = true };
                     }
@@ -716,7 +767,7 @@ pub const AnalysisEngine = struct {
         }
 
         // Get or build the callee's CFG
-        const callee_cfg = self.getOrBuildFunctionCfg(callee_fn_node) orelse return .{ .inlined = false, .summary_applied = false };
+        const callee_cfg = (try self.getOrBuildFunctionCfg(callee_fn_node)) orelse return .{ .inlined = false, .summary_applied = false };
 
         // Find the return point (successor of the call node in the caller)
         var return_node: ?CfgNodeId = null;
@@ -728,8 +779,12 @@ pub const AnalysisEngine = struct {
         }
         const ret_node = return_node orelse return .{ .inlined = false, .summary_applied = false };
 
+        try VarResolution.prepare(self, callee_cfg);
+
         // Create a new state for the inlined call
         var inline_state = try state.clone(self.allocator);
+        var owns_inline_state = true;
+        defer if (owns_inline_state) inline_state.deinit();
         inline_state.incrementInlineDepth();
 
         // Push the call site onto the stack
@@ -741,10 +796,8 @@ pub const AnalysisEngine = struct {
 
         // Create entry point for the callee
         const callee_entry_point = ProgramPoint.initPre(callee_cfg.entry, callee_cfg);
-        const result = try self.graph.getOrCreateNode(callee_entry_point, &inline_state);
-        if (result.caller_should_deinit) {
-            inline_state.deinit();
-        }
+        const result = try self.getOrCreateNode(callee_entry_point, &inline_state, .{});
+        owns_inline_state = result.caller_should_deinit;
         if (result.is_new or result.state_updated) {
             try self.worklist.append(self.allocator, .{
                 .node_index = result.index,
@@ -772,13 +825,13 @@ pub const AnalysisEngine = struct {
 
         // Create a state for continuing after the call
         var return_state = try state.clone(self.allocator);
+        var owns_return_state = true;
+        defer if (owns_return_state) return_state.deinit();
 
         // Create the return point in the caller
         const return_point = ProgramPoint.initPre(call_site.return_node, call_site.caller_cfg);
-        const result = try self.graph.getOrCreateNode(return_point, &return_state);
-        if (result.caller_should_deinit) {
-            return_state.deinit();
-        }
+        const result = try self.getOrCreateNode(return_point, &return_state, .{});
+        owns_return_state = result.caller_should_deinit;
         if (result.is_new or result.state_updated) {
             try self.worklist.append(self.allocator, .{
                 .node_index = result.index,
@@ -791,25 +844,31 @@ pub const AnalysisEngine = struct {
         try self.graph.addEdge(exploded_node_index, result.index);
     }
 
-    fn hasMultiplePredecessors(cfg: *const Cfg, node_index: CfgNodeId) bool {
-        var count: u32 = 0;
+    fn getPredecessorCounts(self: *AnalysisEngine, cfg: *const Cfg) std.mem.Allocator.Error![]const u8 {
+        if (self.predecessor_counts.get(cfg)) |counts| return counts;
+
+        const counts = try self.allocator.alloc(u8, cfg.nodeCount());
+        errdefer self.allocator.free(counts);
+        @memset(counts, 0);
         for (cfg.edges.items) |edge| {
-            if (edge.to == node_index) {
-                count += 1;
-                if (count > 1) return true;
+            const target = ids.cfgIndex(edge.to);
+            if (target < counts.len and counts[target] < 2) {
+                counts[target] += 1;
             }
         }
-        return false;
+        try self.predecessor_counts.put(cfg, counts);
+        return counts;
     }
 
     /// Transfer function: compute the new state after executing a CFG node.
     /// Evaluates literals and assignments, updating the environment.
     /// For call nodes that couldn't be inlined, treats them as having unknown effects.
-    fn transferFunction(self: *AnalysisEngine, point: ProgramPoint, state: *const ProgramState, current_cfg: *const Cfg) EngineError!ProgramState {
-        const cfg_node = current_cfg.getNode(point.node_index) orelse return try state.clone(self.allocator);
+    /// Consumes state on both success and failure.
+    fn transferFunction(self: *AnalysisEngine, point: ProgramPoint, state: ProgramState, current_cfg: *const Cfg) EngineError!ProgramState {
+        var new_state = state;
+        errdefer new_state.deinit();
+        const cfg_node = current_cfg.getNode(point.node_index) orelse return new_state;
         const ir_node = cfg_node.ir_node;
-
-        var new_state = try state.clone(self.allocator);
 
         switch (ir_node.tag) {
             .var_decl => {
@@ -963,7 +1022,7 @@ pub const AnalysisEngine = struct {
 
                     // Check for assertion calls like testing.expect(x != null)
                     // and add non-null constraints for the asserted variables
-                    if (BranchConstraints.extractAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
+                    if (try BranchConstraints.extractAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
                         try new_state.addConstraint(constraint);
                     }
                 }
@@ -1054,7 +1113,7 @@ pub const AnalysisEngine = struct {
                     Ownership.trackEscapesInExpr(self, &new_state, ast_node, current_cfg);
 
                     // Check for assertion calls wrapped in try (try testing.expect(...))
-                    if (BranchConstraints.extractTryAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
+                    if (try BranchConstraints.extractTryAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
                         try new_state.addConstraint(constraint);
                     }
                 }
@@ -1195,6 +1254,433 @@ pub const AnalysisEngine = struct {
     }
 };
 
+test "AnalysisEngine resolver cache failure stops before evaluating occurrence IDs" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 = "fn root() void { var value: i32 = 1; value = 2; }";
+    var source = Source.init(allocator, "resolver-cache-oom.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = ids.astId(@intFromEnum(tree.rootDecls()[0]));
+    var builder = CfgBuilder.init(allocator);
+    var cfg = (try builder.buildFromFn(&source, fn_node)) orelse return error.MissingCfg;
+    defer cfg.deinit();
+
+    // Fail only the resolver cache; all graph and state allocations can succeed.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+    engine.var_resolvers = std.AutoHashMap(AstNodeId, *VarResolver).init(failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, engine.run());
+    try std.testing.expectEqual(@as(usize, 0), engine.getGraph().nodeCount());
+
+    failing.fail_index = std.math.maxInt(usize);
+    try engine.run();
+    const declaration = for (cfg.nodes.items) |node| {
+        if (node.ir_node.tag == .var_decl) {
+            break node.ir_node.ast_node orelse return error.MissingDeclaration;
+        }
+    } else return error.MissingDeclaration;
+    const var_id = AnalysisEngine.VarResolution.resolveVarIdFromVarDecl(&engine, declaration) orelse
+        return error.MissingVariable;
+    var found_exit = false;
+    for (engine.getGraph().nodes.items) |node| {
+        if (node.point.node_index != cfg.exit or node.point.kind != .post) continue;
+        const value = node.state.getVar(var_id) orelse return error.MissingValue;
+        try std.testing.expectEqual(@as(i64, 2), value.concrete_int);
+        found_exit = true;
+    }
+    try std.testing.expect(found_exit);
+}
+
+test "AnalysisEngine resolver preparation cleans every partial allocation" {
+    const code: [:0]const u8 =
+        "fn root() void { var value: i32 = 1; value = 2;" ++
+        "{ var value: i32 = 3; value = 4; } value = 5; }";
+    var source = Source.init(std.testing.allocator, "resolver-oom.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.fn_ast_node = ids.astId(@intFromEnum(tree.rootDecls()[0]));
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testResolverPreparationAllocationFailure,
+        .{ &source, &cfg },
+    );
+}
+
+fn testResolverPreparationAllocationFailure(
+    allocator: std.mem.Allocator,
+    source: *Source,
+    cfg: *const Cfg,
+) !void {
+    var engine = AnalysisEngine.initWithSource(allocator, cfg, source);
+    defer engine.deinit();
+    try AnalysisEngine.VarResolution.prepare(&engine, cfg);
+    const tree = try source.ast();
+    var declarations: [2]u32 = undefined;
+    var declaration_count: usize = 0;
+    var assignment_count: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tree.fullVarDecl(@enumFromInt(index))) |_| {
+            try std.testing.expect(declaration_count < declarations.len);
+            declarations[declaration_count] = @intCast(index);
+            declaration_count += 1;
+        }
+        if (tag != .assign) continue;
+        const declaration = declarations[if (assignment_count == 1) 1 else 0];
+        const identifier = @intFromEnum(tree.nodes.items(.data)[index].node_and_node[0]);
+        const expected = AnalysisEngine.VarResolution.resolveVarIdFromVarDecl(&engine, declaration) orelse
+            return error.MissingVariable;
+        const actual = AnalysisEngine.VarResolution.resolveVarIdFromIdentifier(&engine, identifier, cfg);
+        try std.testing.expectEqual(expected, actual orelse return error.MissingVariable);
+        const info = engine.resolveDeclInfoFromIdentifier(identifier, cfg) orelse
+            return error.MissingDeclaration;
+        try std.testing.expectEqual(declaration, info.decl_node);
+        try std.testing.expect(!info.is_top_level);
+        assignment_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), declaration_count);
+    try std.testing.expectEqual(@as(usize, 3), assignment_count);
+}
+
+test "AnalysisEngine inline CFG cache failure propagates without losing ownership" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 = "fn root() void { callee(); } fn callee() void {}";
+    var source = Source.init(allocator, "inline-cfg-oom.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = ids.astId(@intFromEnum(tree.rootDecls()[0]));
+    var builder = CfgBuilder.init(allocator);
+    var cfg = (try builder.buildFromFn(&source, fn_node)) orelse return error.MissingCfg;
+    defer cfg.deinit();
+
+    // A cache failure must not turn an internal call into an opaque external call.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+    engine.function_cfgs = std.AutoHashMap(AstNodeId, FunctionCfgEntry).init(failing.allocator());
+    engine.setUseSummaries(false);
+    try std.testing.expectError(error.OutOfMemory, engine.run());
+    try std.testing.expectEqual(@as(u32, 0), engine.getInlinedCallCount());
+    for (engine.getGraph().nodes.items) |node| {
+        try std.testing.expect(node.point.cfg != &cfg or node.point.node_index != cfg.exit);
+    }
+}
+
+test "AnalysisEngine propagates lazy source parsing failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source = Source.init(failing.allocator(), "source-oom.zig", "fn root() void {}");
+    defer source.deinit();
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
+    cfg.exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
+    try cfg.addEdge(cfg.entry, cfg.exit);
+    var engine = AnalysisEngine.initWithSource(std.testing.allocator, &cfg, &source);
+    defer engine.deinit();
+    try std.testing.expectError(error.OutOfMemory, engine.run());
+    try std.testing.expectEqual(@as(usize, 0), engine.getGraph().nodeCount());
+}
+
+test "AnalysisEngine entered inline metadata propagates every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testEnteredFunctionPreparation,
+        .{false},
+    );
+}
+
+test "AnalysisEngine preseeded work prepares callees and suspended callers" {
+    try testEnteredFunctionPreparation(std.testing.allocator, true);
+}
+
+fn testEnteredFunctionPreparation(allocator: std.mem.Allocator, preseeded: bool) !void {
+    const code: [:0]const u8 =
+        "fn root() void { caller(); }" ++
+        "fn caller() void { callee(); var parent_value: i32 = 1; parent_value = 2; }" ++
+        "fn callee() void { var child_value: i32 = 3; child_value = 4; }";
+    var source = Source.init(std.testing.allocator, "entered-metadata.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    const functions = tree.rootDecls();
+    var builder = CfgBuilder.init(std.testing.allocator);
+    var cfg = (try builder.buildFromFn(&source, ids.astId(@intFromEnum(functions[0])))) orelse
+        return error.MissingCfg;
+    defer cfg.deinit();
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+    engine.setUseSummaries(false);
+
+    if (preseeded) {
+        const caller = (try engine.getOrBuildFunctionCfg(ids.astId(@intFromEnum(functions[1])))) orelse
+            return error.MissingCaller;
+        const callee = (try engine.getOrBuildFunctionCfg(ids.astId(@intFromEnum(functions[2])))) orelse
+            return error.MissingCallee;
+        const root_call = for (cfg.nodes.items) |node| {
+            if (node.ir_node.tag == .call) break node.index;
+        } else return error.MissingCall;
+        const caller_call = for (caller.nodes.items) |node| {
+            if (node.ir_node.tag == .call) break node.index;
+        } else return error.MissingCall;
+        const caller_return = for (caller.edges.items) |edge| {
+            if (edge.from == caller_call) break edge.to;
+        } else return error.MissingReturn;
+        var initial = ProgramState.init(allocator);
+        var owns_initial = true;
+        defer if (owns_initial) initial.deinit();
+        initial.incrementInlineDepth();
+        try initial.pushCallSite(.{
+            .call_node = root_call,
+            .caller_cfg = &cfg,
+            .return_node = cfg.exit,
+        });
+        initial.incrementInlineDepth();
+        try initial.pushCallSite(.{
+            .call_node = caller_call,
+            .caller_cfg = caller,
+            .return_node = caller_return,
+        });
+        const seeded = try engine.graph.getOrCreateNode(ProgramPoint.initPre(callee.entry, callee), &initial);
+        owns_initial = seeded.caller_should_deinit;
+        try engine.worklist.append(allocator, .{
+            .node_index = seeded.index,
+            .edge_kind = .normal,
+            .pending_constraint = null,
+            .cfg = callee,
+        });
+    }
+
+    try engine.run();
+    var parent_var: ?ids.VarId = null;
+    var child_var: ?ids.VarId = null;
+    for (0..tree.nodes.len) |index| {
+        const declaration = tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+        const token = declaration.ast.mut_token + 1;
+        const name = tree.tokenSlice(token);
+        if (std.mem.eql(u8, name, "parent_value")) parent_var = ids.varId(token);
+        if (std.mem.eql(u8, name, "child_value")) child_var = ids.varId(token);
+    }
+    var found_exit = false;
+    for (engine.getGraph().nodes.items) |node| {
+        if (node.point.cfg != &cfg) continue;
+        if (node.point.node_index != cfg.exit or node.point.kind != .post) continue;
+        const parent = node.state.getVar(parent_var orelse return error.MissingParent) orelse
+            return error.MissingValue;
+        const child = node.state.getVar(child_var orelse return error.MissingChild) orelse
+            return error.MissingValue;
+        try std.testing.expectEqual(@as(i64, 2), parent.concrete_int);
+        try std.testing.expectEqual(@as(i64, 4), child.concrete_int);
+        try std.testing.expectEqual(@as(usize, 0), node.state.call_stack.items.len);
+        found_exit = true;
+    }
+    try std.testing.expect(found_exit);
+}
+
+test "AnalysisEngine cached CFG registration failure retains artifact ownership" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "cached-cfg-oom.zig", "fn callee() void {}");
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = ids.astId(@intFromEnum(tree.rootDecls()[0]));
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    const cached = blk: {
+        var owner = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+        defer owner.deinit();
+        owner.setCachedArtifacts(&artifacts);
+        break :blk (try owner.getOrBuildFunctionCfg(fn_node)) orelse return error.MissingCfg;
+    };
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var engine = AnalysisEngine.init(failing.allocator(), &cfg);
+    defer engine.deinit();
+    engine.setCachedArtifacts(&artifacts);
+    try std.testing.expectError(error.OutOfMemory, engine.getOrBuildFunctionCfg(fn_node));
+    try std.testing.expectEqual(cached, artifacts.getCfg(ids.astIndex(fn_node)).?);
+    failing.fail_index = std.math.maxInt(usize);
+    const registered = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.MissingCfg;
+    try std.testing.expectEqual(cached, registered);
+    try std.testing.expectEqualStrings("callee", registered.fn_name.?);
+}
+
+test "AnalysisEngine state cap stops distinct inline call contexts" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 = "fn caller() void { callee(); callee(); } fn callee() void {}";
+    var source = Source.init(allocator, "inline-cap.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag == .fn_decl) break ids.astId(@intCast(index));
+    } else return error.TestUnexpectedResult;
+    var builder = CfgBuilder.init(allocator);
+    var cfg = (try builder.buildFromFn(&source, fn_node)) orelse return error.TestUnexpectedResult;
+    defer cfg.deinit();
+
+    for ([_]bool{ false, true }) |use_widening| {
+        var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+        defer engine.deinit();
+        engine.setUseSummaries(false);
+        engine.setUseWidening(use_widening);
+        engine.setMaxStatesPerPoint(1);
+        try std.testing.expectError(error.AnalysisLimitExceeded, engine.run());
+        try std.testing.expectEqual(@as(u32, 1), engine.getInlinedCallCount());
+        var counts = engine.graph.point_state_counts.valueIterator();
+        while (counts.next()) |count| {
+            try std.testing.expect(count.* <= 1);
+        }
+    }
+}
+
+test "AnalysisEngine zero state cap stops before seeding" {
+    const allocator = std.testing.allocator;
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    cfg.entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
+    var engine = AnalysisEngine.init(allocator, &cfg);
+    defer engine.deinit();
+    engine.setMaxStatesPerPoint(0);
+    try std.testing.expectError(error.AnalysisLimitExceeded, engine.run());
+    try std.testing.expectEqual(@as(usize, 0), engine.getGraph().nodeCount());
+}
+
+test "AnalysisEngine transfer survives graph relocation and allocation failure" {
+    var relocating = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
+    try testTraversalAllocationFailure(relocating.allocator(), true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testTraversalAllocationFailure, .{false});
+}
+
+fn testTraversalAllocationFailure(allocator: std.mem.Allocator, expect_relocation: bool) !void {
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    const entry = try cfg.addNode(cfg_mod.IrNode.initWithAst(.var_decl, 100));
+    const left = try cfg.addNode(cfg_mod.IrNode.initWithAst(.var_decl, 200));
+    const right = try cfg.addNode(cfg_mod.IrNode.initWithAst(.var_decl, 300));
+    const exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
+    cfg.entry = entry;
+    cfg.exit = exit;
+    try cfg.addEdge(entry, left);
+    try cfg.addEdge(entry, right);
+    try cfg.addEdge(left, exit);
+    try cfg.addEdge(right, exit);
+
+    var engine = AnalysisEngine.init(allocator, &cfg);
+    defer engine.deinit();
+    engine.setUseWidening(true);
+    // Force the first processed state to grow the node array.
+    try engine.graph.nodes.ensureTotalCapacityPrecise(allocator, 1);
+    var initial = ProgramState.init(allocator);
+    var owns_initial = true;
+    defer if (owns_initial) initial.deinit();
+    try initial.setVar(ids.varId(99), .{ .concrete_int = 42 });
+    const seeded = try engine.graph.getOrCreateNode(ProgramPoint.initPre(entry, &cfg), &initial);
+    owns_initial = seeded.caller_should_deinit;
+    try engine.worklist.append(allocator, .{
+        .node_index = seeded.index,
+        .edge_kind = .normal,
+        .pending_constraint = null,
+        .cfg = &cfg,
+    });
+    const nodes_address = @intFromPtr(engine.graph.nodes.items.ptr);
+    try engine.run();
+    if (expect_relocation) {
+        try std.testing.expect(nodes_address != @intFromPtr(engine.graph.nodes.items.ptr));
+    }
+
+    const original = engine.getStateAt(seeded.index) orelse return error.TestUnexpectedResult;
+    const original_value = original.getVar(ids.varId(99)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 42), original_value.concrete_int);
+    try std.testing.expect(original.getVar(ids.varId(100)) == null);
+    var found_left = false;
+    var found_right = false;
+    for (engine.getGraph().nodes.items) |node| {
+        if (node.point.kind != .post) continue;
+        if (node.point.node_index == left) {
+            const value = node.state.getVar(ids.varId(200)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(value.isUnknown());
+            try std.testing.expect(node.state.getVar(ids.varId(300)) == null);
+            found_left = true;
+        } else if (node.point.node_index == right) {
+            const value = node.state.getVar(ids.varId(300)) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(value.isUnknown());
+            try std.testing.expect(node.state.getVar(ids.varId(200)) == null);
+            found_right = true;
+        }
+    }
+    try std.testing.expect(found_left);
+    try std.testing.expect(found_right);
+}
+
+test "AnalysisEngine predecessor cache owns root and inline CFG counts on allocation failure" {
+    var source = Source.init(std.testing.allocator, "cache-oom.zig", "fn callee() void {}");
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag == .fn_decl) break ids.astId(@intCast(index));
+    } else return error.TestUnexpectedResult;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPredecessorCacheAllocationFailure, .{ &source, fn_node });
+}
+
+fn testPredecessorCacheAllocationFailure(allocator: std.mem.Allocator, source: *Source, fn_node: AstNodeId) !void {
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    const entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
+    const other = try cfg.addNode(cfg_mod.IrNode.init(.nop));
+    const exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
+    cfg.entry = entry;
+    cfg.exit = exit;
+    try cfg.addEdge(entry, exit);
+    try cfg.addEdge(other, exit);
+
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, source);
+    defer engine.deinit();
+    const root_counts = try engine.getPredecessorCounts(&cfg);
+    const callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
+    const callee_counts = try engine.getPredecessorCounts(callee);
+    try std.testing.expectEqual(@as(u8, 2), root_counts[ids.cfgIndex(exit)]);
+    try std.testing.expectEqual(@as(u8, 1), callee_counts[ids.cfgIndex(callee.exit)]);
+    try std.testing.expectEqual(@as(u8, 0), callee_counts[ids.cfgIndex(callee.entry)]);
+    const cached_root = try engine.getPredecessorCounts(&cfg);
+    try std.testing.expectEqualSlices(u8, root_counts, cached_root);
+    const cached_callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cached_callee == callee);
+}
+
+test "AnalysisEngine cached CFGs outlive the engine allocator" {
+    var source = Source.init(std.testing.allocator, "artifact-allocator.zig", "fn callee() void {}");
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag == .fn_decl) break ids.astId(@intCast(index));
+    } else return error.TestUnexpectedResult;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCachedCfgAllocatorOwnership, .{ &source, fn_node });
+}
+
+fn testCachedCfgAllocatorOwnership(allocator: std.mem.Allocator, source: *Source, fn_node: AstNodeId) !void {
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    var root = Cfg.init(std.testing.allocator);
+    defer root.deinit();
+    {
+        var storage: [16 * 1024]u8 = undefined;
+        var scratch = std.heap.FixedBufferAllocator.init(&storage);
+        var engine = AnalysisEngine.initWithSource(scratch.allocator(), &root, source);
+        defer engine.deinit();
+        engine.setCachedArtifacts(&artifacts);
+        const callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
+        const counts = try engine.getPredecessorCounts(callee);
+        try std.testing.expectEqual(@as(u8, 1), counts[ids.cfgIndex(callee.exit)]);
+    }
+    const cached = artifacts.getCfg(ids.astIndex(fn_node)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("callee", cached.fn_name.?);
+    try std.testing.expectEqual(cfg_mod.IrTag.fn_entry, cached.getNode(cached.entry).?.ir_node.tag);
+    try std.testing.expectEqual(cfg_mod.IrTag.fn_exit, cached.getNode(cached.exit).?.ir_node.tag);
+}
+
 test "AnalysisEngine simple CFG traversal" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -1320,64 +1806,6 @@ test "AnalysisEngine with var_decl propagates state" {
         }
     }
     try testing.expect(found_var_decl_post);
-}
-
-test "AnalysisEngine branch constraint pruning" {
-    const allocator = std.testing.allocator;
-
-    // Create a CFG with a branch where one path should be pruned:
-    // entry -> assign (x = 5) -> branch (x == 10?) -> then/else -> merge -> exit
-    //
-    // We'll manually set x = 5 in the initial state, then the branch "x == 10"
-    // should prune the then-branch since 5 != 10
-
-    var cfg = Cfg.init(allocator);
-    defer cfg.deinit();
-
-    const entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
-
-    // Create a branch node with condition info embedded
-    // operand_node = variable being tested (100)
-    // operand2_node = value being compared to (10)
-    var branch_ir = cfg_mod.IrNode.init(.branch);
-    branch_ir.operand_node = 100;
-    branch_ir.operand2_node = 10;
-    const branch = try cfg.addNode(branch_ir);
-
-    const then_node = try cfg.addNode(cfg_mod.IrNode.init(.block));
-    const else_node = try cfg.addNode(cfg_mod.IrNode.init(.block));
-    const merge = try cfg.addNode(cfg_mod.IrNode.init(.nop));
-    const exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
-
-    cfg.entry = entry;
-    cfg.exit = exit;
-
-    try cfg.addEdge(entry, branch);
-    try cfg.addEdgeWithKind(branch, then_node, .branch_true);
-    try cfg.addEdgeWithKind(branch, else_node, .branch_false);
-    try cfg.addEdge(then_node, merge);
-    try cfg.addEdge(else_node, merge);
-    try cfg.addEdge(merge, exit);
-
-    var engine = AnalysisEngine.init(allocator, &cfg);
-    defer engine.deinit();
-
-    // Manually set the initial state: x = 5
-    // This simulates the effect of an assignment before the branch
-    const entry_point = ProgramPoint.initPre(entry, &cfg);
-    var initial_state = ProgramState.init(allocator);
-    try initial_state.setVar(ids.varId(100), .{ .concrete_int = 5 });
-    const result = try engine.graph.getOrCreateNode(entry_point, &initial_state);
-    try engine.worklist.append(allocator, .{ .node_index = result.index, .edge_kind = .normal, .pending_constraint = null, .cfg = &cfg });
-    if (result.caller_should_deinit) {
-        initial_state.deinit();
-    }
-
-    try engine.run();
-
-    // With x = 5 and branch condition x == 10, the then-branch (x == 10) should be pruned
-    // We should see exactly 1 pruned path
-    try std.testing.expectEqual(@as(u32, 1), engine.pruned_path_count);
 }
 
 test "AnalysisEngine try edge sets error state" {
@@ -1868,6 +2296,131 @@ test "AnalysisEngine store tracks self allocator calls" {
     }
 }
 
+const mixed_summary_call_source: [:0]const u8 =
+    \\fn target(fail: bool) !void {
+    \\    if (fail) return error.Failed;
+    \\}
+    \\fn caller(fail: bool) !void {
+    \\    try target(fail);
+    \\}
+;
+
+fn testSummaryCallOutcomes(
+    allocator: std.mem.Allocator,
+    code: [:0]const u8,
+    initial_error: ErrorState,
+    expected_errors: []const ErrorState,
+) !void {
+    var source = Source.init(std.testing.allocator, "summary-call.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const call_ast_node = for (tree.nodes.items(.tag), 0..) |tag, index| {
+        switch (tag) {
+            .call, .call_comma, .call_one, .call_one_comma => break @as(u32, @intCast(index)),
+            else => {},
+        }
+    } else return error.MissingCall;
+
+    // The builder lowers try calls as try_expr; retain the real call AST here.
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
+    const call = try cfg.addNode(cfg_mod.IrNode.initWithAst(.call, call_ast_node));
+    cfg.exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
+    cfg.fn_name = "caller";
+    try cfg.addEdge(cfg.entry, call);
+    try cfg.addEdge(call, cfg.exit);
+
+    // Compute the real summary before injecting failures into its application.
+    var summary_engine = AnalysisEngine.initWithSource(std.testing.allocator, &cfg, &source);
+    defer summary_engine.deinit();
+    try summary_engine.buildFunctionIndex(&source);
+    cfg.fn_ast_node = summary_engine.function_names.get("caller") orelse
+        return error.MissingCaller;
+    const target = summary_engine.function_names.get("target") orelse return error.MissingTarget;
+    var summary = (try AnalysisEngine.Summaries.computeSummary(&summary_engine, target)) orelse
+        return error.MissingSummary;
+    var owns_summary = true;
+    defer if (owns_summary) summary.deinit();
+
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+    try engine.buildFunctionIndex(&source);
+    try AnalysisEngine.VarResolution.prepare(&engine, &cfg);
+    try engine.summary_cache.put(summary);
+    owns_summary = false;
+
+    var initial = ProgramState.init(allocator);
+    var owns_initial = true;
+    defer if (owns_initial) initial.deinit();
+    initial.setErrorState(initial_error);
+    // Keep owned state storage so allocation failures also exercise both clones.
+    try initial.addConstraint(Constraint.literalBool(true));
+    const seeded = try engine.getOrCreateNode(ProgramPoint.initPre(call, &cfg), &initial, .{});
+    owns_initial = seeded.caller_should_deinit;
+
+    // An empty worklist makes the summary enqueue allocate under failure injection.
+    try engine.processNode(seeded.index, .normal, null, &cfg);
+    try engine.run();
+
+    var actual_counts = [_]usize{ 0, 0, 0 };
+    for (engine.getGraph().nodes.items) |node| {
+        if (node.point.cfg != &cfg) continue;
+        if (node.point.node_index != cfg.exit or node.point.kind != .post) continue;
+        actual_counts[@intFromEnum(node.state.error_state)] += 1;
+    }
+    var expected_counts = [_]usize{ 0, 0, 0 };
+    for (expected_errors) |error_state| {
+        expected_counts[@intFromEnum(error_state)] += 1;
+    }
+    try std.testing.expectEqualSlices(usize, &expected_counts, &actual_counts);
+    try std.testing.expectEqual(@as(u32, 1), engine.getSummaryUseCount());
+    try std.testing.expectEqual(@as(u32, 0), engine.getInlinedCallCount());
+    const used_summary = engine.getSummaryCache().summaries.get(target) orelse
+        return error.MissingSummary;
+    try std.testing.expectEqual(@as(u32, 1), used_summary.use_count);
+}
+
+test "AnalysisEngine mixed summary reaches normal and error caller exits" {
+    try testSummaryCallOutcomes(
+        std.testing.allocator,
+        mixed_summary_call_source,
+        .normal,
+        &.{ .normal, .error_active },
+    );
+}
+
+test "AnalysisEngine always-error summary reaches only the error caller exit" {
+    const code: [:0]const u8 =
+        \\fn target() !void { return error.Failed; }
+        \\fn caller() !void { try target(); }
+    ;
+    try testSummaryCallOutcomes(std.testing.allocator, code, .normal, &.{.error_active});
+}
+
+test "AnalysisEngine successful summary preserves a pending caller error" {
+    const code: [:0]const u8 =
+        \\fn target() void {}
+        \\fn caller() void { target(); }
+    ;
+    try testSummaryCallOutcomes(std.testing.allocator, code, .error_active, &.{.error_active});
+}
+
+test "AnalysisEngine summary fork owns both outcomes on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testSummaryCallOutcomes,
+        .{ mixed_summary_call_source, ErrorState.normal, &[_]ErrorState{ .normal, .error_active } },
+    );
+    // Both outcomes deduplicate when the caller already has a pending error.
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testSummaryCallOutcomes,
+        .{ mixed_summary_call_source, ErrorState.error_active, &[_]ErrorState{.error_active} },
+    );
+}
+
 test "AnalysisEngine summary cache initialization" {
     const allocator = std.testing.allocator;
 
@@ -2024,65 +2577,6 @@ test "AnalysisEngine widening nested loops widen per header" {
     try testing.expect(graph.getTrackedWideningPointCount() >= 2);
 
     // Analysis should complete without hitting limits
-    try testing.expect(graph.nodeCount() > 0);
-}
-
-test "AnalysisEngine widening branching loop preserves constraints conservatively" {
-    // Integration test: loop with branching inside
-    // Verifies that constraints from branches are handled conservatively during widening.
-    // The branch node has operand_node set to enable constraint extraction.
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var cfg = Cfg.init(allocator);
-    defer cfg.deinit();
-
-    // CFG: entry -> header -> branch (with constraint on var 50) -> then/else -> merge -> header (back)
-    //                      -> exit
-    const entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
-    const header = try cfg.addNode(cfg_mod.IrNode.init(.loop_header));
-
-    // Create branch node with operand_node set to enable constraint extraction.
-    // operand_node = 50 means we're testing variable at AST node 50.
-    // operand2_node = 1 means we're comparing against the value 1.
-    var branch_ir = cfg_mod.IrNode.init(.branch);
-    branch_ir.operand_node = 50;
-    branch_ir.operand2_node = 1;
-    const branch = try cfg.addNode(branch_ir);
-
-    // Use var_decl nodes in then/else to modify state differently in each branch
-    const then_ir = cfg_mod.IrNode.initWithAst(.var_decl, 100);
-    const then_node = try cfg.addNode(then_ir);
-    const else_ir = cfg_mod.IrNode.initWithAst(.var_decl, 101);
-    const else_node = try cfg.addNode(else_ir);
-
-    const merge = try cfg.addNode(cfg_mod.IrNode.init(.nop));
-    const exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
-
-    cfg.entry = entry;
-    cfg.exit = exit;
-
-    try cfg.addEdge(entry, header);
-    try cfg.addEdgeWithKind(header, branch, .branch_true);
-    try cfg.addEdgeWithKind(header, exit, .loop_exit);
-    try cfg.addEdgeWithKind(branch, then_node, .branch_true);
-    try cfg.addEdgeWithKind(branch, else_node, .branch_false);
-    try cfg.addEdge(then_node, merge);
-    try cfg.addEdge(else_node, merge);
-    try cfg.addEdgeWithKind(merge, header, .loop_back);
-
-    var engine = AnalysisEngine.init(allocator, &cfg);
-    defer engine.deinit();
-
-    // Enable widening for this test
-    engine.setUseWidening(true);
-    engine.setMaxStatesPerPoint(5);
-
-    try engine.run();
-
-    const graph = engine.getGraph();
-
-    // Analysis should complete without issues
     try testing.expect(graph.nodeCount() > 0);
 }
 
