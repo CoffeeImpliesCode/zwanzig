@@ -456,6 +456,27 @@ pub fn fillParentMap(tree: *const Ast, root: u32, parent_map: []u32) void {
     fillParentMapInternal(tree, root, 0, parent_map);
 }
 
+/// Declaration-rooted links include container members but exclude detached
+/// function signature subtrees. Seed order determines shared-node ownership.
+pub fn buildDeclarationParentMap(allocator: std.mem.Allocator, tree: *const Ast) std.mem.Allocator.Error![]u32 {
+    const tags = tree.nodes.items(.tag);
+    const parents = try allocator.alloc(u32, tags.len);
+    @memset(parents, 0);
+    for (tags, 0..) |tag, node| {
+        switch (tag) {
+            .fn_decl,
+            .test_decl,
+            .simple_var_decl,
+            .local_var_decl,
+            .global_var_decl,
+            .aligned_var_decl,
+            => fillParentMap(tree, @intCast(node), parents),
+            else => {},
+        }
+    }
+    return parents;
+}
+
 fn fillParentMapInternal(tree: *const Ast, node: u32, parent: u32, parent_map: []u32) void {
     if (node == 0 or node >= tree.nodes.len) return;
     if (parent != 0 and node < parent_map.len and parent_map[node] == 0) {

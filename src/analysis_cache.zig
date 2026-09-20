@@ -621,6 +621,9 @@ test "AnalysisCache charges lazy query growth when a lease returns" {
     const allocator = std.testing.allocator;
     var source = Source.init(allocator, "lazy.zig", "fn foo() void {}");
     defer source.deinit();
+    var foreign_source = Source.init(allocator, "foreign.zig", "fn query() void {}");
+    defer foreign_source.deinit();
+    const foreign_tree = try foreign_source.ast();
     var artifacts = checker_mod.CachedArtifacts.init(allocator);
     defer artifacts.deinit();
     var cache_memory = CountingAllocator.init(allocator);
@@ -645,8 +648,8 @@ test "AnalysisCache charges lazy query growth when a lease returns" {
         var hit = try context.getOrAnalyze(allocator, &source, &cfg, "hit", .configured);
         defer hit.deinit();
         try std.testing.expectEqual(@as(usize, 0), cache.retained_bytes);
-        const parent_map = try hit.engine.getParentMap(try source.ast());
-        try std.testing.expectEqual((try source.ast()).nodes.len, parent_map.len);
+        const parent_map = try hit.engine.getParentMap(foreign_tree);
+        try std.testing.expectEqual(foreign_tree.nodes.len, parent_map.len);
         try std.testing.expect(hit.entry.counting.live_bytes > cache.byte_budget);
     }
     try std.testing.expectEqual(@as(u64, 1), stats.total_runs);
@@ -657,7 +660,7 @@ test "AnalysisCache charges lazy query growth when a lease returns" {
         var rerun = try context.getOrAnalyze(allocator, &source, &cfg, "rerun", .configured);
         defer rerun.deinit();
         try std.testing.expect(rerun.complete);
-        _ = try rerun.engine.getParentMap(try source.ast());
+        _ = try rerun.engine.getParentMap(foreign_tree);
     }
     try std.testing.expectEqual(@as(u64, 2), stats.total_runs);
     try std.testing.expectEqual(@as(usize, 0), cache.entry_count);

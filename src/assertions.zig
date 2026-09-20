@@ -11,7 +11,6 @@ pub const AssertionScope = struct {
     testing_aliases: std.ArrayList([]const u8),
     debug_aliases: std.ArrayList([]const u8),
     allow_bare: bool,
-    usingnamespace_testing: bool,
 
     pub fn init(allocator: std.mem.Allocator) AssertionScope {
         _ = allocator;
@@ -20,7 +19,6 @@ pub const AssertionScope = struct {
             .testing_aliases = .empty,
             .debug_aliases = .empty,
             .allow_bare = false,
-            .usingnamespace_testing = false,
         };
     }
 
@@ -83,11 +81,6 @@ pub fn buildAssertionScope(
         if (getFnBody(tree, fn_root)) |body_node| {
             try collectAliasesFromBody(tree, allocator, body_node, &scope);
         }
-    }
-
-    scope.usingnamespace_testing = detectUsingnamespaceTesting(tree, &scope);
-    if (scope.usingnamespace_testing) {
-        scope.allow_bare = true;
     }
 
     return scope;
@@ -355,75 +348,6 @@ fn isStringLiteralValue(tree: *const std.zig.Ast, node: u32, value: []const u8) 
 
     const token = tree.nodes.items(.main_token)[node];
     const slice = tree.tokenSlice(token);
-    if (slice.len < 2 or slice[0] != '"' or slice[slice.len - 1] != '"') return false;
-    return std.mem.eql(u8, slice[1 .. slice.len - 1], value);
-}
-
-fn detectUsingnamespaceTesting(tree: *const std.zig.Ast, scope: *const AssertionScope) bool {
-    const token_tags = tree.tokens.items(.tag);
-    const token_count = token_tags.len;
-
-    var i: usize = 0;
-    while (i < token_count) : (i += 1) {
-        if (token_tags[i] != .identifier) continue;
-        if (!tokenEquals(tree, i, "usingnamespace")) continue;
-
-        var idx = skipTrivia(token_tags, i + 1);
-        if (idx >= token_count) continue;
-
-        if (token_tags[idx] == .identifier) {
-            if (tokenEquals(tree, idx, "std") or scope.hasStdAlias(tree.tokenSlice(@intCast(idx)))) {
-                idx = skipTrivia(token_tags, idx + 1);
-                if (idx >= token_count or token_tags[idx] != .period) continue;
-                idx = skipTrivia(token_tags, idx + 1);
-                if (idx < token_count and token_tags[idx] == .identifier and tokenEquals(tree, idx, "testing")) {
-                    return true;
-                }
-            }
-
-            if (scope.hasTestingAlias(tree.tokenSlice(@intCast(idx)))) {
-                return true;
-            }
-        }
-
-        if (token_tags[idx] == .builtin and tokenEquals(tree, idx, "@import")) {
-            idx = skipTrivia(token_tags, idx + 1);
-            if (idx >= token_count or token_tags[idx] != .l_paren) continue;
-            idx = skipTrivia(token_tags, idx + 1);
-            if (idx >= token_count or token_tags[idx] != .string_literal) continue;
-            if (!tokenStringEquals(tree, idx, "std")) continue;
-            idx = skipTrivia(token_tags, idx + 1);
-            if (idx >= token_count or token_tags[idx] != .r_paren) continue;
-            idx = skipTrivia(token_tags, idx + 1);
-            if (idx >= token_count or token_tags[idx] != .period) continue;
-            idx = skipTrivia(token_tags, idx + 1);
-            if (idx < token_count and token_tags[idx] == .identifier and tokenEquals(tree, idx, "testing")) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-fn skipTrivia(token_tags: []const std.zig.Token.Tag, start: usize) usize {
-    var idx = start;
-    while (idx < token_tags.len) : (idx += 1) {
-        switch (token_tags[idx]) {
-            .doc_comment, .container_doc_comment => continue,
-            else => return idx,
-        }
-    }
-    return idx;
-}
-
-fn tokenEquals(tree: *const std.zig.Ast, token_index: usize, value: []const u8) bool {
-    const slice = tree.tokenSlice(@intCast(token_index));
-    return std.mem.eql(u8, slice, value);
-}
-
-fn tokenStringEquals(tree: *const std.zig.Ast, token_index: usize, value: []const u8) bool {
-    const slice = tree.tokenSlice(@intCast(token_index));
     if (slice.len < 2 or slice[0] != '"' or slice[slice.len - 1] != '"') return false;
     return std.mem.eql(u8, slice[1 .. slice.len - 1], value);
 }

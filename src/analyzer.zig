@@ -319,7 +319,9 @@ pub const Analyzer = struct {
         else
             null;
         var source = if (registered_source) |parsed| blk: {
-            break :blk Source.initParsed(scratch_allocator, parsed.path, parsed.tree);
+            var parsed_source = Source.initParsed(scratch_allocator, parsed.path, parsed.tree);
+            parsed_source.borrowed_lexical_index = parsed.lexical_index;
+            break :blk parsed_source;
         } else blk: {
             // Sentinel needed for Source.init; free accounts for sentinel byte below.
             // zwanzig-disable-next-line: sentinel-alloc

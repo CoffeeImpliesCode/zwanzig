@@ -97,8 +97,8 @@ pub const AnalysisEngine = struct {
     use_widening: bool,
     /// Cached CFG artifacts for this source (optional, not owned).
     cached_artifacts: ?*CachedArtifacts,
-    /// Cached parent map for AST scope checks.
-    parent_map: ?[]u32,
+    /// Owned parent map for source-less or foreign-AST scope checks.
+    owned_parent_map: ?[]u32,
     /// Scratch buffer for FQN construction
     fqn_buffer: [256]u8 = undefined,
 
@@ -146,7 +146,7 @@ pub const AnalysisEngine = struct {
             .config = null,
             .use_widening = false,
             .cached_artifacts = null,
-            .parent_map = null,
+            .owned_parent_map = null,
         };
     }
 
@@ -185,31 +185,22 @@ pub const AnalysisEngine = struct {
             scope.deinit(self.allocator);
         }
         self.assertion_scopes.deinit();
-        if (self.parent_map) |map| {
+        if (self.owned_parent_map) |map| {
             self.allocator.free(map);
         }
         self.summary_cache.deinit();
     }
 
     pub fn getParentMap(self: *AnalysisEngine, tree: *const std.zig.Ast) ![]const u32 {
-        if (self.parent_map) |map| return map;
-
-        const tags = tree.nodes.items(.tag);
-        const parent_map = try self.allocator.alloc(u32, tags.len);
-        @memset(parent_map, 0);
-        for (0..tags.len) |i| {
-            switch (tags[i]) {
-                .fn_decl,
-                .test_decl,
-                .simple_var_decl,
-                .local_var_decl,
-                .global_var_decl,
-                .aligned_var_decl,
-                => ast_walk.fillParentMap(tree, @intCast(i), parent_map),
-                else => {},
-            }
+        if (self.source) |src| {
+            const source_tree: ?*const std.zig.Ast =
+                src.borrowed_ast orelse if (src.cached_ast) |*cached| cached else null;
+            if (source_tree == tree) return src.engineParentMap();
         }
-        self.parent_map = parent_map;
+        if (self.owned_parent_map) |map| return map;
+
+        const parent_map = try ast_walk.buildDeclarationParentMap(self.allocator, tree);
+        self.owned_parent_map = parent_map;
         return parent_map;
     }
 
@@ -1253,6 +1244,81 @@ pub const AnalysisEngine = struct {
         return null;
     }
 };
+
+test "AnalysisEngine source parents retain container scope after engine teardown" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Outer = struct {
+        \\    const Inner = struct {
+        \\        fn member(value: ?u8) void { _ = value; }
+        \\    };
+        \\};
+    ;
+    var parsed = try std.zig.Ast.parse(allocator, code, .zig);
+    defer parsed.deinit(allocator);
+    var source = Source.initParsed(allocator, "parent-scope.zig", &parsed);
+    defer source.deinit();
+    const tree = try source.ast();
+    const root = @intFromEnum(tree.rootDecls()[0]);
+    const function = for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (tag == .fn_decl) break @as(u32, @intCast(node));
+    } else return error.MissingFunction;
+    const function_data = tree.nodes.items(.data)[function].node_and_node;
+    const body = @intFromEnum(function_data[1]);
+    var proto_buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&proto_buffer, function_data[0]) orelse
+        return error.MissingPrototype;
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+
+    // Source metadata must survive an engine that cannot allocate its own map.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const parents = shared: {
+        var engine = AnalysisEngine.initWithSource(failing.allocator(), &cfg, &source);
+        defer engine.deinit();
+        break :shared try engine.getParentMap(tree);
+    };
+    try std.testing.expect(ast_walk.isAncestor(root, body, parents));
+    try std.testing.expect(!ast_walk.isAncestor(function, @intFromEnum(proto.ast.params[0]), parents));
+
+    var next_engine = AnalysisEngine.initWithSource(failing.allocator(), &cfg, &source);
+    defer next_engine.deinit();
+    const next_parents = try next_engine.getParentMap(tree);
+    try std.testing.expect(ast_walk.isAncestor(root, body, next_parents));
+}
+
+test "AnalysisEngine keeps foreign parent maps separate from source parents" {
+    const allocator = std.testing.allocator;
+    var source_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var source = Source.init(source_allocator.allocator(), "parents.zig", "fn root() void { if (true) { return; } }");
+    defer source.deinit();
+    var foreign = Source.init(allocator, "foreign-parents.zig", "fn other() void { return; }");
+    defer foreign.deinit();
+    const foreign_tree = try foreign.ast();
+    const foreign_function = foreign_tree.rootDecls()[0];
+    const foreign_body = foreign_tree.nodes.items(.data)[@intFromEnum(foreign_function)].node_and_node[1];
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+
+    var standalone = AnalysisEngine.init(allocator, &cfg);
+    defer standalone.deinit();
+    const standalone_parents = try standalone.getParentMap(foreign_tree);
+    try std.testing.expect(ast_walk.isAncestor(@intFromEnum(foreign_function), @intFromEnum(foreign_body), standalone_parents));
+
+    var engine = AnalysisEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+    // A foreign query must not parse an unrelated lazy source.
+    const foreign_parents = try engine.getParentMap(foreign_tree);
+    source_allocator.fail_index = std.math.maxInt(usize);
+    const tree = try source.ast();
+    const function = tree.rootDecls()[0];
+    const body = tree.nodes.items(.data)[@intFromEnum(function)].node_and_node[1];
+    const parents = try engine.getParentMap(tree);
+    try std.testing.expect(ast_walk.isAncestor(@intFromEnum(function), @intFromEnum(body), parents));
+    try std.testing.expect(ast_walk.isAncestor(@intFromEnum(foreign_function), @intFromEnum(foreign_body), foreign_parents));
+    const foreign_again = try engine.getParentMap(foreign_tree);
+    try std.testing.expect(ast_walk.isAncestor(@intFromEnum(foreign_function), @intFromEnum(foreign_body), foreign_again));
+}
 
 test "AnalysisEngine resolver cache failure stops before evaluating occurrence IDs" {
     const allocator = std.testing.allocator;

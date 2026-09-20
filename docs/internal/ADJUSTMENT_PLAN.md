@@ -33,6 +33,61 @@ Controls and diagnostic checks:
 
 Raw timings, hardware counters, input hashes, diagnostics, and comparison records remain in `.tmp/perf2-*`. The performance controls do not change production defaults or exclude files from the full-corpus checks.
 
+#### Six-workload follow-up
+
+The follow-up adds ocean and Zwanzig itself, and retains every source in the
+existing workloads. `scripts/benchmark.py` freezes 586 source files plus root
+build/configuration inputs. Snapshot manifest SHA-256:
+`c285c5b2a9cc9e19cbc2a0315415dfbc70e885138d3e32066e30873f791b1051`.
+
+The baseline is commit `351ae9b3`, binary SHA-256
+`a65f3b03391fa1fc94a388de64cbd50fbd79164d3eb50186a1903aca3962e7fe`.
+The verified result binary is
+`fecbaed5f175e313aff0e437da83bf9ad41996134f02e08eda15373ea4f2b4b3`.
+Both use Zig 0.16.0 ReleaseSafe, one worker, nice level 15, and unchanged default
+analysis limits. No builds or tests overlap the timed runs.
+
+The table gives the range of two runs per binary. Instruction reductions use the
+mean counters; RSS columns use the largest process peak in each pair. Host load
+causes substantial timing variation, so these are measurements, not latency guarantees.
+
+| Workload | Files | Before CPU (s) | After CPU (s) | Fewer instructions | Peak RSS before → after (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| nogui | 79 | 101.66–129.96 | 10.80–11.18 | 91.68% | 89.64 → 88.29 |
+| skript | 73 | 19.38–29.48 | 8.15–8.25 | 67.61% | 50.29 → 48.39 |
+| ocean | 137 | 48.25–74.63 | 15.01–15.04 | 76.65% | 98.55 → 98.44 |
+| Zwanzig | 106 | 6.75–9.07 | 3.51–3.83 | 63.73% | 35.93 → 34.75 |
+| zmath | 185 | 3.61–5.36 | 3.89–3.91 | 13.48% | 66.30 → 66.38 |
+| mon | 6 | 0.21–0.28 | 0.25–0.29 | 2.23% | 21.96 → 21.96 |
+
+Checks and limits:
+
+- All six workloads retain their exact diagnostic multisets, exit status, and
+  analysis-limit warning multisets in both comparisons. Counts are 25, 18, 315,
+  0, 122, and 12 in table order.
+- The full skript workload retains its 15 parse errors, two frontend errors, and
+  one unused declaration. No files are excluded for this comparison.
+- zmath retains 18 state-limit warnings. Its default-limit run is not complete
+  analysis. No meaningful elapsed-time improvement is claimed for zmath or mon.
+- RSS remains near the baseline; zmath's measured maximum rises by 76 KiB.
+  Shared source metadata is outside the engine-owned cache admission budget.
+- Full `just test` and `just lint` gates pass under both pinned toolchains.
+  Both self-lint runs report zero diagnostics over the current 107 source files.
+- The captured-payload fixture checks both a guarded and an unguarded field unwrap
+  inside a nested container method. It exposed and prevented a regression during
+  the index cutover.
+
+Profiles identified repeated enclosing-function scans and AST token-range walks
+as the main nogui cost. Guards now reuse lexical candidates and cached ranges.
+Source-owned declaration parent maps replace per-engine copies. Indexed import
+lookup removes repeated file scans and path normalization, while preserving the
+earliest exact, relative, or package match. Analysis limits and runtime safety
+checks remain unchanged.
+
+Raw evidence is in `.tmp/perf3-baseline{,-repeat}`, `.tmp/perf3-verified{,-repeat}`,
+`.tmp/perf3-inputs`, and `.tmp/perf3-profile*`. Intermediate candidates remain
+separate from the verified result.
+
 ## Step 1: Extract branch constraints
 
 ### Implemented
@@ -93,7 +148,7 @@ The original plan proposed scanning every CFG node without exploded states. That
 - Within a file, compatible configured function analyses use exclusive mutable leases from `AnalysisCache`. Plain or unstable owned CFGs remain uncached.
 - The per-file `TypeContext` outlives its `AnalysisCache`.
 - Cache admission occurs after checker lazy queries. Retention is bounded to 64 entries and 16 MiB of live engine-owned allocation payload.
-- The payload bound is not an RSS limit. Separately owned artifact allocations are outside it. Statistics count actual analysis runs.
+- The payload bound is not an RSS limit. Separately owned artifacts and shared source syntax metadata are outside it. Statistics count actual analysis runs.
 
 ### Remaining scope
 Full persisted ZIR, typed IR, and summaries remain future work. In-memory function-analysis reuse does not provide cross-run persistence for these artifacts. No performance improvement is claimed without measurements.

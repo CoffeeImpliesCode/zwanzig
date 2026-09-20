@@ -36,6 +36,14 @@ pub fn scanForUnsafeUnwraps(
     const fn_index = ids.astIndex(fn_node);
     if (fn_index >= tags.len) return;
 
+    // Functions without unwraps need neither scope data nor guard queries.
+    var unwraps: std.ArrayList(u32) = .empty;
+    defer unwraps.deinit(allocator);
+    try collectUnwrapsInSubtree(tree, fn_index, allocator, &unwraps);
+    if (unwraps.items.len == 0) return;
+
+    const query = guards.QueryContext{ .tree = tree, .lexical = try src.lexicalIndex() };
+
     const parent_map = try allocator.alloc(u32, tags.len);
     defer allocator.free(parent_map);
     @memset(parent_map, 0);
@@ -44,12 +52,6 @@ pub fn scanForUnsafeUnwraps(
     const allow_bare = tags[fn_index] == .test_decl;
     var assertion_scope = try assertions.buildAssertionScope(allocator, tree, fn_index, allow_bare);
     defer assertion_scope.deinit(allocator);
-
-    // Collect all unwrap_optional nodes within this function's body
-    var unwraps: std.ArrayList(u32) = .empty;
-    defer unwraps.deinit(allocator);
-
-    try collectUnwrapsInSubtree(tree, fn_index, allocator, &unwraps);
 
     for (unwraps.items) |ast_node| {
         // Skip if already reported
@@ -66,39 +68,39 @@ pub fn scanForUnsafeUnwraps(
         // Get the variable being unwrapped
         const unwrapped_node = @intFromEnum(datas[ast_node].node_and_token[0]);
 
-        if (guards.isGuardedByAssertion(tree, ast_node, unwrapped_node, parent_map, type_context, &assertion_scope)) continue;
+        if (guards.isGuardedByAssertion(&query, ast_node, unwrapped_node, parent_map, type_context, &assertion_scope)) continue;
 
         // Check if the unwrap is guarded by short-circuit evaluation (and/or operators)
         // or by a ternary if expression. These are AST-level guards that the CFG
         // doesn't track because short-circuit evaluation is implicit.
-        if (guards.isGuardedByShortCircuit(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByShortCircuit(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is a lazy initialization pattern where we initialize
         // the optional before unwrapping it
-        if (guards.isGuardedByLazyInit(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByLazyInit(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is an early exit pattern where a null check leads to
         // continue/break/return, making subsequent code only reachable when non-null
-        if (guards.isGuardedByEarlyExit(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByEarlyExit(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is a switch that exits on null before the unwrap
-        if (guards.isGuardedBySwitchNullCase(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedBySwitchNullCase(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is an assignment followed by immediate unwrap pattern
         // e.g., `x = foo() orelse return error; x.?`
-        if (guards.isGuardedByPriorAssignment(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByPriorAssignment(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // A successful earlier unwrap remains a proof only until the storage path
         // is written or passed to a call that may mutate it.
-        if (guards.isGuardedByPriorUnwrap(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByPriorUnwrap(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is a method call with catch/early exit that ensures the field
         // e.g., `self.ensureTexture() catch return; ... self.texture.?`
-        if (guards.isGuardedByMethodCallWithCatch(tree, ast_node, unwrapped_node, parent_map, fn_node, type_context)) continue;
+        if (guards.isGuardedByMethodCallWithCatch(&query, ast_node, unwrapped_node, parent_map, fn_node, type_context)) continue;
 
         // Check if this is a labeled block invariant pattern
         // e.g., `const flag = blk: { x orelse break :blk false; ... }; if (flag) { x.? }`
-        if (guards.isGuardedByLabeledBlockInvariant(tree, ast_node, unwrapped_node, parent_map, type_context)) continue;
+        if (guards.isGuardedByLabeledBlockInvariant(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Find the CFG node containing this AST node
         const cfg_node_idx = findCfgNodeForAst(cfg, ast_node, tree);
