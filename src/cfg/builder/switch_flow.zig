@@ -7,7 +7,7 @@ const Cfg = graph.Cfg;
 const IrNode = graph.IrNode;
 const CfgNodeId = ids.CfgNodeId;
 
-pub fn mixin(comptime _Builder: type) type {
+pub fn Mixin(comptime _Builder: type) type {
     return struct {
         /// Build the CFG for a switch expression as a multi-way branch.
         ///
@@ -95,7 +95,7 @@ pub fn mixin(comptime _Builder: type) type {
             }
 
             var decl_ir = IrNode.initFull(.var_decl, var_decl_node, var_range);
-            decl_ir = _Builder.type_annotation.annotateWithType(self, decl_ir, source, var_decl_node);
+            decl_ir = _Builder.TypeAnnotation.annotateWithType(self, decl_ir, source, var_decl_node);
             const decl_node = try cfg.addNode(decl_ir);
             try cfg.addEdge(switch_result.last.?, decl_node);
 

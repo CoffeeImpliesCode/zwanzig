@@ -91,7 +91,8 @@ Detects unused container-level `const`, `var`, and `fn` declarations that aren't
 - Underscore-prefixed names (e.g., `_unused`) are ignored (explicit opt-out)
 - Special names like `main` and `panic` are ignored (entry points)
 
-When `unused-decl` is enabled and more than one file is analyzed, zwanzig also runs a project pass over all analyzed files. That pass reports public top-level declarations that are not referenced by any other analyzed file, while ignoring `build.zig`'s `build` entrypoint, package API roots discovered from `root_source_file` in analyzed or workspace `build.zig` files, and alias-style re-exports to avoid library facade noise. Declarations exposed through another used public declaration's type, signature, field, initializer surface, typed receiver method call, or result-location method call are treated as used.
+When `unused-decl` is enabled and more than one file is analyzed, zwanzig also runs a project pass over all analyzed files. That pass reports public top-level declarations that are not referenced by any other analyzed file, while ignoring `build.zig`'s `build` entrypoint, package API roots discovered from `root_source_file` in analyzed or workspace `build.zig` files, and alias-style re-exports to avoid library facade noise. Declarations exposed through another used public declaration's type, signature, field, initializer surface, typed receiver method call, or result-location method call are treated as used. Method references through nested inline namespaces and type aliases are also resolved.
+Private file-as-struct methods called through `self.method` are treated as used, even when an unrelated field has the same name. A bare field read never counts as a method call, so a same-named field on another type does not mask an unused method.
 
 **Bad:**
 ```zig
@@ -121,6 +122,7 @@ pub fn main() void {
 Detects function parameters that are never referenced.
 
 - Parameters starting with `_` are ignored (explicit opt-out)
+- References in range, labeled, and nested expressions count as uses when they resolve to the parameter. Comptime parameters referenced by fields or methods of a returned anonymous container also count as used. Shadowed names do not count.
 
 **Bad:**
 ```zig
@@ -274,7 +276,7 @@ Detected functions:
 - `allocWithOptions` with non-null sentinel parameter
 - `readToEndAllocOptions` with non-null sentinel parameter
 
-The rule uses shared result-location resolution for casts, variable declarations, assignments, and returns, so preserving `[:sentinel]T` through common factory and wrapper patterns suppresses the diagnostic.
+The rule uses shared result-location resolution for casts, variable declarations, assignments, and returns. An untyped local initialized directly from a sentinel allocation keeps the inferred sentinel type. Explicit coercion to `[]T` remains diagnostic.
 
 ### return-local-ptr
 
@@ -323,6 +325,7 @@ The hint does not trigger when:
 - The active deferred cleanup uses a different method than the direct call (`defer x.close()` with `x.deinit()` does not match).
 
 Receiver matching handles simple variables and field chains such as `holder.value.deinit()`, so lifecycle checks apply to cleanup methods on nested resources as well as local variables.
+For allocator `free` and `destroy` calls, cleanup identity includes the cleaned argument. Calls that clean different values do not match.
 
 **Bad (warning):**
 ```zig
@@ -369,11 +372,12 @@ fn run() !void {
 Enforces Zig naming conventions:
 
 - Types: PascalCase
-- Functions: camelCase
+- Functions: camelCase, except functions declared to return `type`, which use PascalCase
 - Variables/constants/parameters/payloads: snake_case (lowercase); SCREAMING_SNAKE_CASE only when mirroring established external conventions (e.g., `std.posix.ENOENT`)
 - Namespaces/modules declared as `const` structs may use lowercase (e.g., `std.mem`)
+- Direct `@import` aliases for namespaces and file structs may use lower_snake_case or PascalCase. Imported value constants must use snake_case.
 - Quoted identifiers (e.g., `@"weird-name"`) are exempt from these checks
-- When type info is available, type aliases and function type aliases are treated as types and should use PascalCase; heuristics also treat C-style `*_t` aliases as types (lowercase `*_t` names are allowed when mirroring external conventions like `fd_t`)
+- Explicit `const Name: type = ...` aliases use PascalCase. When type info is available, other type aliases and function type aliases are treated as types and should use PascalCase. Heuristics also treat C-style `*_t` aliases as types (lowercase `*_t` names are allowed when mirroring external conventions like `fd_t`)
 
 **Bad:**
 ```zig
@@ -618,6 +622,7 @@ Detects catch blocks that ignore errors without rethrowing or logging. An error 
 - Doesn't rethrow the error
 - Doesn't call any functions (potential logging)
 - Simply continues execution
+- A fallback expression in `catch` counts as intentional handling. Storing the captured error also counts as handling. Assignments unrelated to the captured error remain swallowed.
 
 **Bad:**
 ```zig

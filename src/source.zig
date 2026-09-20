@@ -14,6 +14,7 @@ pub const Source = struct {
     allocator: std.mem.Allocator,
     file_path: []const u8,
     content: [:0]const u8,
+    borrowed_ast: ?*const std.zig.Ast = null,
 
     cached_ast: ?std.zig.Ast = null,
     cached_location_mapper: ?LocationMapper = null,
@@ -25,6 +26,26 @@ pub const Source = struct {
             .allocator = allocator,
             .file_path = file_path,
             .content = content,
+            .borrowed_ast = null,
+            .cached_ast = null,
+            .cached_location_mapper = null,
+            .cached_zir_bridge = null,
+            .zir_load_attempted = false,
+        };
+    }
+
+    /// Construct a source over syntax storage owned by a project registry.
+    /// This object borrows the AST and source bytes; its caches remain local.
+    pub fn initParsed(
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        parsed_ast: *const std.zig.Ast,
+    ) Source {
+        return Source{
+            .allocator = allocator,
+            .file_path = file_path,
+            .content = parsed_ast.source,
+            .borrowed_ast = parsed_ast,
             .cached_ast = null,
             .cached_location_mapper = null,
             .cached_zir_bridge = null,
@@ -58,6 +79,7 @@ pub const Source = struct {
     }
 
     pub fn ast(self: *Source) !*const std.zig.Ast {
+        if (self.borrowed_ast) |parsed_ast| return parsed_ast;
         if (self.cached_ast == null) {
             const parsed = try std.zig.Ast.parse(self.allocator, self.content, .zig);
             self.cached_ast = parsed;

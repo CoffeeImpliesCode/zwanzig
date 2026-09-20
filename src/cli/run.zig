@@ -322,8 +322,9 @@ pub fn runParsed(allocator: std.mem.Allocator, cli_args: CliArgs, io_context: *c
     try configureAnalyzer(&analyzer, cli_args, final_config);
 
     log.info("analyzing with {d} rule(s) using {d} thread(s)", .{ analyzer.totalCheckerCount(), cli_args.thread_count });
+    try analyzer.prepareProject(files);
     try analyzeFilesParallel(&analyzer, files, cli_args.thread_count, allocator, io_context);
-    try analyzer.analyzeProjectUnusedDecls(files);
+    try analyzer.analyzeProjectUnusedDecls();
     log.info("analysis complete", .{});
     analyzer.logAnalysisStats();
 

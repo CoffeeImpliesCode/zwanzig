@@ -1,5 +1,6 @@
 const std = @import("std");
 const ids = @import("../ids.zig");
+const ast_walk = @import("../ast_walk.zig");
 
 const VarId = ids.VarId;
 const ResolveError = std.mem.Allocator.Error;
@@ -35,7 +36,7 @@ pub const VarResolver = struct {
         try resolver.addGlobalDecls();
 
         try resolver.pushScope();
-        try resolver.addFnParams(ids.astIndex(fn_node));
+        try resolver.scanFnSignature(ids.astIndex(fn_node));
 
         const body_node = resolver.getFnBody(ids.astIndex(fn_node)) orelse 0;
 
@@ -148,11 +149,11 @@ pub const VarResolver = struct {
         }
     }
 
-    fn addFnParams(self: *VarResolver, fn_node: u32) ResolveError!void {
+    fn scanFnSignature(self: *VarResolver, fn_node: u32) ResolveError!void {
         const tags = self.tree.nodes.items(.tag);
         if (fn_node >= tags.len) return;
 
-        // Test declarations don't have parameters
+        // Test declarations don't have parameters.
         if (tags[fn_node] == .test_decl) return;
 
         const data = self.tree.nodes.items(.data)[fn_node];
@@ -170,11 +171,23 @@ pub const VarResolver = struct {
 
         var it = proto.iterate(self.tree);
         while (it.next()) |param| {
-            if (param.name_token) |name_tok| {
-                const name = self.tree.tokenSlice(name_tok);
-                try self.addBinding(name, ids.varId(name_tok), null, false);
+            // Earlier parameters are in scope for later parameter types. The
+            // current parameter is not in scope for its own type.
+            if (param.type_expr) |type_expr| {
+                try self.scanNode(@intFromEnum(type_expr));
+            }
+
+            if (param.name_token) |name_token| {
+                const name = self.tree.tokenSlice(name_token);
+                try self.addBinding(name, ids.varId(name_token), null, false);
             }
         }
+
+        try self.scanNode(@intFromEnum(proto.ast.return_type));
+        try self.scanNode(@intFromEnum(proto.ast.align_expr));
+        try self.scanNode(@intFromEnum(proto.ast.addrspace_expr));
+        try self.scanNode(@intFromEnum(proto.ast.section_expr));
+        try self.scanNode(@intFromEnum(proto.ast.callconv_expr));
     }
 
     fn getFnBody(self: *const VarResolver, fn_node: u32) ?u32 {
@@ -192,6 +205,21 @@ pub const VarResolver = struct {
         return @intFromEnum(data.node_and_node[1]);
     }
 
+    fn scanFnDecl(self: *VarResolver, node: u32) ResolveError!void {
+        try self.pushScope();
+        defer self.popScope();
+
+        try self.scanFnSignature(node);
+
+        const body_node = self.getFnBody(node) orelse return;
+        if (body_node == 0) return;
+
+        try self.pushScope();
+        defer self.popScope();
+
+        try self.scanNode(body_node);
+    }
+
     fn scanNode(self: *VarResolver, node: u32) ResolveError!void {
         if (node == 0) return;
 
@@ -200,6 +228,7 @@ pub const VarResolver = struct {
 
         switch (tags[node]) {
             .identifier => try self.recordIdentifier(node),
+            .fn_decl => try self.scanFnDecl(node),
             .simple_var_decl,
             .aligned_var_decl,
             .local_var_decl,
@@ -243,149 +272,17 @@ pub const VarResolver = struct {
     }
 
     fn scanChildren(self: *VarResolver, node: u32) ResolveError!void {
-        const tags = self.tree.nodes.items(.tag);
-        const data = self.tree.nodes.items(.data);
-        const tag = tags[node];
+        const child = struct {
+            fn visit(
+                _: *const std.zig.Ast,
+                child_node: u32,
+                resolver: *VarResolver,
+            ) ResolveError!void {
+                try resolver.scanNode(child_node);
+            }
+        };
 
-        switch (tag) {
-            .equal_equal,
-            .bang_equal,
-            .less_than,
-            .greater_than,
-            .less_or_equal,
-            .greater_or_equal,
-            .assign,
-            .assign_mul,
-            .assign_div,
-            .assign_mod,
-            .assign_add,
-            .assign_sub,
-            .assign_shl,
-            .assign_shl_sat,
-            .assign_shr,
-            .assign_bit_and,
-            .assign_bit_xor,
-            .assign_bit_or,
-            .assign_mul_wrap,
-            .assign_add_wrap,
-            .assign_sub_wrap,
-            .assign_mul_sat,
-            .assign_add_sat,
-            .assign_sub_sat,
-            .merge_error_sets,
-            .mul,
-            .div,
-            .mod,
-            .array_mult,
-            .mul_wrap,
-            .mul_sat,
-            .add,
-            .sub,
-            .array_cat,
-            .add_wrap,
-            .sub_wrap,
-            .add_sat,
-            .sub_sat,
-            .shl,
-            .shl_sat,
-            .shr,
-            .bit_and,
-            .bit_xor,
-            .bit_or,
-            .@"orelse",
-            .bool_and,
-            .bool_or,
-            .error_union,
-            .array_access,
-            .switch_range,
-            => {
-                const pair = data[node].node_and_node;
-                try self.scanNode(@intFromEnum(pair[0]));
-                try self.scanNode(@intFromEnum(pair[1]));
-            },
-
-            .bool_not,
-            .negation,
-            .bit_not,
-            .negation_wrap,
-            .address_of,
-            .@"try",
-            .optional_type,
-            .@"suspend",
-            .@"resume",
-            .@"nosuspend",
-            .@"comptime",
-            .deref,
-            .@"defer",
-            => try self.scanNode(@intFromEnum(data[node].node)),
-
-            .unwrap_optional,
-            .grouped_expression,
-            => try self.scanNode(@intFromEnum(data[node].node_and_token[0])),
-
-            .@"return" => {
-                if (data[node].opt_node.unwrap()) |ret_node| {
-                    try self.scanNode(@intFromEnum(ret_node));
-                }
-            },
-
-            .field_access => {
-                try self.scanNode(@intFromEnum(data[node].node_and_token[0]));
-            },
-
-            .call, .call_comma, .call_one, .call_one_comma => {
-                var buf: [1]std.zig.Ast.Node.Index = undefined;
-                const call_info = self.tree.fullCall(&buf, @enumFromInt(node)) orelse return;
-                try self.scanNode(@intFromEnum(call_info.ast.fn_expr));
-                for (call_info.ast.params) |param| {
-                    try self.scanNode(@intFromEnum(param));
-                }
-            },
-
-            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
-                var buf: [2]std.zig.Ast.Node.Index = undefined;
-                const params = self.tree.builtinCallParams(&buf, @enumFromInt(node)) orelse return;
-                for (params) |param| {
-                    try self.scanNode(@intFromEnum(param));
-                }
-            },
-
-            .struct_init, .struct_init_comma, .struct_init_one, .struct_init_one_comma, .struct_init_dot, .struct_init_dot_comma, .struct_init_dot_two, .struct_init_dot_two_comma => {
-                var buf: [2]std.zig.Ast.Node.Index = undefined;
-                const struct_init = self.tree.fullStructInit(&buf, @enumFromInt(node)) orelse return;
-                if (struct_init.ast.type_expr.unwrap()) |type_node| {
-                    try self.scanNode(@intFromEnum(type_node));
-                }
-                for (struct_init.ast.fields) |field| {
-                    try self.scanNode(@intFromEnum(field));
-                }
-            },
-
-            .array_init, .array_init_comma, .array_init_one, .array_init_one_comma, .array_init_dot, .array_init_dot_comma, .array_init_dot_two, .array_init_dot_two_comma => {
-                var buf: [2]std.zig.Ast.Node.Index = undefined;
-                const array_init = self.tree.fullArrayInit(&buf, @enumFromInt(node)) orelse return;
-                if (array_init.ast.type_expr.unwrap()) |type_node| {
-                    try self.scanNode(@intFromEnum(type_node));
-                }
-                for (array_init.ast.elements) |elem| {
-                    try self.scanNode(@intFromEnum(elem));
-                }
-            },
-
-            .slice, .slice_open, .slice_sentinel => {
-                const slice = self.tree.fullSlice(@enumFromInt(node)) orelse return;
-                try self.scanNode(@intFromEnum(slice.ast.sliced));
-                try self.scanNode(@intFromEnum(slice.ast.start));
-                if (slice.ast.end.unwrap()) |end_node| {
-                    try self.scanNode(@intFromEnum(end_node));
-                }
-                if (slice.ast.sentinel.unwrap()) |sentinel_node| {
-                    try self.scanNode(@intFromEnum(sentinel_node));
-                }
-            },
-
-            else => {},
-        }
+        try ast_walk.walkChildren(VarResolver, self.tree, node, self, child.visit);
     }
 
     fn scanVarDecl(self: *VarResolver, node: u32) ResolveError!void {
@@ -579,16 +476,6 @@ pub const VarResolver = struct {
             .tagged_union_two, .tagged_union_two_trailing => self.tree.taggedUnionTwo(&buf, @enumFromInt(node)).ast.members,
             else => return,
         };
-
-        const saved_stack = self.scope_stack;
-        self.scope_stack = .empty;
-        defer {
-            for (self.scope_stack.items) |*scope| {
-                scope.deinit(self.allocator);
-            }
-            self.scope_stack.deinit(self.allocator);
-            self.scope_stack = saved_stack;
-        }
 
         try self.pushScope();
         defer self.popScope();

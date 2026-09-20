@@ -663,7 +663,7 @@ pub const StackEscapeEngineChecker = struct {
                 const pair = datas[ast_node].node_and_node;
                 const lhs_node = @intFromEnum(pair[0]);
                 const rhs_node = @intFromEnum(pair[1]);
-                const var_id = ctx.resolver.resolve(lhs_node) orelse return;
+                const var_id = resolveStorageVarId(ctx, lhs_node) orelse return;
                 const origin = originOfExpr(ctx, in_state, rhs_node, ctx.helper_depth);
                 try out_state.set(var_id, origin);
             },
@@ -926,6 +926,24 @@ pub const StackEscapeEngineChecker = struct {
         };
     }
 
+    fn resolveStorageVarId(ctx: *AnalysisContext, lhs_node: u32) ?ids.VarId {
+        const tree = ctx.tree;
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        if (lhs_node >= tags.len) return null;
+
+        return switch (tags[lhs_node]) {
+            .identifier => ctx.resolver.resolve(lhs_node),
+            .array_access => resolveStorageVarId(ctx, @intFromEnum(datas[lhs_node].node_and_node[0])),
+            .field_access => resolveStorageVarId(ctx, @intFromEnum(datas[lhs_node].node_and_token[0])),
+            .grouped_expression, .unwrap_optional => resolveStorageVarId(
+                ctx,
+                @intFromEnum(datas[lhs_node].node_and_token[0]),
+            ),
+            else => null,
+        };
+    }
+
     fn originOfExpr(ctx: *AnalysisContext, state: *const OriginState, expr_node: u32, depth: u32) Origin {
         const tree = ctx.tree;
         const tags = tree.nodes.items(.tag);
@@ -969,7 +987,11 @@ pub const StackEscapeEngineChecker = struct {
             },
             .slice, .slice_open, .slice_sentinel => {
                 const slice = tree.fullSlice(@enumFromInt(expr_node)) orelse return Origin.unknown();
-                return originOfExpr(ctx, state, @intFromEnum(slice.ast.sliced), depth);
+                const sliced = @intFromEnum(slice.ast.sliced);
+                if (isStackBackedIndexedBase(ctx, sliced)) {
+                    return .{ .kind = .stack, .token = treeMainToken(tree, expr_node) };
+                }
+                return originOfExpr(ctx, state, sliced, depth);
             },
             .array_access => {
                 const pair = datas[expr_node].node_and_node;
@@ -1007,11 +1029,6 @@ pub const StackEscapeEngineChecker = struct {
     }
 
     fn originFromIdentifier(ctx: *AnalysisContext, state: *const OriginState, ident_node: u32) Origin {
-        // Local array values live on the stack even when initialized from comptime literals.
-        if (localArrayOriginToken(ctx, ident_node)) |origin_token| {
-            return .{ .kind = .stack, .token = origin_token };
-        }
-
         if (ctx.resolver.resolve(ident_node)) |var_id| {
             if (state.get(var_id)) |origin| return origin;
         }
@@ -1078,7 +1095,7 @@ pub const StackEscapeEngineChecker = struct {
                 if (isTopLevelConst(ctx, base_node)) {
                     return .{ .kind = .static, .token = treeMainToken(tree, address_node) };
                 }
-                if (isLocalDecl(ctx, base_node)) {
+                if (isLocalValueStorage(ctx, base_node)) {
                     return .{ .kind = .stack, .token = treeMainToken(tree, address_node) };
                 }
                 const base_origin = originOfExpr(ctx, state, base_node, depth);
@@ -1094,7 +1111,7 @@ pub const StackEscapeEngineChecker = struct {
                 if (isTopLevelConst(ctx, base_node)) {
                     return .{ .kind = .static, .token = treeMainToken(tree, address_node) };
                 }
-                if (isLocalDecl(ctx, base_node)) {
+                if (isStackBackedIndexedBase(ctx, base_node)) {
                     return .{ .kind = .stack, .token = treeMainToken(tree, address_node) };
                 }
                 const base_origin = originOfExpr(ctx, state, base_node, depth);
@@ -1250,7 +1267,7 @@ pub const StackEscapeEngineChecker = struct {
         const field_token = datas[expr_node].node_and_token[1];
 
         // Local struct fields storing arrays still live on the stack.
-        if (isLocalDecl(ctx, base_node)) {
+        if (isLocalValueStorage(ctx, base_node)) {
             if (ctx.type_ctx) |type_ctx| {
                 if (type_ctx.getExpressionType(expr_node)) |info| {
                     if (info.kind == .array) {
@@ -1469,6 +1486,79 @@ pub const StackEscapeEngineChecker = struct {
             return !decl_info.is_top_level;
         }
         return false;
+    }
+
+    fn isLocalValueStorage(ctx: *AnalysisContext, ident_node: u32) bool {
+        if (!isLocalDecl(ctx, ident_node)) return false;
+
+        if (ctx.type_ctx) |type_ctx| {
+            if (type_ctx.getExpressionTypeStrict(ident_node)) |info| {
+                if (info.kind == .pointer or info.kind == .slice) return false;
+                if (info.kind != .unknown) return true;
+            }
+        }
+
+        const decl_node = ctx.resolver.resolveDeclNode(ident_node) orelse return false;
+        const full = ctx.tree.fullVarDecl(@enumFromInt(decl_node)) orelse return false;
+        if (full.ast.type_node.unwrap()) |type_node| {
+            if (isPointerOrSliceTypeNode(ctx.tree, @intFromEnum(type_node))) return false;
+        }
+        if (isArrayDeclNode(ctx.tree, decl_node)) return true;
+        const init_node = full.ast.init_node.unwrap() orelse return false;
+        return switch (ctx.tree.nodeTag(init_node)) {
+            .struct_init,
+            .struct_init_comma,
+            .struct_init_one,
+            .struct_init_one_comma,
+            .struct_init_dot,
+            .struct_init_dot_comma,
+            .struct_init_dot_two,
+            .struct_init_dot_two_comma,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isPointerOrSliceTypeNode(tree: *const std.zig.Ast, node: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return false;
+        return switch (tags[node]) {
+            .ptr_type,
+            .ptr_type_aligned,
+            .ptr_type_sentinel,
+            .ptr_type_bit_range,
+            .slice,
+            .slice_open,
+            .slice_sentinel,
+            => true,
+            .optional_type => isPointerOrSliceTypeNode(tree, @intFromEnum(tree.nodes.items(.data)[node].node)),
+            else => false,
+        };
+    }
+
+    fn isStackBackedIndexedBase(ctx: *AnalysisContext, node: u32) bool {
+        const tree = ctx.tree;
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        if (node >= tags.len) return false;
+
+        return switch (tags[node]) {
+            .identifier => isLocalValueStorage(ctx, node),
+            .field_access => {
+                if (ctx.type_ctx) |type_ctx| {
+                    if (type_ctx.getExpressionType(node)) |info| {
+                        if (info.kind == .pointer or info.kind == .slice) return false;
+                    }
+                }
+                return isStackBackedIndexedBase(ctx, @intFromEnum(datas[node].node_and_token[0]));
+            },
+            .array_access => isStackBackedIndexedBase(ctx, @intFromEnum(datas[node].node_and_node[0])),
+            .slice, .slice_open, .slice_sentinel => blk: {
+                const slice = tree.fullSlice(@enumFromInt(node)) orelse break :blk false;
+                break :blk isStackBackedIndexedBase(ctx, @intFromEnum(slice.ast.sliced));
+            },
+            else => false,
+        };
     }
 
     fn localArrayOriginToken(ctx: *AnalysisContext, ident_node: u32) ?u32 {
@@ -1976,3 +2066,115 @@ pub const StackEscapeEngineChecker = struct {
         return allocator_utils.isAllocatorExpr(ctx.tree, ctx.type_ctx, allocator_arg);
     }
 };
+
+fn expectStackEscapeDiagnostics(code: [:0]const u8, expected: usize) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+    var type_ctx = TypeContext.init(allocator, &source);
+    defer type_ctx.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try StackEscapeEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &type_ctx,
+    });
+    try std.testing.expectEqual(expected, diagnostics.items.len);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expectEqualStrings("stack-escape-engine", diagnostic.rule_id);
+    }
+}
+
+test "skript regression: copied array values do not expose local backing" {
+    const code: [:0]const u8 =
+        \\fn copiedElement() u8 {
+        \\    var outputs: [1]u8 = undefined;
+        \\    outputs[0] = 7;
+        \\    return outputs[0];
+        \\}
+        \\fn copiedArray() [2]u8 {
+        \\    var outputs: [2]u8 = undefined;
+        \\    outputs[0] = 7;
+        \\    outputs[1] = 9;
+        \\    return outputs;
+        \\}
+        \\fn escapedElement() *u8 {
+        \\    var local = [_]u8{0};
+        \\    return &local[0];
+        \\}
+        \\fn escapedSlice() []u8 {
+        \\    var local = [_]u8{0};
+        \\    return local[0..];
+        \\}
+    ;
+
+    try expectStackEscapeDiagnostics(code, 2);
+}
+
+test "skript regression: aggregate values retain only contained pointer origins" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn heapPointers(allocator: std.mem.Allocator) ![1]*u8 {
+        \\    var outputs: [1]*u8 = undefined;
+        \\    outputs[0] = try allocator.create(u8);
+        \\    return outputs;
+        \\}
+        \\fn borrowedElement(items: []u8) *u8 {
+        \\    const local_alias: []u8 = items;
+        \\    return &local_alias[0];
+        \\}
+        \\fn literalStackPointer() [1]*u8 {
+        \\    var local: u8 = 0;
+        \\    return .{&local};
+        \\}
+        \\fn assignedStackPointer() [1]*u8 {
+        \\    var local: u8 = 0;
+        \\    var outputs: [1]*u8 = undefined;
+        \\    outputs[0] = &local;
+        \\    return outputs;
+        \\}
+    ;
+
+    try expectStackEscapeDiagnostics(code, 2);
+}
+
+test "skript residual: explicit pointer operations do not imply local aggregate storage" {
+    const code: [:0]const u8 =
+        \\const Record = struct { value: u8, pointer: ?*u8 };
+        \\fn build(factory: anytype) !*Record {
+        \\    const owner = try factory.obtain();
+        \\    owner.* = .{ .value = 1, .pointer = null };
+        \\    owner.pointer = &owner.value;
+        \\    return owner;
+        \\}
+        \\fn borrowed(records: []Record) *u8 {
+        \\    const entry = &records[0];
+        \\    return &entry.value;
+        \\}
+        \\fn copied(records: []Record) *u8 {
+        \\    const entry = records[0];
+        \\    return &entry.value;
+        \\}
+    ;
+    try expectStackEscapeDiagnostics(code, 1);
+}
+
+test "unresolved values do not prove stack backing but returned arrays do" {
+    const code: [:0]const u8 =
+        \\fn borrowed(factory: anytype) []const u8 {
+        \\    const bytes = factory.read([*:0]const u8);
+        \\    return bytes[0..1];
+        \\}
+        \\fn makeArray() [2]u8 { return .{ 1, 2 }; }
+        \\fn escapedArray() []u8 {
+        \\    var bytes = makeArray();
+        \\    return bytes[0..];
+        \\}
+    ;
+    try expectStackEscapeDiagnostics(code, 1);
+}

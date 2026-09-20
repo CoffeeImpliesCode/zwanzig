@@ -2,7 +2,7 @@ const EngineError = @import("../base.zig").EngineError;
 const FunctionSummary = @import("../summary.zig").FunctionSummary;
 const ids = @import("../../ids.zig");
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         /// Get or compute a summary for a function.
         /// Returns the summary if it can be computed, or null if the function

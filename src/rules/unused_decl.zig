@@ -1,4 +1,8 @@
 const std = @import("std");
+const TypeContext = @import("../type_context.zig").TypeContext;
+const call_utils = @import("../analysis/call_utils.zig");
+const import_resolver = @import("../analysis/import_resolver.zig");
+const call_resolver = @import("../analysis/call_resolver.zig");
 const Rule = @import("../rule.zig").Rule;
 const RuleError = @import("../rule.zig").RuleError;
 const Diagnostic = @import("../rule.zig").Diagnostic;
@@ -29,6 +33,7 @@ pub const UnusedDeclRule = struct {
         allow_field_access: bool,
         owner_container: ?u32,
         owner_container_name: ?[]const u8,
+        receiver_type_node: ?u32,
         is_function: bool,
     };
 
@@ -93,8 +98,18 @@ pub const UnusedDeclRule = struct {
         try collectRootDecls(tree, allocator, &decls, token_starts);
         try collectContainerDecls(tree, allocator, &decls, tags, token_starts, &container_names);
 
+        const parent_map = try allocator.alloc(u32, tags.len);
+        defer allocator.free(parent_map);
+        @memset(parent_map, 0);
+        for (tree.rootDecls()) |root| {
+            ast_walk.fillParentMap(tree, @intFromEnum(root), parent_map);
+        }
+
+        var type_ctx = TypeContext.init(allocator, src);
+        defer type_ctx.deinit();
+
         for (decls.items) |decl| {
-            if (!try isDeclUsed(tree, allocator, decl)) {
+            if (!try isDeclUsed(tree, allocator, decl, parent_map, &type_ctx)) {
                 const range = try src.byteRangeToSourceRange(decl.byte_offset, decl.byte_offset + decl.name.len);
 
                 // Use ZIR-based type info for more descriptive messages
@@ -275,6 +290,7 @@ pub const UnusedDeclRule = struct {
             .allow_field_access = allow_field_access,
             .owner_container = owner_container,
             .owner_container_name = owner_container_name,
+            .receiver_type_node = null,
             .is_function = false,
         };
     }
@@ -369,8 +385,16 @@ pub const UnusedDeclRule = struct {
             .allow_field_access = allow_field_access,
             .owner_container = owner_container,
             .owner_container_name = owner_container_name,
+            .receiver_type_node = if (owner_container == null) receiverTypeNode(tree, proto) else null,
             .is_function = true,
         };
+    }
+
+    fn receiverTypeNode(tree: *const std.zig.Ast, proto: std.zig.Ast.full.FnProto) ?u32 {
+        var params = proto.iterate(tree);
+        const first = params.next() orelse return null;
+        const type_expr = first.type_expr orelse return null;
+        return @intFromEnum(type_expr);
     }
 
     fn normalizeIdentifier(ident: []const u8) []const u8 {
@@ -391,8 +415,10 @@ pub const UnusedDeclRule = struct {
         tree: *const std.zig.Ast,
         allocator: std.mem.Allocator,
         decl: DeclInfo,
+        parent_map: []const u32,
+        type_ctx: *TypeContext,
     ) RuleError!bool {
-        var scanner = UsageScanner.init(allocator, tree, decl);
+        var scanner = UsageScanner.init(allocator, tree, decl, parent_map, type_ctx);
         defer scanner.deinit();
         return scanner.scanRoot();
     }
@@ -409,6 +435,9 @@ pub const UnusedDeclRule = struct {
         owner_container: ?u32,
         owner_container_name: ?[]const u8,
         is_function: bool,
+        receiver_type_node: ?u32,
+        parent_map: []const u32,
+        type_ctx: *TypeContext,
         inside_owner_container: bool = false,
         shadowed: bool = false,
         shadow_stack: std.ArrayListUnmanaged(bool) = .empty,
@@ -418,6 +447,8 @@ pub const UnusedDeclRule = struct {
             allocator: std.mem.Allocator,
             tree: *const std.zig.Ast,
             decl: DeclInfo,
+            parent_map: []const u32,
+            type_ctx: *TypeContext,
         ) UsageScanner {
             return .{
                 .allocator = allocator,
@@ -431,6 +462,9 @@ pub const UnusedDeclRule = struct {
                 .owner_container = decl.owner_container,
                 .owner_container_name = decl.owner_container_name,
                 .is_function = decl.is_function,
+                .receiver_type_node = decl.receiver_type_node,
+                .parent_map = parent_map,
+                .type_ctx = type_ctx,
             };
         }
 
@@ -479,13 +513,14 @@ pub const UnusedDeclRule = struct {
 
             switch (tag) {
                 .identifier => return self.isIdentifierUsed(node),
-                .field_access => return self.scanFieldAccess(data),
+                .field_access => return self.scanFieldAccess(@intCast(node), data),
                 .fn_decl => return self.scanFnDecl(node),
                 .fn_proto,
                 .fn_proto_simple,
                 .fn_proto_one,
                 .fn_proto_multi,
                 => return self.scanFnProto(node),
+                .call, .call_comma, .call_one, .call_one_comma => return self.scanCall(node),
                 .simple_var_decl,
                 .aligned_var_decl,
                 .local_var_decl,
@@ -550,6 +585,81 @@ pub const UnusedDeclRule = struct {
             };
         }
 
+        fn scanCall(self: *UsageScanner, node: u32) RuleError!bool {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&buffer, @enumFromInt(node)) orelse return false;
+            const callee = @intFromEnum(call.ast.fn_expr);
+            if (callee < self.tags.len and self.tags[callee] == .enum_literal and
+                self.is_function and self.owner_container != null and
+                self.resultLocationCallTargetsOwner(node))
+            {
+                const token = self.main_tokens[callee];
+                if (self.isTokenName(token)) return true;
+            }
+            if (self.callReflectsOwner(node)) return true;
+            return self.scanChildren(node);
+        }
+
+        fn resultLocationCallTargetsOwner(self: *UsageScanner, node: u32) bool {
+            const local_files = [_]import_resolver.File{.{ .path = "", .tree = self.tree }};
+            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
+                .files = &local_files,
+                .file_index = 0,
+            };
+            const expected = resolver.resolveResultLocationTypeNode(node) orelse return false;
+            const owner_resolver = call_resolver.ProjectTypeResolver{
+                .files = resolver.files,
+                .file_index = expected.file_index,
+            };
+            const owner = owner_resolver.resolveTypeNode(expected.node_index) orelse return false;
+            return resolver.files[owner.file_index].tree == self.tree and owner.container_node == self.owner_container;
+        }
+
+        fn callReflectsOwner(self: *UsageScanner, node: u32) bool {
+            if (!self.inside_owner_container) return false;
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&buffer, @enumFromInt(node)) orelse return false;
+            const callee = @intFromEnum(call.ast.fn_expr);
+            if (callee >= self.tags.len or self.tags[callee] != .field_access) return false;
+            const access = self.datas[callee].node_and_token;
+            const field_token = access[1];
+            if (!self.tokenMatchesSlice(field_token, "refAllDecls") and
+                !self.tokenMatchesSlice(field_token, "refAllDeclsRecursive")) return false;
+            if (call.ast.params.len != 1) return false;
+            const target = @intFromEnum(call.ast.params[0]);
+            if (target >= self.tags.len) return false;
+            if (self.tags[target] == .builtin_call or
+                self.tags[target] == .builtin_call_comma or
+                self.tags[target] == .builtin_call_two or
+                self.tags[target] == .builtin_call_two_comma)
+            {
+                const token = self.main_tokens[target];
+                if (token < self.token_tags.len and std.mem.eql(u8, self.tree.tokenSlice(token), "@This")) {
+                    return true;
+                }
+            }
+            if (self.tags[target] == .identifier) {
+                if (self.owner_container_name) |owner_name| {
+                    return self.tokenMatchesSlice(self.main_tokens[target], owner_name);
+                }
+            }
+            return false;
+        }
+
+        fn typeNameMatchesOwner(type_name: []const u8, owner_name: []const u8) bool {
+            var name = type_name;
+            while (name.len > 0 and (name[0] == '?' or name[0] == '*')) {
+                name = name[1..];
+            }
+            while (std.mem.startsWith(u8, name, "const ")) {
+                name = name["const ".len..];
+            }
+            while (std.mem.startsWith(u8, name, "volatile ")) {
+                name = name["volatile ".len..];
+            }
+            return std.mem.eql(u8, normalizeIdentifier(name), normalizeIdentifier(owner_name));
+        }
+
         fn scanChildren(self: *UsageScanner, node: u32) RuleError!bool {
             const ChildScanner = struct {
                 scanner: *UsageScanner,
@@ -582,14 +692,33 @@ pub const UnusedDeclRule = struct {
             return false;
         }
 
-        fn scanFieldAccess(self: *UsageScanner, data: std.zig.Ast.Node.Data) RuleError!bool {
-            if (self.allow_field_access) {
-                const field_token = data.node_and_token[1];
-                if (self.isTokenName(field_token)) {
+        fn scanFieldAccess(self: *UsageScanner, node: u32, data: std.zig.Ast.Node.Data) RuleError!bool {
+            const receiver_node = @intFromEnum(data.node_and_token[0]);
+            const field_token = data.node_and_token[1];
+
+            if (self.isTokenName(field_token)) {
+                if (self.isTypedReceiver(receiver_node)) return true;
+                if (self.allow_field_access) {
                     if (self.inside_owner_container) return true;
-                    if (self.is_function) return true;
-                    if (self.owner_container_name) |owner_name| {
-                        if (self.accessHasOwnerName(@intFromEnum(data.node_and_token[0]), owner_name)) {
+                    if (self.is_function) {
+                        // A bare field read can never invoke a method. Only a
+                        // call through the field, or a namespace access naming
+                        // the owner, counts as a use. A same-named field read
+                        // on another type must not mask an unused method.
+                        if (self.fieldAccessIsCallee(node)) return true;
+                        if (self.owner_container) |owner| {
+                            // `Owner.name`, or `struct {...}.name` whose receiver
+                            // is the owner container itself, unambiguously names
+                            // this member.
+                            if (receiver_node == owner) return true;
+                            if (self.owner_container_name) |owner_name| {
+                                if (self.accessHasOwnerName(receiver_node, owner_name)) return true;
+                            }
+                        } else {
+                            return true;
+                        }
+                    } else if (self.owner_container_name) |owner_name| {
+                        if (self.accessHasOwnerName(receiver_node, owner_name)) {
                             return true;
                         }
                     } else {
@@ -597,7 +726,35 @@ pub const UnusedDeclRule = struct {
                     }
                 }
             }
-            return self.scanNode(@intFromEnum(data.node_and_token[0]));
+            return self.scanNode(receiver_node);
+        }
+
+        fn fieldAccessIsCallee(self: *UsageScanner, node: u32) bool {
+            if (node == 0 or node >= self.parent_map.len) return false;
+            const parent = self.parent_map[node];
+            if (parent == 0 or parent >= self.tags.len) return false;
+            switch (self.tags[parent]) {
+                .call, .call_comma, .call_one, .call_one_comma => {},
+                else => return false,
+            }
+            var call_buf: [1]std.zig.Ast.Node.Index = undefined;
+            const full_call = self.tree.fullCall(&call_buf, @enumFromInt(parent)) orelse return false;
+            return @intFromEnum(full_call.ast.fn_expr) == node;
+        }
+
+        fn isTypedReceiver(self: *UsageScanner, receiver_node: u32) bool {
+            const expected_type_node = self.receiver_type_node orelse return false;
+            const files = [_]import_resolver.File{
+                .{ .path = "", .tree = self.tree },
+            };
+            const resolver = call_resolver.ProjectTypeResolver{
+                .files = &files,
+                .file_index = 0,
+            };
+            const expected_type = resolver.resolveTypeNode(expected_type_node) orelse return false;
+            if (expected_type.container_node != null) return false;
+            const actual_type = resolver.resolveExprType(receiver_node) orelse return false;
+            return call_resolver.resolvedTypesEqual(actual_type, expected_type);
         }
 
         fn scanVarDecl(self: *UsageScanner, node: u32) RuleError!bool {
@@ -1022,11 +1179,13 @@ pub const UnusedDeclRule = struct {
         }
 
         fn isTokenName(self: *UsageScanner, token: u32) bool {
+            if (token >= self.token_tags.len) return false;
             const slice = normalizeIdentifier(self.tree.tokenSlice(token));
             return std.mem.eql(u8, slice, self.normalized_name);
         }
 
         fn tokenMatchesSlice(self: *UsageScanner, token: u32, name: []const u8) bool {
+            if (token >= self.token_tags.len) return false;
             const slice = normalizeIdentifier(self.tree.tokenSlice(token));
             return std.mem.eql(u8, slice, name);
         }
@@ -1142,3 +1301,440 @@ pub const UnusedDeclRule = struct {
         };
     }
 };
+
+fn expectSingleUnusedDecl(code: [:0]const u8, expected_name: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, expected_name) != null);
+}
+
+test "skript regression: result-location method calls use private declarations" {
+    const code: [:0]const u8 =
+        \\pub const Query = struct {
+        \\    value: u32,
+        \\    fn submit(value: u32) Query {
+        \\        return .{ .value = value };
+        \\    }
+        \\    fn genuinelyUnused() Query {
+        \\        return .{ .value = 0 };
+        \\    }
+        \\};
+        \\pub fn makeQuery() Query {
+        \\    return .submit(1);
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript regression: refAllDecls reaches private container declarations" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\pub const Reflected = struct {
+        \\    fn reachedOnlyByReflection() void {}
+        \\    test {
+        \\        comptime {
+        \\            std.testing.refAllDecls(@This());
+        \\        }
+        \\    }
+        \\};
+        \\pub const Ordinary = struct {
+        \\    fn genuinelyUnused() void {}
+        \\};
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript residual: typed file receiver reaches private method" {
+    const code: [:0]const u8 =
+        \\const Reader = @This();
+        \\fn finalizeSlocTable(self: *Reader) !void {
+        \\    _ = self;
+        \\}
+        \\fn genuinelyUnused() void {}
+        \\pub fn readUnit() !void {
+        \\    var reader: Reader = .{};
+        \\    try reader.finalizeSlocTable();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript residual: call argument result location reaches private method" {
+    const code: [:0]const u8 =
+        \\pub const Query = struct {
+        \\    value: u32,
+        \\    fn submit(value: u32) Query {
+        \\        return .{ .value = value };
+        \\    }
+        \\    fn genuinelyUnused() Query {
+        \\        return .{ .value = 0 };
+        \\    }
+        \\};
+        \\const History = struct {
+        \\    fn add(self: *History, query: Query) void {
+        \\        _ = self;
+        \\        _ = query;
+        \\    }
+        \\};
+        \\pub fn record(history: *History) void {
+        \\    history.add(.submit(1));
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript residual: typed receiver rejects homonymous root method" {
+    const code: [:0]const u8 =
+        \\const Reader = @This();
+        \\const Other = struct {
+        \\    fn finalizeSlocTable(self: *Other) !void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn finalizeSlocTable(self: *Reader) !void {
+        \\    _ = self;
+        \\}
+        \\pub fn readUnit(other: *Other) !void {
+        \\    try other.finalizeSlocTable();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "finalizeSlocTable");
+}
+
+test "skript control: shadowed local type rejects root receiver method" {
+    const code: [:0]const u8 =
+        \\const Reader = @This();
+        \\const Other = struct {};
+        \\fn finalizeSlocTable(self: *Reader) !void {
+        \\    _ = self;
+        \\}
+        \\pub fn readUnit() !void {
+        \\    const Reader = Other;
+        \\    var reader: Reader = .{};
+        \\    try reader.finalizeSlocTable();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "finalizeSlocTable");
+}
+
+test "skript regression: Ast root receiver calls use consume and parseFile" {
+    const code: [:0]const u8 =
+        \\const Ast = @This();
+        \\fn consume(_: *Ast, pos: *usize, n: usize) void {
+        \\    pos.* += n;
+        \\}
+        \\fn parseFile(self: *Ast, pos: *usize) void {
+        \\    _ = self;
+        \\    _ = pos;
+        \\}
+        \\fn eatExpected(self: *Ast, pos: *usize) void {
+        \\    self.consume(pos, 1);
+        \\}
+        \\pub fn create(self: *Ast, pos: *usize) void {
+        \\    self.parseFile(pos);
+        \\    self.eatExpected(pos);
+        \\}
+        \\fn genuinelyUnused() void {}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript regression: EvalHeap alias receiver call uses checkOwner" {
+    const code: [:0]const u8 =
+        \\const Self = @This();
+        \\pub const Heap = Self;
+        \\fn checkOwner(self: *Heap) void {
+        \\    _ = self;
+        \\}
+        \\pub fn importValue(self: *Heap) void {
+        \\    self.checkOwner();
+        \\}
+        \\fn genuinelyUnused() void {}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript regression: allocator-created Store uses rawAllocator and retainRaw" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const MemAllocator = std.mem.Allocator;
+        \\const Store = @This();
+        \\pub fn init(base_alloc: MemAllocator) !*Store {
+        \\    const self = try base_alloc.create(Store);
+        \\    _ = self.rawAllocator();
+        \\    try self.retainRaw(1);
+        \\    return self;
+        \\}
+        \\fn rawAllocator(self: *Store) void {
+        \\    _ = self;
+        \\}
+        \\fn retainRaw(self: *Store, bytes: usize) !void {
+        \\    _ = self;
+        \\    _ = bytes;
+        \\}
+        \\fn genuinelyUnused() void {}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript regression: receiver field gives shorthand submit its Query result type" {
+    const code: [:0]const u8 =
+        \\pub const Query = struct {
+        \\    value: u32,
+        \\    fn submit(value: u32) Query {
+        \\        return .{ .value = value };
+        \\    }
+        \\    fn genuinelyUnused() Query {
+        \\        return .{ .value = 0 };
+        \\    }
+        \\};
+        \\const History = struct {
+        \\    pub fn add(_: *History, _: Query, _: u32) void {}
+        \\};
+        \\const Model = struct {
+        \\    history: History,
+        \\    pub fn doEvaluate(self: *Model) void {
+        \\        self.history.add(.submit(1), 0);
+        \\    }
+        \\};
+        \\pub fn run(model: *Model) void {
+        \\    model.doEvaluate();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript control: homonymous factory create keeps its declared return type" {
+    const code: [:0]const u8 =
+        \\const Store = @This();
+        \\const Other = struct {
+        \\    fn rawAllocator(_: *Other) void {}
+        \\};
+        \\const Factory = struct {
+        \\    fn create(_: Factory, comptime T: type) *Other {
+        \\        _ = T;
+        \\        return undefined;
+        \\    }
+        \\};
+        \\fn rawAllocator(self: *Store) void {
+        \\    _ = self;
+        \\}
+        \\pub fn init(factory: Factory) void {
+        \\    const self = factory.create(Store);
+        \\    self.rawAllocator();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "rawAllocator");
+}
+
+test "skript control: nonmatching result location rejects homonymous submit" {
+    const code: [:0]const u8 =
+        \\pub const Query = struct {
+        \\    fn submit() Query {
+        \\        return .{};
+        \\    }
+        \\};
+        \\pub const OtherQuery = struct {
+        \\    pub fn submit() OtherQuery {
+        \\        return .{};
+        \\    }
+        \\};
+        \\const History = struct {
+        \\    pub fn add(_: *History, _: OtherQuery) void {}
+        \\};
+        \\const Model = struct {
+        \\    history: History,
+        \\    pub fn doEvaluate(self: *Model) void {
+        \\        self.history.add(.submit());
+        \\    }
+        \\};
+        \\pub fn run(model: *Model) void {
+        \\    model.doEvaluate();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "submit");
+}
+
+test "skript control: unknown receiver type is not method identity proof" {
+    const code: [:0]const u8 =
+        \\const Heap = @This();
+        \\fn checkOwner(self: *Heap) void {
+        \\    _ = self;
+        \\}
+        \\pub fn importValue(receiver: anytype) void {
+        \\    receiver.checkOwner();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "checkOwner");
+}
+
+test "skript regression: array receiver reaches root method" {
+    const code: [:0]const u8 =
+        \\const Site = @This();
+        \\fn captures(self: *Site) void {
+        \\    _ = self;
+        \\}
+        \\pub fn run(sites: []Site) void {
+        \\    sites[0].captures();
+        \\}
+        \\fn genuinelyUnused() void {}
+    ;
+
+    try expectSingleUnusedDecl(code, "genuinelyUnused");
+}
+
+test "skript control: array receiver type mismatch rejects root method" {
+    const code: [:0]const u8 =
+        \\const Site = @This();
+        \\const Other = struct {};
+        \\fn captures(self: *Site) void {
+        \\    _ = self;
+        \\}
+        \\pub fn run(sites: []Other) void {
+        \\    sites[0].captures();
+        \\}
+    ;
+
+    try expectSingleUnusedDecl(code, "captures");
+}
+
+test "contextual shorthand distinguishes same-named nested containers" {
+    const code: [:0]const u8 =
+        \\pub const Left = struct {
+        \\    pub const Item = struct {
+        \\        fn submit() Item { return .{}; }
+        \\    };
+        \\};
+        \\pub const Right = struct {
+        \\    pub const Item = struct {
+        \\        fn submit() Item { return .{}; }
+        \\    };
+        \\};
+        \\const Sink = struct {
+        \\    fn add(_: Sink, _: Left.Item) void {}
+        \\};
+        \\pub fn run(sink: Sink) void {
+        \\    sink.add(.submit());
+        \\    _ = @sizeOf(Right.Item);
+        \\}
+    ;
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "contextual-method.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 8), diagnostics.items[0].range.start.line);
+}
+
+test "self-called private method counts as used" {
+    const code: [:0]const u8 =
+        \\const Adapter = @This();
+        \\value: usize,
+        \\fn bump(self: *Adapter) usize {
+        \\    return self.value + 1;
+        \\}
+        \\pub fn run(self: *Adapter) usize {
+        \\    return self.bump();
+        \\}
+    ;
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "self-called-method.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "same-named field read does not mark method used" {
+    const code: [:0]const u8 =
+        \\const A = struct {
+        \\    bump: u32,
+        \\    pub fn get(self: *A) u32 {
+        \\        return self.bump;
+        \\    }
+        \\};
+        \\const B = struct {
+        \\    fn bump(self: *B) u32 {
+        \\        _ = self;
+        \\        return 1;
+        \\    }
+        \\    pub fn go(self: *B) u32 {
+        \\        _ = self;
+        \\        return 0;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    var a: A = .{ .bump = 3 };
+        \\    var b: B = .{};
+        \\    const x: u32 = a.get() + b.go();
+        \\    _ = x;
+        \\}
+    ;
+    try expectSingleUnusedDecl(code, "bump");
+}
+
+test "anonymous struct namespace reference counts as used" {
+    const code: [:0]const u8 =
+        \\const Handler = struct {
+        \\    dispatch: *const fn (state: *Handler, event: u32) bool,
+        \\    state: u32,
+        \\    pub fn init() Handler {
+        \\        return .{
+        \\            .dispatch = struct {
+        \\                fn call(ptr: *Handler, event: u32) bool {
+        \\                    ptr.state += event;
+        \\                    return true;
+        \\                }
+        \\            }.call,
+        \\            .state = 0,
+        \\        };
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    var handler = Handler.init();
+        \\    _ = handler.dispatch(&handler, 1);
+        \\}
+    ;
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "anonymous-namespace.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}

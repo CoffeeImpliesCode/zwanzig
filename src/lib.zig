@@ -4,6 +4,7 @@ pub const rule = @import("rule.zig");
 pub const checker = @import("checker.zig");
 pub const config = @import("config.zig");
 pub const analyzer = @import("analyzer.zig");
+pub const project_sources = @import("project_sources.zig");
 pub const rule_filter = @import("rule_filter.zig");
 pub const compat = @import("compat.zig");
 
@@ -17,6 +18,7 @@ pub const Severity = diagnostic.Severity;
 pub const Rule = rule.Rule;
 pub const Checker = checker.Checker;
 pub const Analyzer = analyzer.Analyzer;
+pub const ProjectSources = project_sources.ProjectSources;
 pub const RuleFilter = rule_filter.RuleFilter;
 
 pub const rules = struct {
