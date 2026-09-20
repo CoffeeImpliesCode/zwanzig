@@ -232,9 +232,7 @@ pub const ExplodedGraph = struct {
 
         if (new_key != old_key) {
             _ = self.node_map.remove(old_key);
-            self.node_map.put(new_key, cap_index) catch |err| switch (err) {
-                error.OutOfMemory => return EngineError.OutOfMemory,
-            };
+            self.node_map.putAssumeCapacity(new_key, cap_index);
         }
 
         self.widened_nodes += 1;
@@ -265,6 +263,7 @@ pub const ExplodedGraph = struct {
     ) EngineError!GetOrCreateResult {
         var current_state = state;
         var widened_state: ?ProgramState = null;
+        errdefer if (widened_state) |*ws| ws.deinit();
         var widening_applied = false;
         var converged = false;
 
@@ -274,16 +273,12 @@ pub const ExplodedGraph = struct {
                 const visit_count = self.widening_visits.get(widening_key) orelse 0;
 
                 if (visit_count == 0) {
-                    // First visit: store a clone of the state for future widening
-                    const state_clone = state.clone(self.allocator) catch |err| switch (err) {
-                        error.OutOfMemory => return EngineError.OutOfMemory,
-                    };
-                    self.widening_states.put(widening_key, state_clone) catch |err| switch (err) {
-                        error.OutOfMemory => return EngineError.OutOfMemory,
-                    };
-                    self.widening_visits.put(widening_key, 1) catch |err| switch (err) {
-                        error.OutOfMemory => return EngineError.OutOfMemory,
-                    };
+                    // Reserve both maps before either takes ownership.
+                    try self.widening_states.ensureUnusedCapacity(1);
+                    try self.widening_visits.ensureUnusedCapacity(1);
+                    const state_clone = try state.clone(self.allocator);
+                    self.widening_states.putAssumeCapacity(widening_key, state_clone);
+                    self.widening_visits.putAssumeCapacity(widening_key, 1);
                 } else {
                     // Subsequent visits: widen incoming state with stored state
                     if (self.widening_states.getPtr(widening_key)) |stored_state| {
@@ -298,27 +293,14 @@ pub const ExplodedGraph = struct {
                             converged = true;
                             self.widening_converged += 1;
                         } else {
-                            // Update stored state with widened result for next iteration
-                            // Clone first, then replace to avoid leaving invalid state on OOM
-                            var new_clone = ws.clone(self.allocator) catch |err| switch (err) {
-                                error.OutOfMemory => return EngineError.OutOfMemory,
-                            };
-                            errdefer new_clone.deinit();
-                            // Save old state before put() overwrites it
-                            var old_state = stored_state.*;
-                            // put() for existing key replaces value without allocation failure
-                            // (capacity already exists), but we handle it defensively
-                            self.widening_states.put(widening_key, new_clone) catch |err| switch (err) {
-                                error.OutOfMemory => return EngineError.OutOfMemory,
-                            };
-                            // Deinit old state after successful replacement
-                            old_state.deinit();
+                            // Clone first so allocation failure preserves the stored state.
+                            const new_clone = try ws.clone(self.allocator);
+                            stored_state.deinit();
+                            stored_state.* = new_clone;
                         }
 
                         // Increment visit count
-                        self.widening_visits.put(widening_key, visit_count + 1) catch |err| switch (err) {
-                            error.OutOfMemory => return EngineError.OutOfMemory,
-                        };
+                        self.widening_visits.putAssumeCapacity(widening_key, visit_count + 1);
                     }
 
                     // Use widened state for deduplication
@@ -326,12 +308,6 @@ pub const ExplodedGraph = struct {
                         current_state = &widened_state.?;
                     }
                 }
-            }
-        }
-
-        errdefer {
-            if (widened_state) |*ws| {
-                ws.deinit();
             }
         }
 
@@ -389,27 +365,19 @@ pub const ExplodedGraph = struct {
 
         const index: u32 = @intCast(self.nodes.items.len);
 
-        // Use widened state if available, otherwise use original state
+        // Finish all fallible allocations before transferring state ownership.
+        try self.nodes.ensureUnusedCapacity(self.allocator, 1);
+        try self.node_map.ensureUnusedCapacity(1);
+        try self.point_state_counts.ensureUnusedCapacity(1);
+        const point_list = try self.ensurePointNodes(point_key);
+        try point_list.ensureUnusedCapacity(self.allocator, 1);
+
         const node_state = if (widened_state) |ws| ws else state.*;
-        const node = ExplodedNode.init(point, node_state, index);
-
-        self.nodes.append(self.allocator, node) catch |err| switch (err) {
-            error.OutOfMemory => {
-                if (widened_state) |*ws| {
-                    ws.deinit();
-                }
-                return EngineError.OutOfMemory;
-            },
-        };
-        self.node_map.put(key, index) catch |err| switch (err) {
-            error.OutOfMemory => return EngineError.OutOfMemory,
-        };
-        self.point_state_counts.put(point_key, current_count + 1) catch |err| switch (err) {
-            error.OutOfMemory => return EngineError.OutOfMemory,
-        };
-
-        var point_list = try self.ensurePointNodes(point_key);
-        try point_list.append(self.allocator, index);
+        self.nodes.appendAssumeCapacity(ExplodedNode.init(point, node_state, index));
+        self.node_map.putAssumeCapacity(key, index);
+        self.point_state_counts.putAssumeCapacity(point_key, current_count + 1);
+        point_list.appendAssumeCapacity(index);
+        widened_state = null;
 
         if (widening_applied) {
             self.widened_nodes += 1;
@@ -891,4 +859,32 @@ test "ExplodedGraph without widening options works as before" {
     try testing.expect(!result.widening_applied);
     try testing.expect(!result.converged);
     try testing.expectEqual(@as(u32, 0), graph.getWidenedNodeCount());
+}
+
+test "ExplodedGraph insertion preserves ownership on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testInsertionAllocationFailure, .{});
+}
+
+fn testInsertionAllocationFailure(allocator: std.mem.Allocator) !void {
+    var cfg = Cfg.init(std.testing.allocator);
+    defer cfg.deinit();
+    const node = try cfg.addNode(IrNode.init(.loop_header));
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    const point = ProgramPoint.initPre(node, &cfg);
+
+    for (0..3) |value| {
+        var state = ProgramState.init(std.testing.allocator);
+        var owns_state = true;
+        defer if (owns_state) state.deinit();
+        try state.setVar(ids.varId(1), .{ .concrete_int = @intCast(value) });
+        const result = try graph.getOrCreateNodeWithWidening(point, &state, .{
+            .apply_widening = true,
+            .widening_key = WideningKey.init(point, &state),
+        });
+        owns_state = result.caller_should_deinit;
+        const stored = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
+        const observed = stored.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(observed.subsumes(.{ .concrete_int = @intCast(value) }));
+    }
 }

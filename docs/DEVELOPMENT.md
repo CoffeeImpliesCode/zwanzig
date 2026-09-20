@@ -16,6 +16,10 @@ nix develop .#zig015
 
 Run `just test` and `just lint` in both shells when changing code that touches the embedded frontend or its compatibility adapters.
 
+`just build` and `just run` use `ReleaseSafe`. `just test` retains Debug checks.
+`just lint` uses a ReleaseSafe analyzer and one analysis worker to limit CPU load.
+Use `zig build` directly when you need a Debug executable.
+
 ## Formatting
 
 Zig 0.15.2 is the sole canonical formatter. Format and check source files

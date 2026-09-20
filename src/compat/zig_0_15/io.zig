@@ -117,7 +117,8 @@ pub fn closeDir(_: *Context, directory: *Directory) void {
 
 pub fn nextDir(_: *Context, directory: *Directory) !?DirectoryEntry {
     if (directory.iterator == null) {
-        directory.iterator = directory.dir.iterate();
+        const iterator: std.fs.Dir.Iterator = directory.dir.iterate();
+        directory.iterator = iterator;
     }
     const entry = try directory.iterator.?.next() orelse return null;
     return .{

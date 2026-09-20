@@ -398,6 +398,11 @@ pub const ZirBridge = struct {
                         const src_node: Ast.Node.Offset = @enumFromInt(@as(i32, @bitCast(extended.operand)));
                         if (src_node == target_offset) return @intFromEnum(inst);
                     },
+                    .struct_decl, .union_decl, .enum_decl => {
+                        if (builtin.zig_version.minor == 16) {
+                            return findZirInstForNodeInContainer(allocator, zir, target_offset, inst, defers);
+                        }
+                    },
                     else => {},
                 }
 
@@ -541,6 +546,63 @@ pub const ZirBridge = struct {
 
             else => return null,
         }
+    }
+
+    fn findZirInstForNodeInContainer(
+        allocator: std.mem.Allocator,
+        zir: Zir,
+        target_offset: Ast.Node.Offset,
+        inst: Zir.Inst.Index,
+        defers: *std.AutoHashMapUnmanaged(u32, void),
+    ) ?u32 {
+        // Zig 0.16 changed container payload layouts. Use its field iterators
+        // rather than interpreting body lengths as the older packed metadata.
+        switch (zir.instructions.items(.data)[@intFromEnum(inst)].extended.opcode) {
+            .struct_decl => {
+                const decl = zir.getStructDecl(inst);
+                if (decl.backing_int_type_body) |body| {
+                    if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                }
+                var fields = decl.iterateFields();
+                while (fields.next()) |field| {
+                    if (findZirInstForNodeInBody(allocator, zir, target_offset, field.type_body, defers)) |found| return found;
+                    if (field.align_body) |body| {
+                        if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                    }
+                    if (field.default_body) |body| {
+                        if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                    }
+                }
+            },
+            .union_decl => {
+                const decl = zir.getUnionDecl(inst);
+                if (decl.arg_type_body) |body| {
+                    if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                }
+                var fields = decl.iterateFields();
+                while (fields.next()) |field| {
+                    for ([_]?[]const Zir.Inst.Index{ field.type_body, field.align_body, field.value_body }) |optional_body| {
+                        if (optional_body) |body| {
+                            if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                        }
+                    }
+                }
+            },
+            .enum_decl => {
+                const decl = zir.getEnumDecl(inst);
+                if (decl.tag_type_body) |body| {
+                    if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                }
+                var fields = decl.iterateFields();
+                while (fields.next()) |field| {
+                    if (field.value_body) |body| {
+                        if (findZirInstForNodeInBody(allocator, zir, target_offset, body, defers)) |found| return found;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        return null;
     }
 
     fn findZirInstForNodeInExtended(
@@ -991,7 +1053,11 @@ pub const ZirBridge = struct {
                 if (std.mem.eql(u8, type_name, "std.posix.fd_t")) {
                     return .{ .kind = .int, .type_str = type_name };
                 }
-                if (std.mem.eql(u8, type_name, "std.mem.Allocator")) {
+                if (std.mem.eql(u8, type_name, "std.mem.Allocator") or
+                    std.mem.eql(u8, type_name, "std.zig.Ast") or
+                    std.mem.eql(u8, type_name, "std.fs.Dir.Iterator") or
+                    std.mem.eql(u8, type_name, "std.Io.Dir.Iterator"))
+                {
                     return .{ .kind = .@"struct", .type_str = type_name };
                 }
                 return .{ .kind = .unknown, .type_str = type_name };
@@ -1329,4 +1395,23 @@ test "TypeInfo hasSentinel returns true for error union sentinel slice" {
         try std.testing.expectEqual(TypeInfo.TypeKind.error_union, d.type_info.kind);
         try std.testing.expect(d.type_info.hasSentinel());
     }
+}
+
+test "ZirBridge resolves declarations after generic struct parameter types" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn Container(comptime T: type, comptime options: struct { value: T }) type {
+        \\    return struct { const item = options.value; };
+        \\}
+        \\const answer: u32 = 42;
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+    var bridge = ZirBridge.init(allocator);
+    defer bridge.deinit();
+
+    try bridge.loadFromSource(&source);
+    const answer = bridge.findDeclByName("answer") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(TypeInfo.TypeKind.uint, answer.type_info.kind);
+    try std.testing.expectEqual(@as(u16, 32), answer.type_info.size_bits);
 }

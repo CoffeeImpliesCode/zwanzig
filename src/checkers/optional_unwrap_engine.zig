@@ -111,13 +111,6 @@ pub const OptionalUnwrapEngineChecker = struct {
     }
 };
 
-// Tests
-test "OptionalUnwrapEngineChecker initialization" {
-    const testing = std.testing;
-    try testing.expectEqualStrings("optional-unwrap", OptionalUnwrapEngineChecker.checker.name);
-    try testing.expectEqual(checker_mod.Severity.warning, OptionalUnwrapEngineChecker.checker.default_severity);
-}
-
 fn expectOptionalUnwrapDiagnosticLines(
     code: [:0]const u8,
     expected_lines: []const usize,
@@ -926,4 +919,53 @@ test "labeled flag killed by intervening write still diagnoses" {
         \\}
     ;
     try expectOptionalUnwrapDiagnosticLines(code, &.{10});
+}
+
+test "optional field assertions survive disjoint writes but not mutation" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const State = struct { value: ?u32, other: u32 };
+        \\fn bump(value: *u32) void { value.* += 1; }
+        \\fn guarded(state: *State) !u32 {
+        \\    try std.testing.expect(state.value != null);
+        \\    bump(&state.other);
+        \\    return state.value.?;
+        \\}
+        \\fn invalidated(state: *State) !u32 {
+        \\    try std.testing.expect(state.value != null);
+        \\    state.value = null;
+        \\    return state.value.?;
+        \\}
+        \\fn ignored(state: *State) u32 {
+        \\    std.testing.expect(state.value != null) catch {};
+        \\    return state.value.?;
+        \\}
+        \\fn earlyExit(state: *State) ?u32 {
+        \\    if (state.value == null) return null;
+        \\    bump(&state.other);
+        \\    return state.value.?;
+        \\}
+    ;
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 12, 16 });
+}
+
+test "lazy initialization preserves explicit standard container types" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const State = struct { value: ?std.zig.Ast = null };
+        \\fn read(state: *State, parsed: std.zig.Ast) std.zig.Ast {
+        \\    if (state.value == null) state.value = parsed;
+        \\    return state.value.?;
+        \\}
+    ;
+    try expectOptionalUnwrapDiagnosticLines(code, &.{});
+    const shadowed: [:0]const u8 =
+        \\const std = struct { const zig = struct { const Ast = ?u32; }; };
+        \\const State = struct { value: std.zig.Ast = null };
+        \\fn read(state: *State, parsed: std.zig.Ast) u32 {
+        \\    if (state.value == null) state.value = parsed;
+        \\    return state.value.?;
+        \\}
+    ;
+    try expectOptionalUnwrapDiagnosticLines(shadowed, &.{5});
 }

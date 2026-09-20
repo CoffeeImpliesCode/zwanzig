@@ -315,14 +315,14 @@ fn evalRangeBinary(
                 safeMul(lhs.max, rhs.min),
                 safeMul(lhs.max, rhs.max),
             };
-            var min_val: ?i64 = null;
-            var max_val: ?i64 = null;
-            for (products) |item| {
+            var min_val = products[0] orelse break :blk null;
+            var max_val = min_val;
+            for (products[1..]) |item| {
                 const v = item orelse break :blk null;
-                min_val = if (min_val) |existing| @min(existing, v) else v;
-                max_val = if (max_val) |existing| @max(existing, v) else v;
+                min_val = @min(min_val, v);
+                max_val = @max(max_val, v);
             }
-            break :blk .{ .int_range = .{ .min = min_val.?, .max = max_val.? } };
+            break :blk .{ .int_range = .{ .min = min_val, .max = max_val } };
         },
         .div => blk: {
             if (rhs.contains(0)) break :blk null;

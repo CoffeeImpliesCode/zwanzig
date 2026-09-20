@@ -81,7 +81,7 @@ pub const Source = struct {
     pub fn ast(self: *Source) !*const std.zig.Ast {
         if (self.borrowed_ast) |parsed_ast| return parsed_ast;
         if (self.cached_ast == null) {
-            const parsed = try std.zig.Ast.parse(self.allocator, self.content, .zig);
+            const parsed: std.zig.Ast = try std.zig.Ast.parse(self.allocator, self.content, .zig);
             self.cached_ast = parsed;
         }
         return &self.cached_ast.?;

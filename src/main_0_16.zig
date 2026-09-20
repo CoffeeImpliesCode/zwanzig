@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("analysis/call_resolver.zig");
+    _ = @import("analysis/import_resolver.zig");
     _ = @import("ir.zig");
     _ = @import("cfg.zig");
     _ = @import("checker.zig");

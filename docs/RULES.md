@@ -93,6 +93,7 @@ Detects unused container-level `const`, `var`, and `fn` declarations that aren't
 
 When `unused-decl` is enabled and more than one file is analyzed, zwanzig also runs a project pass over all analyzed files. That pass reports public top-level declarations that are not referenced by any other analyzed file, while ignoring `build.zig`'s `build` entrypoint, package API roots discovered from `root_source_file` in analyzed or workspace `build.zig` files, and alias-style re-exports to avoid library facade noise. Declarations exposed through another used public declaration's type, signature, field, initializer surface, typed receiver method call, or result-location method call are treated as used. Method references through nested inline namespaces and type aliases are also resolved.
 Private file-as-struct methods called through `self.method` are treated as used, even when an unrelated field has the same name. A bare field read never counts as a method call, so a same-named field on another type does not mask an unused method.
+Cyclic type aliases and namespace re-exports stop at the repeated binding or file. They do not prevent resolution of independent declarations.
 
 **Bad:**
 ```zig
@@ -518,6 +519,11 @@ if (opt) |value| {
 std.debug.assert(opt != null);
 const value = opt.?;  // Safe: assert guarantees non-null
 ```
+
+Field guards also support `std.debug.assert(state.value != null)` and `try std.testing.expect(state.value != null)`.
+A write through the address of a different struct field preserves the guard.
+Replacing the guarded field or passing its address to a mutating call invalidates it.
+An ignored `expect` error does not establish a guard.
 
 **Switch null-case guard:**
 ```zig

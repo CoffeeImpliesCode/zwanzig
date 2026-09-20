@@ -47,6 +47,8 @@ test {
     _ = @import("cli/config_merge.zig");
     _ = @import("cli/registry.zig");
     _ = @import("cli/run.zig");
+    _ = @import("analysis/call_resolver.zig");
+    _ = @import("analysis/import_resolver.zig");
 }
 
 pub fn main() !void {

@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed false positives for intentional catch fallback expressions and captured-error storage, while unrelated catch assignments remain reported as swallowed errors.
 - Fixed `sentinel-alloc` false positives when an untyped local directly infers the sentinel slice returned by the allocation.
 - Fixed project `unused-decl` false positives for method references through inline namespaces and nested type aliases.
+- Fixed stack overflows when the Zig 0.16.0 frontend analyzes generic container parameters or `unused-decl` follows cyclic aliases and namespace imports.
+- Fixed excess analysis concurrency with `--threads 1` on Zig 0.16.0 and double-free failures when the analysis graph runs out of memory.
+- Fixed optional-unwrap false positives after field assertions and calls that write a different struct field. Self-lint now reports failures in CI.
+
+### Changed
+
+- `just build`, `just run`, and `just lint` now use ReleaseSafe to avoid Debug analysis overhead while retaining safety checks. Self-lint uses one worker.
 
 ## [0.15.1]
 

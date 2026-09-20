@@ -8,7 +8,6 @@ const EdgeKind = cfg_mod.EdgeKind;
 const CfgBuilder = cfg_mod.CfgBuilder;
 const cached_artifacts_mod = @import("../../cached_artifacts.zig");
 const ast_walk = @import("../../ast_walk.zig");
-const call_utils = @import("../../analysis/call_utils.zig");
 const Source = @import("../../source.zig").Source;
 const BuildMetadata = @import("../../build_metadata.zig").BuildMetadata;
 const assertions = @import("../../assertions.zig");
