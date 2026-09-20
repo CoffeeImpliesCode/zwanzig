@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast_walk = @import("../ast_walk.zig");
+const ProjectTypeResolver = @import("call_resolver.zig").ProjectTypeResolver;
 
 pub const File = struct {
     path: []const u8,
@@ -39,10 +40,7 @@ pub fn nodeImportsPath(
     if (node >= tags.len) return false;
 
     switch (tags[node]) {
-        .identifier => {
-            const name = identifierName(tree, node) orelse return false;
-            return importAliasResolvesToPath(tree, importer_path, name, target_path);
-        },
+        .identifier => return initNodeImportsPath(tree, node, importer_path, target_path),
         .builtin_call,
         .builtin_call_comma,
         .builtin_call_two,
@@ -123,8 +121,20 @@ pub fn initNodeImportsPath(
     importer_path: []const u8,
     target_path: []const u8,
 ) bool {
+    var visited: [64]u32 = undefined;
+    return initNodeImportsPathVisited(tree, node, importer_path, target_path, &visited, 0);
+}
+
+fn initNodeImportsPathVisited(
+    tree: *const std.zig.Ast,
+    node: usize,
+    importer_path: []const u8,
+    target_path: []const u8,
+    visited: *[64]u32,
+    depth: usize,
+) bool {
     const tags = tree.nodes.items(.tag);
-    if (node >= tags.len) return false;
+    if (node >= tags.len or depth >= visited.len) return false;
 
     switch (tags[node]) {
         .builtin_call,
@@ -135,15 +145,81 @@ pub fn initNodeImportsPath(
             const import_path = importPathFromBuiltinCall(tree, node) orelse return false;
             return importMayResolveToPath(importer_path, import_path, target_path);
         },
+        .identifier => {
+            const alias_node: u32 = @intCast(node);
+            return aliasInitImportsPath(
+                tree,
+                alias_node,
+                importer_path,
+                target_path,
+                visited,
+                depth,
+            );
+        },
+        .call,
+        .call_comma,
+        .call_one,
+        .call_one_comma,
+        .struct_init,
+        .struct_init_comma,
+        .struct_init_one,
+        .struct_init_one_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .array_init,
+        .array_init_comma,
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        => return false,
         else => {
-            var scanner = ImportPathScanner{
+            var scanner = InitPathScanner{
                 .importer_path = importer_path,
                 .target_path = target_path,
+                .visited = visited,
+                .depth = depth,
             };
-            ast_walk.walk(ImportPathScanner, tree, @intCast(node), &scanner) catch return false;
+            if (tree.fullIf(@enumFromInt(node))) |full| {
+                InitPathScanner.visit(tree, @intFromEnum(full.ast.then_expr), &scanner) catch return false;
+                if (full.ast.else_expr.unwrap()) |alternative| {
+                    InitPathScanner.visit(tree, @intFromEnum(alternative), &scanner) catch return false;
+                }
+            } else {
+                ast_walk.walkChildren(InitPathScanner, tree, @intCast(node), &scanner, InitPathScanner.visit) catch return false;
+            }
             return scanner.found;
         },
     }
+}
+
+fn aliasInitImportsPath(
+    tree: *const std.zig.Ast,
+    alias_node: u32,
+    importer_path: []const u8,
+    target_path: []const u8,
+    visited: *[64]u32,
+    depth: usize,
+) bool {
+    const files = [_]File{.{ .path = importer_path, .tree = tree }};
+    const resolver = ProjectTypeResolver{ .files = &files, .file_index = 0 };
+    const decl_node = resolver.resolveDeclarationNode(alias_node) orelse return false;
+    if (std.mem.indexOfScalar(u32, visited[0..depth], decl_node) != null) return false;
+    const full = tree.fullVarDecl(@enumFromInt(decl_node)) orelse return false;
+    const init_node = full.ast.init_node.unwrap() orelse return false;
+    visited[depth] = decl_node;
+    return initNodeImportsPathVisited(
+        tree,
+        @intFromEnum(init_node),
+        importer_path,
+        target_path,
+        visited,
+        depth + 1,
+    );
 }
 
 pub fn importPathFromBuiltinCall(tree: *const std.zig.Ast, node_idx: usize) ?[]const u8 {
@@ -323,10 +399,9 @@ pub fn prevNonCommentToken(token_tags: []const std.zig.Token.Tag, start: usize) 
 }
 
 pub fn paramNameTokenBeforeType(tree: *const std.zig.Ast, type_node: usize) ?usize {
-    const main_tokens = tree.nodes.items(.main_token);
-    if (type_node >= main_tokens.len) return null;
+    if (type_node >= tree.nodes.len) return null;
     const token_tags = tree.tokens.items(.tag);
-    const type_token = main_tokens[type_node];
+    const type_token = tree.firstToken(@enumFromInt(type_node));
     const colon_token = prevNonCommentToken(token_tags, type_token) orelse return null;
     if (token_tags[colon_token] != .colon) return null;
     const name_token = prevNonCommentToken(token_tags, colon_token) orelse return null;
@@ -363,42 +438,7 @@ fn publicVarDeclImportsPath(
     const tags = tree.nodes.items(.tag);
     if (init_idx >= tags.len) return false;
 
-    switch (tags[init_idx]) {
-        .builtin_call,
-        .builtin_call_comma,
-        .builtin_call_two,
-        .builtin_call_two_comma,
-        => {
-            const import_path = importPathFromBuiltinCall(tree, init_idx) orelse return false;
-            return importMayResolveToPath(importer_path, import_path, target_path);
-        },
-        else => return false,
-    }
-}
-
-fn importAliasResolvesToPath(
-    tree: *const std.zig.Ast,
-    importer_path: []const u8,
-    alias_name: []const u8,
-    target_path: []const u8,
-) bool {
-    const tags = tree.nodes.items(.tag);
-
-    for (tags, 0..) |tag, node_index| {
-        if (!isVarDeclTag(tag)) continue;
-        const full = tree.fullVarDecl(@enumFromInt(node_index)) orelse continue;
-        const name_token = full.ast.mut_token + 1;
-        if (name_token >= tree.tokens.len) continue;
-        if (tree.tokenTag(name_token) != .identifier) continue;
-
-        const name = normalizeIdentifier(tree.tokenSlice(name_token));
-        if (!std.mem.eql(u8, name, alias_name)) continue;
-
-        const init_node = full.ast.init_node.unwrap() orelse continue;
-        if (initNodeImportsPath(tree, @intFromEnum(init_node), importer_path, target_path)) return true;
-    }
-
-    return false;
+    return initNodeImportsPath(tree, init_idx, importer_path, target_path);
 }
 
 fn filePublicMemberImportsPath(files: []const File, file_index: usize, member_name: []const u8, target_path: []const u8) bool {
@@ -424,7 +464,6 @@ fn publicVarDeclNamedImportsPath(
 ) bool {
     const full = tree.fullVarDecl(@enumFromInt(node_idx)) orelse return false;
     if (!isPubToken(tree, full.visib_token)) return false;
-
     const name_token = full.ast.mut_token + 1;
     if (name_token >= tree.tokens.len) return false;
     if (tree.tokenTag(name_token) != .identifier) return false;
@@ -432,8 +471,7 @@ fn publicVarDeclNamedImportsPath(
     if (!std.mem.eql(u8, name, expected_name)) return false;
 
     const init_node = full.ast.init_node.unwrap() orelse return false;
-    const import_path = importPathFromBuiltinCall(tree, @intFromEnum(init_node)) orelse return false;
-    return importMayResolveToPath(importer_path, import_path, target_path);
+    return initNodeImportsPath(tree, @intFromEnum(init_node), importer_path, target_path);
 }
 
 fn isPubToken(tree: *const std.zig.Ast, token: ?std.zig.Ast.TokenIndex) bool {
@@ -441,31 +479,110 @@ fn isPubToken(tree: *const std.zig.Ast, token: ?std.zig.Ast.TokenIndex) bool {
     return tree.tokenTag(tok) == .keyword_pub;
 }
 
-const ImportPathScanner = struct {
+const InitPathScanner = struct {
     importer_path: []const u8,
     target_path: []const u8,
+    visited: *[64]u32,
+    depth: usize,
     found: bool = false,
     stop: bool = false,
 
-    pub fn visit(
-        self: *ImportPathScanner,
-        tree: *const std.zig.Ast,
-        node: u32,
-        tag: std.zig.Ast.Node.Tag,
-    ) anyerror!void {
-        switch (tag) {
-            .builtin_call,
-            .builtin_call_comma,
-            .builtin_call_two,
-            .builtin_call_two_comma,
-            => {
-                const import_path = importPathFromBuiltinCall(tree, node) orelse return;
-                if (importMayResolveToPath(self.importer_path, import_path, self.target_path)) {
-                    self.found = true;
-                    self.stop = true;
-                }
-            },
-            else => {},
-        }
+    pub fn visit(tree: *const std.zig.Ast, node: u32, self: *InitPathScanner) anyerror!void {
+        if (self.stop) return;
+        self.found = initNodeImportsPathVisited(
+            tree,
+            node,
+            self.importer_path,
+            self.target_path,
+            self.visited,
+            self.depth,
+        );
+        self.stop = self.found;
     }
 };
+
+test "skript residual: public conditional imports expose both branches" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const dynlib_impl = @import("dynlib.zig");
+        \\const no_dynlib_impl = @import("no_dynlib.zig");
+        \\pub const dynlib = if (true) dynlib_impl else no_dynlib_impl;
+        \\const ffi_impl = @import("ffi.zig");
+        \\const no_ffi_impl = @import("no_ffi.zig");
+        \\pub const ffi = if (true) ffi_impl else no_ffi_impl;
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+
+    const files = [_]File{
+        .{ .path = "src/intrinsics/root.zig", .tree = &tree },
+    };
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/dynlib.zig"));
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/no_dynlib.zig"));
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/ffi.zig"));
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/intrinsics/no_ffi.zig"));
+}
+
+test "public import aliases ignore unrelated local bindings" {
+    const code: [:0]const u8 =
+        \\const selected = @import("selected.zig");
+        \\pub const exposed = selected;
+        \\fn unrelated() void {
+        \\    const selected = @import("hidden.zig");
+        \\    _ = selected;
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const files = [_]File{.{ .path = "src/root.zig", .tree = &tree }};
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/selected.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/hidden.zig"));
+    const declaration = tree.fullVarDecl(tree.rootDecls()[1]) orelse return error.MissingDeclaration;
+    const initializer = declaration.ast.init_node.unwrap() orelse return error.MissingInitializer;
+    try std.testing.expect(nodeImportsPath(&files, &tree, @intFromEnum(initializer), files[0].path, "src/selected.zig"));
+    try std.testing.expect(!nodeImportsPath(&files, &tree, @intFromEnum(initializer), files[0].path, "src/hidden.zig"));
+}
+
+test "public initializer locals shadow root import aliases" {
+    const code: [:0]const u8 =
+        \\const selected = @import("selected.zig");
+        \\pub const exposed = blk: {
+        \\    const selected = 1;
+        \\    break :blk selected;
+        \\};
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const files = [_]File{.{ .path = "src/root.zig", .tree = &tree }};
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/selected.zig"));
+}
+
+test "public values do not reexport namespaces passed to constructors" {
+    const code: [:0]const u8 =
+        \\const hidden = @import("hidden.zig");
+        \\const Box = struct { count: usize };
+        \\fn count(_: type) usize { return 1; }
+        \\pub const value = count(hidden);
+        \\pub const instance = Box{ .count = count(hidden) };
+        \\pub const conditional = if (true) Box{ .count = count(hidden) } else count(hidden);
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const files = [_]File{.{ .path = "src/root.zig", .tree = &tree }};
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/hidden.zig"));
+}
+
+test "conditional namespace aliases do not reexport their condition" {
+    const code: [:0]const u8 =
+        \\pub const selected = if (@import("condition.zig").enabled)
+        \\    @import("native.zig")
+        \\else
+        \\    @import("fallback.zig");
+    ;
+    var tree = try std.zig.Ast.parse(std.testing.allocator, code, .zig);
+    defer tree.deinit(std.testing.allocator);
+    const files = [_]File{.{ .path = "src/root.zig", .tree = &tree }};
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/native.zig"));
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/fallback.zig"));
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/condition.zig"));
+}

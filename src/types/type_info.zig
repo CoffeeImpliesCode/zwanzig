@@ -14,6 +14,12 @@ pub const TypeInfo = struct {
     type_str: ?[]const u8 = null,
     /// Sentinel information for sentinel-terminated types (e.g., [:0]u8)
     sentinel: ?SentinelInfo = null,
+    /// Immediate child kind for wrapped and container types.
+    payload_kind: ?TypeKind = null,
+    /// Type and immediate child AST nodes in the owning source, when known.
+    type_node: ?u32 = null,
+    payload_node: ?u32 = null,
+    type_ast: ?*const std.zig.Ast = null,
 
     /// Sentinel value information for sentinel-terminated types.
     pub const SentinelInfo = struct {

@@ -22,6 +22,7 @@ const SarifFormatter = @import("formatters/sarif.zig").SarifFormatter;
 const log = std.log.scoped(.analyzer);
 const diagnostic_mod = @import("diagnostic.zig");
 const suppression = @import("suppression.zig");
+const ProjectSources = @import("project_sources.zig").ProjectSources;
 const project_unused_decl = @import("project_unused_decl.zig");
 
 pub const Analyzer = struct {
@@ -43,6 +44,7 @@ pub const Analyzer = struct {
     dump_annotated_cfg_dir: ?[]const u8 = null,
     dump_path_trace_dir: ?[]const u8 = null,
     io_context: ?*compat.Context = null,
+    project_sources: ?ProjectSources = null,
 
     pub fn init(allocator: std.mem.Allocator) Analyzer {
         return Analyzer{
@@ -73,6 +75,10 @@ pub const Analyzer = struct {
             diag.deinit(self.allocator);
         }
         self.diagnostics.deinit(self.allocator);
+        if (self.project_sources) |*project| {
+            project.deinit();
+            self.project_sources = null;
+        }
         if (self.build_metadata) |*meta| {
             var meta_mut = meta.*;
             meta_mut.deinit(self.allocator);
@@ -223,13 +229,29 @@ pub const Analyzer = struct {
         }
     }
 
+    pub fn prepareProject(self: *Analyzer, files: []const []const u8) !void {
+        if (self.project_sources) |*project| {
+            project.deinit();
+            self.project_sources = null;
+        }
+        self.project_sources = try ProjectSources.init(
+            self.getIoContext(),
+            self.allocator,
+            files,
+        );
+    }
+
     pub fn shouldRunProjectUnusedDecls(self: *const Analyzer) bool {
         return self.isRuleEnabled("unused-decl");
     }
 
-    pub fn analyzeProjectUnusedDecls(self: *Analyzer, files: []const []const u8) !void {
+    pub fn analyzeProjectUnusedDecls(self: *Analyzer) !void {
         if (!self.shouldRunProjectUnusedDecls()) return;
-        try project_unused_decl.analyze(self.getIoContext(), self.allocator, files, &self.diagnostics);
+        if (self.project_sources) |*project| {
+            try project_unused_decl.analyze(project, self.allocator, &self.diagnostics);
+        } else {
+            return error.ProjectNotPrepared;
+        }
         std.mem.sort(Diagnostic, self.diagnostics.items, {}, Diagnostic.lessThan);
     }
 
@@ -273,14 +295,31 @@ pub const Analyzer = struct {
     ) !AnalysisResult {
         log.debug("analyzeResult: start {s}", .{file_path});
 
-        const max_size = 10 * 1024 * 1024;
-        // Sentinel needed for Source.init; free accounts for sentinel byte below
-        // zwanzig-disable-next-line: sentinel-alloc
-        const content = try compat.readFileAlloc(self.getIoContext(), scratch_allocator, file_path, max_size);
-        defer scratch_allocator.free(content.ptr[0 .. content.len + 1]);
+        var owned_content: ?[:0]u8 = null;
+        defer if (owned_content) |content| {
+            scratch_allocator.free(content.ptr[0 .. content.len + 1]);
+        };
 
-        var source = Source.init(scratch_allocator, file_path, content);
+        const registered_source = if (self.project_sources) |*project|
+            project.sourceForPath(file_path)
+        else
+            null;
+        var source = if (registered_source) |parsed| blk: {
+            break :blk Source.initParsed(scratch_allocator, parsed.path, parsed.tree);
+        } else blk: {
+            // Sentinel needed for Source.init; free accounts for sentinel byte below.
+            // zwanzig-disable-next-line: sentinel-alloc
+            const content = try compat.readFileAlloc(
+                self.getIoContext(),
+                scratch_allocator,
+                file_path,
+                10 * 1024 * 1024,
+            );
+            owned_content = content;
+            break :blk Source.init(scratch_allocator, file_path, content);
+        };
         defer source.deinit();
+        const content = source.getContent();
         const type_info_available = source.hasTypeInfo();
 
         var cached_artifacts: ?CachedArtifacts = null;
@@ -303,12 +342,17 @@ pub const Analyzer = struct {
             }
 
             sortRuleNames(enabled_rules_buf.items);
+            const project_fingerprint = if (self.project_sources) |*project|
+                project.fingerprint()
+            else
+                null;
             const key = CacheKey.init(
                 content,
                 self.getBuildMetadata(),
                 self.tool_version,
                 type_info_available,
                 enabled_rules_buf.items,
+                project_fingerprint,
             );
             cache_key = key;
             if (self.cache) |*c| {
@@ -380,7 +424,7 @@ pub const Analyzer = struct {
     /// Filter suppressed diagnostics in a standalone list.
     fn filterDiagnosticsWithSuppressions(
         allocator: std.mem.Allocator,
-        content: [:0]const u8,
+        content: []const u8,
         diagnostics: *std.ArrayList(Diagnostic),
     ) !void {
         var sup_map = try suppression.parseSuppressions(allocator, content);
@@ -411,6 +455,9 @@ pub const Analyzer = struct {
     ) !void {
         var type_ctx = TypeContext.init(scratch_allocator, source);
         defer type_ctx.deinit();
+        if (self.project_sources) |*project| {
+            type_ctx.project_resolver = project.resolverForPath(source.getFilePath());
+        }
         log.debug("type context: created for {s}, available={}", .{
             source.getFilePath(),
             type_ctx.isAvailable(),
@@ -761,5 +808,78 @@ test "Analyzer cache hit still produces diagnostics" {
 
         try analyzer2.analyzeFile(test_file_path);
         try testing.expectEqual(first_run_diag_count, analyzer2.diagnostics.items.len);
+    }
+}
+
+test "Analyzer project cache invalidates imported source changes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const OptionalUnwrapEngineChecker =
+        @import("checkers/optional_unwrap_engine.zig").OptionalUnwrapEngineChecker;
+
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var tmp_dir = compat.TestDir.init();
+    defer tmp_dir.cleanup();
+
+    const main_content =
+        \\const api = @import("api.zig");
+        \\const State = struct { value: ?u8 };
+        \\
+        \\pub fn read() u8 {
+        \\    var state: State = .{ .value = null };
+        \\    state.value = api.make();
+        \\    return state.value.?;
+        \\}
+    ;
+    try tmp_dir.writeFile("main.zig", main_content);
+    try tmp_dir.writeFile("api.zig", "pub fn make() u8 { return 1; }\n");
+
+    var main_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const main_path = try std.fmt.bufPrint(
+        &main_path_buf,
+        "{s}/main.zig",
+        .{tmp_dir.path()},
+    );
+    var api_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const api_path = try std.fmt.bufPrint(
+        &api_path_buf,
+        "{s}/api.zig",
+        .{tmp_dir.path()},
+    );
+    var cache_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(
+        &cache_path_buf,
+        "{s}/cache",
+        .{tmp_dir.path()},
+    );
+    const files = [_][]const u8{ main_path, api_path };
+
+    {
+        var analyzer = Analyzer.initWithContext(allocator, &io_context);
+        defer analyzer.deinit();
+        analyzer.cache = try Cache.initAt(allocator, &io_context, cache_path);
+        analyzer.use_cache = true;
+        try analyzer.registerChecker(&OptionalUnwrapEngineChecker.checker);
+        try analyzer.prepareProject(&files);
+        try analyzer.analyzeFile(main_path);
+        try testing.expectEqual(@as(usize, 0), analyzer.diagnostics.items.len);
+    }
+
+    try tmp_dir.writeFile("api.zig", "pub fn make() ?u8 { return null; }\n");
+
+    {
+        var analyzer = Analyzer.initWithContext(allocator, &io_context);
+        defer analyzer.deinit();
+        analyzer.cache = try Cache.initAt(allocator, &io_context, cache_path);
+        analyzer.use_cache = true;
+        try analyzer.registerChecker(&OptionalUnwrapEngineChecker.checker);
+        try analyzer.prepareProject(&files);
+        try analyzer.analyzeFile(main_path);
+        try testing.expectEqual(@as(usize, 1), analyzer.diagnostics.items.len);
+        try testing.expectEqualStrings(
+            "optional-unwrap",
+            analyzer.diagnostics.items[0].rule_id,
+        );
     }
 }

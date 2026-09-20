@@ -5,9 +5,6 @@ const Rule = @import("../rule.zig").Rule;
 const RuleError = @import("../rule.zig").RuleError;
 const Source = @import("../source.zig").Source;
 const VarResolver = @import("../engine/var_resolver.zig").VarResolver;
-const ast_walk = @import("../ast_walk.zig");
-
-const Ast = std.zig.Ast;
 
 /// Rule that detects unused function parameters.
 ///
@@ -64,9 +61,6 @@ pub const UnusedParameterRule = struct {
                 const var_id = ids.varId(name_tok);
                 if (isVarIdUsed(&resolver, var_id)) continue;
 
-                // Check if parameter is used in signature (other param types or return type)
-                if (isUsedInSignature(tree, proto, name)) continue;
-
                 const loc = try src.tokenLocation(name_tok);
                 const message = try std.fmt.allocPrint(allocator, "Unused parameter '{s}'", .{name});
                 defer allocator.free(message);
@@ -98,33 +92,73 @@ pub const UnusedParameterRule = struct {
         }
         return false;
     }
-
-    /// Check if a parameter name is used in the function signature:
-    /// - In type annotations of other parameters
-    /// - In the return type
-    fn isUsedInSignature(tree: *const Ast, proto: Ast.full.FnProto, param_name: []const u8) bool {
-        // Check return type
-        const ret_node = @intFromEnum(proto.ast.return_type);
-        if (ret_node != 0 and containsIdentifier(tree, ret_node, param_name)) {
-            return true;
-        }
-
-        // Check all parameter type annotations
-        var it = proto.iterate(tree);
-        while (it.next()) |param| {
-            if (param.type_expr) |type_expr| {
-                const type_node = @intFromEnum(type_expr);
-                if (type_node != 0 and containsIdentifier(tree, type_node, param_name)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /// Recursively check if a node contains an identifier with the given name.
-    fn containsIdentifier(tree: *const Ast, node: u32, target_name: []const u8) bool {
-        return ast_walk.containsIdentifier(tree, node, target_name);
-    }
 };
+
+fn expectUnusedParameterDiagnostics(code: [:0]const u8, expected_name: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try UnusedParameterRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, expected_name) != null);
+}
+
+test "skript regression: tuple destructuring reads its source parameter" {
+    const code: [:0]const u8 =
+        \\fn unpack(payload: u32) u32 {
+        \\    const low, const high = .{ payload & 0xff, payload >> 8 };
+        \\    return low + high;
+        \\}
+        \\fn unsafeControl(actually_unused: u32) void {
+        \\    _ = 0;
+        \\}
+    ;
+
+    try expectUnusedParameterDiagnostics(code, "actually_unused");
+}
+
+test "skript regression: generic signatures use comptime parameters" {
+    const code: [:0]const u8 =
+        \\fn signatureOnly(comptime T: type, comptime op: fn (T) T) type {
+        \\    _ = op;
+        \\    return u8;
+        \\}
+        \\fn tupleType(comptime F: type) type {
+        \\    return struct { F, F };
+        \\}
+        \\fn unsafeControl(comptime actually_unused: type) type {
+        \\    return u8;
+        \\}
+    ;
+
+    try expectUnusedParameterDiagnostics(code, "actually_unused");
+}
+
+test "shadowed parameter name still diagnoses the parameter" {
+    const code: [:0]const u8 =
+        \\fn shadowed(x: u32) u32 {
+        \\    const x: u32 = 5;
+        \\    return x;
+        \\}
+    ;
+
+    try expectUnusedParameterDiagnostics(code, "x");
+}
+
+test "shadowed comptime parameter still diagnoses the parameter" {
+    const code: [:0]const u8 =
+        \\fn shadowedComptime(comptime T: type) type {
+        \\    const T = u8;
+        \\    return T;
+        \\}
+    ;
+
+    try expectUnusedParameterDiagnostics(code, "T");
+}

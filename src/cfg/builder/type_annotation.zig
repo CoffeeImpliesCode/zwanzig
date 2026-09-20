@@ -2,7 +2,7 @@ const graph = @import("../graph.zig");
 const Source = @import("../../source.zig").Source;
 const IrNode = graph.IrNode;
 
-pub fn mixin(comptime _Builder: type) type {
+pub fn Mixin(comptime _Builder: type) type {
     return struct {
         /// Annotate an IR node with type information if available.
         /// Returns the node (possibly enriched with type info).

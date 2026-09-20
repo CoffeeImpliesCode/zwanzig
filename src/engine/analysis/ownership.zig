@@ -5,7 +5,7 @@ const Cfg = @import("../../cfg.zig").Cfg;
 const ProgramState = @import("../state.zig").ProgramState;
 const EngineError = @import("../base.zig").EngineError;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         pub fn resolveCallToken(self: *_Engine, call_node: u32) ?u32 {
             const src = self.source orelse return null;
@@ -46,7 +46,7 @@ pub fn mixin(comptime _Engine: type) type {
 
             switch (tags[expr_node]) {
                 .identifier => {
-                    if (_Engine.var_resolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg)) |var_id| {
+                    if (_Engine.VarResolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg)) |var_id| {
                         const token = main_tokens[expr_node];
                         try state.trackUse(var_id, token);
                     }
@@ -95,7 +95,7 @@ pub fn mixin(comptime _Engine: type) type {
 
             switch (tags[expr_node]) {
                 .identifier => {
-                    if (_Engine.var_resolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg)) |var_id| {
+                    if (_Engine.VarResolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg)) |var_id| {
                         try state.trackEscapeOwned(var_id);
                         state.trackEscape(var_id);
                         const token = main_tokens[expr_node];
@@ -300,7 +300,7 @@ pub fn mixin(comptime _Engine: type) type {
             const parent_map = try self.getParentMap(tree);
             const tags = tree.nodes.items(.tag);
 
-            const call_token = _Engine.ownership.resolveCallToken(self, call_node);
+            const call_token = _Engine.Ownership.resolveCallToken(self, call_node);
 
             var seen: std.AutoHashMap(ids.VarId, void) = .init(self.allocator);
             defer seen.deinit();
@@ -336,7 +336,7 @@ pub fn mixin(comptime _Engine: type) type {
 
             switch (tags[expr_node]) {
                 .identifier => {
-                    const var_id = _Engine.var_resolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg) orelse return;
+                    const var_id = _Engine.VarResolution.resolveVarIdFromIdentifier(self, expr_node, current_cfg) orelse return;
                     if (seen.contains(var_id)) return;
                     try seen.put(var_id, {});
                     const defer_scope = state.store.pendingDeferredFreeScope(var_id) orelse return;
@@ -420,7 +420,7 @@ pub fn mixin(comptime _Engine: type) type {
             current_cfg: *const Cfg,
         ) bool {
             const root_ident_node = findRootIdentifierNode(tags, tree.nodes.items(.data), receiver_node) orelse return false;
-            const decl_info = _Engine.var_resolution.resolveDeclInfoFromIdentifier(self, root_ident_node, current_cfg) orelse return true;
+            const decl_info = _Engine.VarResolution.resolveDeclInfoFromIdentifier(self, root_ident_node, current_cfg) orelse return true;
             if (decl_info.is_top_level) return true;
             return !ast_walk.isAncestor(defer_scope, decl_info.decl_node, parent_map);
         }
@@ -466,7 +466,7 @@ pub fn mixin(comptime _Engine: type) type {
             if (full_call.ast.params.len < 2) return;
 
             const first_arg_node = @intFromEnum(full_call.ast.params[0]);
-            const first_arg_var = _Engine.var_resolution.resolveVarIdFromExpr(self, first_arg_node, current_cfg) orelse return;
+            const first_arg_var = _Engine.VarResolution.resolveVarIdFromExpr(self, first_arg_node, current_cfg) orelse return;
 
             const first_arg_is_ptr = blk: {
                 if (self.type_context) |type_ctx| {
@@ -502,7 +502,7 @@ pub fn mixin(comptime _Engine: type) type {
 
             for (full_call.ast.params[1..]) |param| {
                 const param_node = @intFromEnum(param);
-                if (_Engine.var_resolution.resolveVarIdFromExpr(self, param_node, current_cfg)) |param_var| {
+                if (_Engine.VarResolution.resolveVarIdFromExpr(self, param_node, current_cfg)) |param_var| {
                     if (state.getRegionState(param_var)) |rs| {
                         if (rs == .allocated or rs == .open) {
                             if (first_arg_is_ptr or callee_is_init_fn) {
@@ -633,19 +633,19 @@ pub fn mixin(comptime _Engine: type) type {
                     .container_field, .container_field_init, .container_field_align => {
                         const full_field = tree.fullContainerField(@enumFromInt(field_idx)) orelse continue;
                         if (full_field.ast.value_expr.unwrap()) |value_expr| {
-                            if (_Engine.var_resolution.resolveVarIdFromExpr(self, @intFromEnum(value_expr), current_cfg)) |var_id| {
+                            if (_Engine.VarResolution.resolveVarIdFromExpr(self, @intFromEnum(value_expr), current_cfg)) |var_id| {
                                 try state.trackOwnership(var_id, container_var);
                             }
                         } else if (full_field.ast.tuple_like) {
                             if (full_field.ast.type_expr.unwrap()) |value_expr| {
-                                if (_Engine.var_resolution.resolveVarIdFromExpr(self, @intFromEnum(value_expr), current_cfg)) |var_id| {
+                                if (_Engine.VarResolution.resolveVarIdFromExpr(self, @intFromEnum(value_expr), current_cfg)) |var_id| {
                                     try state.trackOwnership(var_id, container_var);
                                 }
                             }
                         }
                     },
                     else => {
-                        if (_Engine.var_resolution.resolveVarIdFromExpr(self, field_idx, current_cfg)) |var_id| {
+                        if (_Engine.VarResolution.resolveVarIdFromExpr(self, field_idx, current_cfg)) |var_id| {
                             try state.trackOwnership(var_id, container_var);
                         }
                     },
@@ -719,10 +719,10 @@ pub fn mixin(comptime _Engine: type) type {
 
             const field_access_data = datas[lhs_node].node_and_token;
             const base_node = @intFromEnum(field_access_data[0]);
-            const container_var = _Engine.var_resolution.resolveVarIdFromExpr(self, base_node, current_cfg) orelse return;
-            const resource_var = _Engine.var_resolution.resolveVarIdFromExpr(self, rhs_node, current_cfg) orelse return;
+            const container_var = _Engine.VarResolution.resolveVarIdFromExpr(self, base_node, current_cfg) orelse return;
+            const resource_var = _Engine.VarResolution.resolveVarIdFromExpr(self, rhs_node, current_cfg) orelse return;
             try state.trackOwnership(resource_var, container_var);
-            try _Engine.ownership.escapeOwnedFromFieldBase(self, state, tree, base_node, container_var, resource_var);
+            try _Engine.Ownership.escapeOwnedFromFieldBase(self, state, tree, base_node, container_var, resource_var);
         }
 
         pub fn escapeReturnedVars(self: *_Engine, state: *ProgramState, fn_node: ids.AstNodeId, current_cfg: *const Cfg) EngineError!void {

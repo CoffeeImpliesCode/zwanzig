@@ -251,7 +251,7 @@ Two zwanzig binaries from the same release but different embedded frontends must
 ```zig
 test "CacheKey version hash includes the embedded Zig frontend version" {
     const rules = [_][]const u8{};
-    const key = CacheKey.init("test", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test", null, "1.0.0", false, &rules, null);
 
     // Regression guard: if version_hash were derived from the tool version
     // alone, two binaries embedding different Zig frontends would share

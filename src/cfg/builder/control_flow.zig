@@ -7,7 +7,7 @@ const Cfg = graph.Cfg;
 const IrNode = graph.IrNode;
 const CfgNodeId = ids.CfgNodeId;
 
-pub fn mixin(comptime _Builder: type) type {
+pub fn Mixin(comptime _Builder: type) type {
     return struct {
         pub fn processIf(
             self: *_Builder,

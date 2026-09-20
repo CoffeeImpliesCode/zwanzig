@@ -99,14 +99,14 @@ pub const AnalysisEngine = struct {
     /// Scratch buffer for FQN construction
     fqn_buffer: [256]u8 = undefined,
 
-    pub const resource_calls = @import("resource_calls.zig").mixin(@This());
-    pub const literals = @import("literals.zig").mixin(@This());
-    pub const var_resolution = @import("var_resolution.zig").mixin(@This());
-    pub const ownership = @import("ownership.zig").mixin(@This());
-    pub const payloads = @import("payloads.zig").mixin(@This());
-    pub const defer_scan = @import("defer_scan.zig").mixin(@This());
-    pub const branch_constraints = @import("branch_constraints.zig").mixin(@This());
-    pub const summaries = @import("summaries.zig").mixin(@This());
+    pub const ResourceCalls = @import("resource_calls.zig").Mixin(@This());
+    pub const Literals = @import("literals.zig").Mixin(@This());
+    pub const VarResolution = @import("var_resolution.zig").Mixin(@This());
+    pub const Ownership = @import("ownership.zig").Mixin(@This());
+    pub const Payloads = @import("payloads.zig").Mixin(@This());
+    pub const DeferScan = @import("defer_scan.zig").Mixin(@This());
+    pub const BranchConstraints = @import("branch_constraints.zig").Mixin(@This());
+    pub const Summaries = @import("summaries.zig").Mixin(@This());
 
     const WorklistItem = struct {
         /// Index of the exploded graph node to process
@@ -433,7 +433,7 @@ pub const AnalysisEngine = struct {
     }
 
     pub fn resolveVarIdFromExpr(self: *AnalysisEngine, expr_node: u32, current_cfg: *const Cfg) ?ids.VarId {
-        return var_resolution.resolveVarIdFromExpr(self, expr_node, current_cfg);
+        return VarResolution.resolveVarIdFromExpr(self, expr_node, current_cfg);
     }
 
     pub fn resolveDeclInfoFromIdentifier(
@@ -441,7 +441,7 @@ pub const AnalysisEngine = struct {
         identifier_node: u32,
         current_cfg: *const Cfg,
     ) ?VarResolver.DeclInfo {
-        return var_resolution.resolveDeclInfoFromIdentifier(self, identifier_node, current_cfg);
+        return VarResolution.resolveDeclInfoFromIdentifier(self, identifier_node, current_cfg);
     }
 
     fn processNode(self: *AnalysisEngine, node_index: u32, edge_kind: EdgeKind, pending_constraint: ?Constraint, current_cfg: *const Cfg) EngineError!void {
@@ -464,8 +464,8 @@ pub const AnalysisEngine = struct {
                     if (node.ir_node.tag == .call) {
                         // Track escapes BEFORE inlining, since inlining will skip normal processing
                         if (node.ir_node.ast_node) |ast_node| {
-                            ownership.trackEscapesFromCall(self, &state_copy, ast_node, current_cfg);
-                            try ownership.recordOwnershipFromCall(self, &state_copy, ast_node, current_cfg);
+                            Ownership.trackEscapesFromCall(self, &state_copy, ast_node, current_cfg);
+                            try Ownership.recordOwnershipFromCall(self, &state_copy, ast_node, current_cfg);
                         }
 
                         const inline_result = try self.handleCallNode(node_index, node, &state_copy, current_cfg);
@@ -517,7 +517,7 @@ pub const AnalysisEngine = struct {
                 var branch_constraint_buf: [4]?Constraint = .{ null, null, null, null };
                 const branch_constraint_count: usize = if (cfg_node) |node| blk: {
                     if (node.ir_node.tag == .branch) {
-                        break :blk branch_constraints.extractBranchConstraints(self, node, current_cfg, &branch_constraint_buf);
+                        break :blk BranchConstraints.extractBranchConstraints(self, node, current_cfg, &branch_constraint_buf);
                     }
                     break :blk 0;
                 } else 0;
@@ -554,7 +554,7 @@ pub const AnalysisEngine = struct {
                         }
 
                         if (cfg_node) |node| {
-                            try payloads.applyPayloadBindings(self, node, edge.kind, &succ_state, current_cfg);
+                            try Payloads.applyPayloadBindings(self, node, edge.kind, &succ_state, current_cfg);
                         }
 
                         // Apply all branch constraints based on the edge kind
@@ -663,7 +663,7 @@ pub const AnalysisEngine = struct {
         // Only use summaries for pure functions (no side effects) to avoid losing
         // callee effects when skipping inlining
         if (self.use_summaries) {
-            if (summaries.getOrComputeSummary(self, callee_fn_node)) |summary| {
+            if (Summaries.getOrComputeSummary(self, callee_fn_node)) |summary| {
                 // Only apply summaries for pure functions to preserve side effect semantics
                 if (!summary.has_side_effects and summary.isApplicable(state)) {
                     // Find the return point (successor of the call node in the caller)
@@ -815,30 +815,30 @@ pub const AnalysisEngine = struct {
         switch (ir_node.tag) {
             .var_decl => {
                 if (ir_node.ast_node) |ast_node| {
-                    const var_id = var_resolution.resolveVarIdFromVarDecl(self, ast_node) orelse ids.varId(ast_node);
+                    const var_id = VarResolution.resolveVarIdFromVarDecl(self, ast_node) orelse ids.varId(ast_node);
                     new_state.resetRegion(var_id);
                     // Try to evaluate literal value from init expression, fall back to unknown
-                    const init_value = if (var_resolution.resolveVarDeclInitNode(self, ast_node)) |init_node|
-                        literals.evaluateLiteral(self, init_node)
+                    const init_value = if (VarResolution.resolveVarDeclInitNode(self, ast_node)) |init_node|
+                        Literals.evaluateLiteral(self, init_node)
                     else
                         null;
                     try new_state.setVar(var_id, init_value orelse .unknown);
-                    if (var_resolution.resolveVarDeclInitNode(self, ast_node)) |init_node| {
-                        if (resource_calls.resolveResourceCall(self, init_node)) |call_info| {
+                    if (VarResolution.resolveVarDeclInitNode(self, ast_node)) |init_node| {
+                        if (ResourceCalls.resolveResourceCall(self, init_node)) |call_info| {
                             switch (call_info.kind) {
                                 .alloc => try new_state.trackAllocation(var_id),
                                 .open => try new_state.trackOpen(var_id),
                                 else => {},
                             }
-                        } else if (var_resolution.resolveVarIdFromExpr(self, init_node, current_cfg)) |alias_target| {
+                        } else if (VarResolution.resolveVarIdFromExpr(self, init_node, current_cfg)) |alias_target| {
                             if (alias_target != var_id) {
                                 try new_state.trackAlias(var_id, alias_target);
                             }
-                        } else if (resource_calls.isDefinitelyNonAlloc(self, init_node)) {
+                        } else if (ResourceCalls.isDefinitelyNonAlloc(self, init_node)) {
                             try new_state.trackNonAllocation(var_id);
                         }
-                        try ownership.recordOwnershipFromExpr(self, &new_state, init_node, var_id, current_cfg);
-                        try ownership.checkUseAfterFreeInExpr(self, &new_state, init_node, current_cfg);
+                        try Ownership.recordOwnershipFromExpr(self, &new_state, init_node, var_id, current_cfg);
+                        try Ownership.checkUseAfterFreeInExpr(self, &new_state, init_node, current_cfg);
                     }
                 }
             },
@@ -855,36 +855,36 @@ pub const AnalysisEngine = struct {
                     }
 
                     if (lhs_is_identifier) {
-                        const var_id = var_resolution.resolveVarIdFromIdentifier(self, lhs_node, current_cfg) orelse ids.varId(lhs_node);
+                        const var_id = VarResolution.resolveVarIdFromIdentifier(self, lhs_node, current_cfg) orelse ids.varId(lhs_node);
                         new_state.resetRegion(var_id);
                         // Try to evaluate literal value from RHS, fall back to unknown
                         const rhs_value = if (ir_node.operand2_node) |rhs|
-                            literals.evaluateLiteral(self, rhs)
+                            Literals.evaluateLiteral(self, rhs)
                         else
                             null;
                         try new_state.setVar(var_id, rhs_value orelse .unknown);
                         if (ir_node.operand2_node) |rhs_node| {
-                            if (resource_calls.resolveResourceCall(self, rhs_node)) |call_info| {
+                            if (ResourceCalls.resolveResourceCall(self, rhs_node)) |call_info| {
                                 switch (call_info.kind) {
                                     .alloc => try new_state.trackAllocation(var_id),
                                     .open => try new_state.trackOpen(var_id),
                                     else => {},
                                 }
-                            } else if (var_resolution.resolveVarIdFromExpr(self, rhs_node, current_cfg)) |alias_target| {
+                            } else if (VarResolution.resolveVarIdFromExpr(self, rhs_node, current_cfg)) |alias_target| {
                                 if (alias_target != var_id) {
                                     try new_state.trackAlias(var_id, alias_target);
                                 }
-                            } else if (resource_calls.isDefinitelyNonAlloc(self, rhs_node)) {
+                            } else if (ResourceCalls.isDefinitelyNonAlloc(self, rhs_node)) {
                                 try new_state.trackNonAllocation(var_id);
                             }
-                            try ownership.recordOwnershipFromExpr(self, &new_state, rhs_node, var_id, current_cfg);
-                            try ownership.checkUseAfterFreeInExpr(self, &new_state, rhs_node, current_cfg);
+                            try Ownership.recordOwnershipFromExpr(self, &new_state, rhs_node, var_id, current_cfg);
+                            try Ownership.checkUseAfterFreeInExpr(self, &new_state, rhs_node, current_cfg);
                         }
                     } else if (ir_node.operand2_node) |rhs_node| {
-                        try ownership.checkUseAfterFreeInExpr(self, &new_state, rhs_node, current_cfg);
-                        try ownership.markEscapedInExpr(self, &new_state, rhs_node, current_cfg);
-                        try ownership.recordOwnershipFromFieldAssign(self, &new_state, lhs_node, rhs_node, current_cfg);
-                        if (resource_calls.resolveResourceCall(self, rhs_node)) |call_info| {
+                        try Ownership.checkUseAfterFreeInExpr(self, &new_state, rhs_node, current_cfg);
+                        try Ownership.markEscapedInExpr(self, &new_state, rhs_node, current_cfg);
+                        try Ownership.recordOwnershipFromFieldAssign(self, &new_state, lhs_node, rhs_node, current_cfg);
+                        if (ResourceCalls.resolveResourceCall(self, rhs_node)) |call_info| {
                             switch (call_info.kind) {
                                 .alloc, .open => {
                                     if (self.source) |src| {
@@ -892,7 +892,7 @@ pub const AnalysisEngine = struct {
                                             const tags = tree.nodes.items(.tag);
                                             const datas = tree.nodes.items(.data);
                                             if (lhs_node < tags.len and tags[lhs_node] == .field_access) {
-                                                if (var_resolution.resolveVarIdFromExpr(self, lhs_node, current_cfg)) |field_var| {
+                                                if (VarResolution.resolveVarIdFromExpr(self, lhs_node, current_cfg)) |field_var| {
                                                     switch (call_info.kind) {
                                                         .alloc => try new_state.trackAllocation(field_var),
                                                         .open => try new_state.trackOpen(field_var),
@@ -900,9 +900,9 @@ pub const AnalysisEngine = struct {
                                                     }
                                                     const field_access_data = datas[lhs_node].node_and_token;
                                                     const base_node = @intFromEnum(field_access_data[0]);
-                                                    if (var_resolution.resolveVarIdFromExpr(self, base_node, current_cfg)) |container_var| {
+                                                    if (VarResolution.resolveVarIdFromExpr(self, base_node, current_cfg)) |container_var| {
                                                         try new_state.trackOwnership(field_var, container_var);
-                                                        try ownership.escapeOwnedFromFieldBase(self, &new_state, tree, base_node, container_var, field_var);
+                                                        try Ownership.escapeOwnedFromFieldBase(self, &new_state, tree, base_node, container_var, field_var);
                                                     }
                                                 }
                                             }
@@ -925,28 +925,28 @@ pub const AnalysisEngine = struct {
                 // The call node itself doesn't change the abstract state significantly,
                 // but the return value (if captured) would be unknown.
                 if (ir_node.ast_node) |ast_node| {
-                    if (resource_calls.resolveResourceCall(self, ast_node)) |call_info| {
+                    if (ResourceCalls.resolveResourceCall(self, ast_node)) |call_info| {
                         switch (call_info.kind) {
                             .free => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
-                                        const call_token = ownership.resolveCallToken(self, call_info.call_node);
+                                    if (VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                        const call_token = Ownership.resolveCallToken(self, call_info.call_node);
                                         try new_state.trackFree(var_id, call_token);
                                     }
                                 }
                             },
                             .free_owned => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
-                                        const call_token = ownership.resolveCallToken(self, call_info.call_node);
+                                    if (VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                        const call_token = Ownership.resolveCallToken(self, call_info.call_node);
                                         try new_state.trackFreeOwned(var_id, call_token);
                                     }
                                 }
                             },
                             .close => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
-                                        const call_token = ownership.resolveCallToken(self, call_info.call_node);
+                                    if (VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                        const call_token = Ownership.resolveCallToken(self, call_info.call_node);
                                         try new_state.trackClose(var_id, call_token);
                                     }
                                 }
@@ -954,29 +954,29 @@ pub const AnalysisEngine = struct {
                             else => {},
                         }
                         if (call_info.kind != .free and call_info.kind != .free_owned and call_info.kind != .close) {
-                            try ownership.checkUseAfterFreeInCall(self, &new_state, ast_node, current_cfg);
+                            try Ownership.checkUseAfterFreeInCall(self, &new_state, ast_node, current_cfg);
                         }
                     } else {
-                        try ownership.checkUseAfterFreeInCall(self, &new_state, ast_node, current_cfg);
+                        try Ownership.checkUseAfterFreeInCall(self, &new_state, ast_node, current_cfg);
                     }
-                    ownership.trackEscapesFromCall(self, &new_state, ast_node, current_cfg);
-                    try ownership.recordOwnershipFromCall(self, &new_state, ast_node, current_cfg);
+                    Ownership.trackEscapesFromCall(self, &new_state, ast_node, current_cfg);
+                    try Ownership.recordOwnershipFromCall(self, &new_state, ast_node, current_cfg);
 
                     // Check for assertion calls like testing.expect(x != null)
                     // and add non-null constraints for the asserted variables
-                    if (branch_constraints.extractAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
+                    if (BranchConstraints.extractAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
                         try new_state.addConstraint(constraint);
                     }
                 }
             },
             .defer_stmt => {
                 if (ir_node.ast_node) |ast_node| {
-                    try defer_scan.applyDeferredReleases(self, &new_state, ast_node, current_cfg);
+                    try DeferScan.applyDeferredReleases(self, &new_state, ast_node, current_cfg);
                 }
             },
             .errdefer_stmt => {
                 if (ir_node.ast_node) |ast_node| {
-                    try defer_scan.applyErrdeferredReleases(self, &new_state, ast_node, current_cfg);
+                    try DeferScan.applyErrdeferredReleases(self, &new_state, ast_node, current_cfg);
                 }
             },
             .ret => {
@@ -990,13 +990,13 @@ pub const AnalysisEngine = struct {
                             if (ast_node < data.len) {
                                 if (data[ast_node].opt_node.unwrap()) |ret_expr| {
                                     const ret_expr_idx = @intFromEnum(ret_expr);
-                                    try ownership.checkUseAfterFreeInExpr(self, &new_state, ret_expr_idx, current_cfg);
+                                    try Ownership.checkUseAfterFreeInExpr(self, &new_state, ret_expr_idx, current_cfg);
 
                                     // Fast path: expression that is definitely an error value
                                     if (isDefinitelyErrorExpr(tree, ret_expr_idx)) {
                                         new_state.setErrorState(.error_active);
                                     } else if (ret_expr_idx < tags.len and tags[ret_expr_idx] == .identifier) {
-                                        if (var_resolution.resolveDeclInfoFromIdentifier(self, ret_expr_idx, current_cfg)) |decl_info| {
+                                        if (VarResolution.resolveDeclInfoFromIdentifier(self, ret_expr_idx, current_cfg)) |decl_info| {
                                             if (decl_info.is_top_level) {
                                                 if (self.type_context) |type_ctx| {
                                                     if (type_ctx.getNodeType(decl_info.decl_node)) |ti| {
@@ -1013,11 +1013,9 @@ pub const AnalysisEngine = struct {
                                                     }
                                                 } else if (self.type_context) |type_ctx| {
                                                     if (error_info.init_node) |init_node| {
-                                                        if (init_node < tags.len and call_utils.isCallNode(tags[init_node])) {
-                                                            if (type_ctx.getExpressionTypeStrict(init_node)) |ti| {
-                                                                if (ti.kind == .error_union) {
-                                                                    new_state.setErrorState(.error_active);
-                                                                }
+                                                        if (type_ctx.getExpressionTypeStrict(init_node)) |ti| {
+                                                            if (ti.kind == .error_union) {
+                                                                new_state.setErrorState(.error_active);
                                                             }
                                                         }
                                                     }
@@ -1034,11 +1032,11 @@ pub const AnalysisEngine = struct {
                                         }
                                     }
 
-                                    if (var_resolution.resolveVarIdFromExpr(self, ret_expr_idx, current_cfg)) |var_id| {
+                                    if (VarResolution.resolveVarIdFromExpr(self, ret_expr_idx, current_cfg)) |var_id| {
                                         try new_state.trackEscapeOwned(var_id);
                                         new_state.trackEscape(var_id);
                                     }
-                                    try ownership.markEscapedInExpr(self, &new_state, ret_expr_idx, current_cfg);
+                                    try Ownership.markEscapedInExpr(self, &new_state, ret_expr_idx, current_cfg);
                                 }
                             }
                         }
@@ -1053,24 +1051,24 @@ pub const AnalysisEngine = struct {
             },
             .try_expr, .catch_expr => {
                 if (ir_node.ast_node) |ast_node| {
-                    try ownership.checkUseAfterFreeInExpr(self, &new_state, ast_node, current_cfg);
-                    ownership.trackEscapesInExpr(self, &new_state, ast_node, current_cfg);
+                    try Ownership.checkUseAfterFreeInExpr(self, &new_state, ast_node, current_cfg);
+                    Ownership.trackEscapesInExpr(self, &new_state, ast_node, current_cfg);
 
                     // Check for assertion calls wrapped in try (try testing.expect(...))
-                    if (branch_constraints.extractTryAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
+                    if (BranchConstraints.extractTryAssertionConstraint(self, ast_node, current_cfg)) |constraint| {
                         try new_state.addConstraint(constraint);
                     }
                 }
             },
             .expr => {
                 if (ir_node.ast_node) |ast_node| {
-                    try ownership.checkUseAfterFreeInExpr(self, &new_state, ast_node, current_cfg);
-                    ownership.trackEscapesInExpr(self, &new_state, ast_node, current_cfg);
+                    try Ownership.checkUseAfterFreeInExpr(self, &new_state, ast_node, current_cfg);
+                    Ownership.trackEscapesInExpr(self, &new_state, ast_node, current_cfg);
                 }
             },
             .fn_exit => {
                 if (current_cfg.fn_ast_node) |fn_node| {
-                    try ownership.escapeReturnedVars(self, &new_state, fn_node, current_cfg);
+                    try Ownership.escapeReturnedVars(self, &new_state, fn_node, current_cfg);
                 }
                 // Only record leaks at the exit of the top-level function, not inlined functions
                 if (new_state.getInlineDepth() == 0 and !new_state.isErrorPath()) {
@@ -1173,13 +1171,10 @@ pub const AnalysisEngine = struct {
     fn initNodeImpliesErrorUnion(tree: *const std.zig.Ast, init_node: u32) bool {
         const tags = tree.nodes.items(.tag);
         if (init_node >= tags.len) return false;
-        return switch (tags[init_node]) {
-            .error_value,
-            .@"try",
-            .@"catch",
-            => true,
-            else => false,
-        };
+        // `try` and `catch` produce their successful result values. Their
+        // expression types, rather than their syntax, determine whether a
+        // returned local still carries an error union.
+        return tags[init_node] == .error_value;
     }
 
     /// Get the count of pruned paths

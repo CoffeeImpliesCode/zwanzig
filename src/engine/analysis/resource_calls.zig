@@ -1,8 +1,10 @@
 const std = @import("std");
 const call_utils = @import("../../analysis/call_utils.zig");
 const allocator_utils = @import("../../analysis/allocator_utils.zig");
+const call_resolver = @import("../../analysis/call_resolver.zig");
+const import_resolver = @import("../../analysis/import_resolver.zig");
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         const ResourceCallKind = enum {
             alloc,
@@ -94,7 +96,6 @@ pub fn mixin(comptime _Engine: type) type {
                     return .{ .kind = kind, .target_expr = target_expr, .call_node = call_ast_node };
                 }
             }
-
             // Priority 2: Built-in heuristics (allocator methods)
             if (call_info.base_node) |base_node| {
                 if (allocator_utils.isAllocatorExpr(tree, self.type_context, base_node)) {
@@ -142,7 +143,9 @@ pub fn mixin(comptime _Engine: type) type {
             if (std.mem.eql(u8, call_info.method_name, "close")) {
                 if (first_arg == null) {
                     if (call_info.base_node) |base_node| {
-                        return .{ .kind = .close, .target_expr = base_node, .call_node = call_ast_node };
+                        if (isKnownResourceType(call_info.receiver_type)) {
+                            return .{ .kind = .close, .target_expr = base_node, .call_node = call_ast_node };
+                        }
                     }
                 }
                 if (call_info.fqn) |fqn| {
@@ -156,6 +159,22 @@ pub fn mixin(comptime _Engine: type) type {
             return null;
         }
 
+        fn isKnownResourceType(type_name: ?[]const u8) bool {
+            var name = type_name orelse return false;
+            while (name.len > 0 and (name[0] == '?' or name[0] == '*')) {
+                name = name[1..];
+            }
+            while (std.mem.startsWith(u8, name, "const ")) {
+                name = name["const ".len..];
+            }
+            while (std.mem.startsWith(u8, name, "volatile ")) {
+                name = name["volatile ".len..];
+            }
+            return std.mem.eql(u8, name, "std.fs.File") or
+                std.mem.eql(u8, name, "std.posix.fd_t") or
+                std.mem.eql(u8, name, "std.fs.Dir") or
+                std.mem.eql(u8, name, "std.fs.IterableDir");
+        }
         const ResourceReturnStatus = enum {
             unknown,
             resource,
@@ -206,32 +225,32 @@ pub fn mixin(comptime _Engine: type) type {
         }
 
         pub fn isKnownOpenBase(self: *_Engine, tree: *const std.zig.Ast, base_node: u32) bool {
-            _ = self;
-            const tags = tree.nodes.items(.tag);
-            const datas = tree.nodes.items(.data);
-            const token_tags = tree.tokens.items(.tag);
-            const main_tokens = tree.nodes.items(.main_token);
+            return isKnownOpenBaseDepth(self, tree, base_node, 0);
+        }
 
-            if (base_node >= tags.len) return false;
-            switch (tags[base_node]) {
+        fn isKnownOpenBaseDepth(self: *_Engine, tree: *const std.zig.Ast, base_node: u32, depth: u8) bool {
+            if (depth >= 16 or base_node >= tree.nodes.len) return false;
+            const source = self.source orelse return false;
+            const files = [_]import_resolver.File{.{ .path = source.getFilePath(), .tree = tree }};
+            const resolver = call_resolver.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+            const node: std.zig.Ast.Node.Index = @enumFromInt(base_node);
+            switch (tree.nodeTag(node)) {
                 .identifier => {
-                    const base_token = main_tokens[base_node];
-                    if (base_token >= token_tags.len or token_tags[base_token] != .identifier) return false;
-                    const base_name = tree.tokenSlice(base_token);
-                    return std.mem.eql(u8, base_name, "posix");
+                    const declaration = resolver.resolveDeclarationNode(base_node) orelse return false;
+                    const full = tree.fullVarDecl(@enumFromInt(declaration)) orelse return false;
+                    if (tree.tokenTag(full.ast.mut_token) != .keyword_const) return false;
+                    const init = full.ast.init_node.unwrap() orelse return false;
+                    return isKnownOpenBaseDepth(self, tree, @intFromEnum(init), depth + 1);
                 },
                 .field_access => {
-                    const field_access_data = datas[base_node].node_and_token;
-                    const base_expr = @intFromEnum(field_access_data[0]);
-                    const field_token = field_access_data[1];
-                    if (field_token >= token_tags.len or token_tags[field_token] != .identifier) return false;
-                    const field_name = tree.tokenSlice(field_token);
-                    if (!std.mem.eql(u8, field_name, "posix") and !std.mem.eql(u8, field_name, "fs")) return false;
-                    if (base_expr >= tags.len or tags[base_expr] != .identifier) return false;
-                    const base_token = main_tokens[base_expr];
-                    if (base_token >= token_tags.len or token_tags[base_token] != .identifier) return false;
-                    const base_name = tree.tokenSlice(base_token);
-                    return std.mem.eql(u8, base_name, "std");
+                    const access = tree.nodeData(node).node_and_token;
+                    const member = tree.tokenSlice(access[1]);
+                    if (!std.mem.eql(u8, member, "posix") and !std.mem.eql(u8, member, "fs")) return false;
+                    const base = @intFromEnum(access[0]);
+                    if (import_resolver.importPathFromBuiltinCall(tree, base)) |path| {
+                        return std.mem.eql(u8, path, "std");
+                    }
+                    return resolver.isVerifiedImportBinding(base, "std");
                 },
                 else => return false,
             }

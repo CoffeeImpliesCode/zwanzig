@@ -615,3 +615,98 @@ test "store_violations_engine detects double_free inside switch arm" {
     }
     try std.testing.expectEqual(@as(usize, 1), double_free_count);
 }
+
+fn expectStoreDiagnostics(code: [:0]const u8, expected: usize, message_fragment: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+    var type_ctx = TypeContext.init(allocator, &source);
+    defer type_ctx.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try StoreViolationsEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &type_ctx,
+    });
+    if (diagnostics.items.len != expected) {
+        for (diagnostics.items) |diagnostic| {
+            std.debug.print(
+                "store diagnostic at {d}:{d}: {s}\n",
+                .{
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.column,
+                    diagnostic.message,
+                },
+            );
+        }
+    }
+    try std.testing.expectEqual(expected, diagnostics.items.len);
+    for (diagnostics.items) |diagnostic| {
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, message_fragment) != null);
+    }
+}
+
+test "skript regression: allocator fields do not imply region ownership" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Context = struct { allocator: std.mem.Allocator };
+        \\fn frameView(ctx: *const Context) ![]u8 {
+        \\    const first = try std.fmt.allocPrint(ctx.allocator, "{d}", .{1});
+        \\    const second = try std.fmt.allocPrint(ctx.allocator, "{s}", .{first});
+        \\    return second;
+        \\}
+        \\fn leaks(allocator: std.mem.Allocator) !void {
+        \\    const leaked = try std.fmt.allocPrint(allocator, "{d}", .{1});
+        \\    _ = leaked;
+        \\}
+    ;
+
+    try expectStoreDiagnostics(code, 2, "resource leak");
+}
+
+test "skript regression: real error returns remain error paths" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn propagatesError(allocator: std.mem.Allocator) !void {
+        \\    const leaked = try std.fmt.allocPrint(allocator, "{d}", .{1});
+        \\    const failure = error.Failed;
+        \\    _ = leaked;
+        \\    return failure;
+        \\}
+    ;
+
+    try expectStoreDiagnostics(code, 0, "resource leak");
+}
+
+test "skript regression: close-like state methods are not resource closes" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Control = struct {
+        \\    const File = struct {
+        \\        fn close(_: File) void {}
+        \\        fn release(_: File) void {}
+        \\    };
+        \\    fn close(_: *Control) void {}
+        \\    fn release(_: *Control) void {}
+        \\};
+        \\fn cleanup(file: *Control) void {
+        \\    file.close();
+        \\    file.release();
+        \\}
+        \\fn cleanupValue(file: Control.File) void {
+        \\    file.close();
+        \\    file.release();
+        \\}
+        \\fn unsafeUse(file: std.fs.File) !void {
+        \\    file.close();
+        \\    _ = try file.stat();
+        \\}
+    ;
+
+    try expectStoreDiagnostics(code, 1, "use after close");
+}

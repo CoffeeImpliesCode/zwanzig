@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed false positives for imported namespace and file-struct aliases, private file-as-struct methods, parameter uses in nested expressions, and allocator cleanup identity. Explicit `const Name: type = ...` aliases and functions declared to return `type` use PascalCase. Comptime parameters referenced from fields or methods of returned anonymous containers count as used.
+- Fixed false positives for intentional catch fallback expressions and captured-error storage, while unrelated catch assignments remain reported as swallowed errors.
+- Fixed `sentinel-alloc` false positives when an untyped local directly infers the sentinel slice returned by the allocation.
+- Fixed project `unused-decl` false positives for method references through inline namespaces and nested type aliases.
+
 ## [0.15.1]
 
 ### Fixed

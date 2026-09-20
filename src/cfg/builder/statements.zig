@@ -8,7 +8,7 @@ const EdgeKind = graph.EdgeKind;
 const IrNode = graph.IrNode;
 const CfgNodeId = ids.CfgNodeId;
 
-pub fn mixin(comptime _Builder: type) type {
+pub fn Mixin(comptime _Builder: type) type {
     return struct {
         pub fn processBlock(
             self: *_Builder,
@@ -108,11 +108,11 @@ pub fn mixin(comptime _Builder: type) type {
                 if (ret_expr_idx < tags.len) {
                     const ret_expr_tag = tags[ret_expr_idx];
                     if (ret_expr_tag == .@"try") {
-                        return try _Builder.error_flow.processReturnWithTry(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
+                        return try _Builder.ErrorFlow.processReturnWithTry(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
                     } else if (ret_expr_tag == .@"catch") {
-                        return try _Builder.error_flow.processReturnWithCatch(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
+                        return try _Builder.ErrorFlow.processReturnWithCatch(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
                     } else if (ret_expr_tag == .@"switch" or ret_expr_tag == .switch_comma) {
-                        return try _Builder.switch_flow.processReturnWithSwitch(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
+                        return try _Builder.SwitchFlow.processReturnWithSwitch(self, cfg, source, ast_node, ret_expr_idx, prev_node, range);
                     }
                 }
             }
@@ -142,11 +142,11 @@ pub fn mixin(comptime _Builder: type) type {
                     if (init_idx < tags.len) {
                         const init_tag = tags[init_idx];
                         if (init_tag == .@"try") {
-                            return try _Builder.error_flow.processVarDeclWithTry(self, cfg, source, ast_node, init_idx, prev_node, range);
+                            return try _Builder.ErrorFlow.processVarDeclWithTry(self, cfg, source, ast_node, init_idx, prev_node, range);
                         } else if (init_tag == .@"catch") {
-                            return try _Builder.error_flow.processVarDeclWithCatch(self, cfg, source, ast_node, init_idx, prev_node, range);
+                            return try _Builder.ErrorFlow.processVarDeclWithCatch(self, cfg, source, ast_node, init_idx, prev_node, range);
                         } else if (init_tag == .@"switch" or init_tag == .switch_comma) {
-                            return try _Builder.switch_flow.processVarDeclWithSwitch(self, cfg, source, ast_node, init_idx, prev_node, range);
+                            return try _Builder.SwitchFlow.processVarDeclWithSwitch(self, cfg, source, ast_node, init_idx, prev_node, range);
                         }
                     }
                 }
@@ -155,7 +155,7 @@ pub fn mixin(comptime _Builder: type) type {
             // Simple var decl without try/catch in initializer
             // Annotate with type information if available
             var ir_node = IrNode.initFull(.var_decl, ast_node, range);
-            ir_node = _Builder.type_annotation.annotateWithType(self, ir_node, source, ast_node);
+            ir_node = _Builder.TypeAnnotation.annotateWithType(self, ir_node, source, ast_node);
 
             const decl_node = try cfg.addNode(ir_node);
             try cfg.addEdge(prev_node, decl_node);
@@ -182,11 +182,11 @@ pub fn mixin(comptime _Builder: type) type {
             if (rhs_idx < tags.len) {
                 const rhs_tag = tags[rhs_idx];
                 if (rhs_tag == .@"try") {
-                    return try _Builder.error_flow.processAssignWithTry(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
+                    return try _Builder.ErrorFlow.processAssignWithTry(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
                 } else if (rhs_tag == .@"catch") {
-                    return try _Builder.error_flow.processAssignWithCatch(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
+                    return try _Builder.ErrorFlow.processAssignWithCatch(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
                 } else if (rhs_tag == .@"switch" or rhs_tag == .switch_comma) {
-                    return try _Builder.switch_flow.processAssignWithSwitch(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
+                    return try _Builder.SwitchFlow.processAssignWithSwitch(self, cfg, source, ast_node, lhs_idx, rhs_idx, prev_node, range);
                 }
             }
 
