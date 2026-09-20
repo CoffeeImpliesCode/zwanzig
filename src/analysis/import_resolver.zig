@@ -261,6 +261,7 @@ pub fn importPathFromBuiltinToken(tree: *const std.zig.Ast, token: usize) ?[]con
 
 pub fn importResolvesToPath(importer_path: []const u8, import_path: []const u8, target_path: []const u8) bool {
     if (std.mem.eql(u8, import_path, target_path)) return true;
+    if (distinctPathLeaves(import_path, target_path)) return false;
 
     const importer_dir = std.fs.path.dirname(importer_path) orelse "";
     if (importer_dir.len == 0) return pathsEquivalent(import_path, target_path);
@@ -293,11 +294,23 @@ pub fn packageImportMayResolveToPath(import_path: []const u8, target_path: []con
 }
 
 pub fn pathsEquivalent(a: []const u8, b: []const u8) bool {
+    if (distinctPathLeaves(a, b)) return false;
     var a_buf: [std.fs.max_path_bytes]u8 = undefined;
     var b_buf: [std.fs.max_path_bytes]u8 = undefined;
     const normalized_a = normalizePath(&a_buf, a) catch return false;
     const normalized_b = normalizePath(&b_buf, b) catch return false;
     return std.mem.eql(u8, normalized_a, normalized_b);
+}
+
+fn distinctPathLeaves(a: []const u8, b: []const u8) bool {
+    // Match normalizePath's slash-only syntax on every host.
+    const a_leaf = std.fs.path.basenamePosix(a);
+    const b_leaf = std.fs.path.basenamePosix(b);
+    // Dot components can change the final segment during normalization.
+    if (a_leaf.len == 0 or b_leaf.len == 0) return false;
+    if (std.mem.eql(u8, a_leaf, ".") or std.mem.eql(u8, a_leaf, "..")) return false;
+    if (std.mem.eql(u8, b_leaf, ".") or std.mem.eql(u8, b_leaf, "..")) return false;
+    return !std.mem.eql(u8, a_leaf, b_leaf);
 }
 
 pub fn normalizePath(buffer: []u8, path: []const u8) ![]const u8 {
@@ -595,4 +608,16 @@ test "cyclic namespace imports still find reachable files" {
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "c.zig"));
     try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "missing.zig"));
     try std.testing.expect(fileUsingnamespaceImportsPath(&files, &first, "a.zig", "c.zig"));
+}
+
+test "import path comparisons preserve normalization and package precedence" {
+    try std.testing.expect(importResolvesToPath("src/main.zig", "../lib/value.zig", "lib/value.zig"));
+    try std.testing.expect(!importResolvesToPath("src/main.zig", "../lib/value.zig", "lib/other.zig"));
+    try std.testing.expect(importResolvesToPath("src/main.zig", "value.zig/.", "src/value.zig"));
+    try std.testing.expect(importResolvesToPath("src/main.zig", "value.zig/child/..", "src/value.zig"));
+    try std.testing.expect(pathsEquivalent("/src//value.zig", "src/value.zig"));
+    try std.testing.expect(pathsEquivalent("src/value.zig", "src/value.zig/"));
+    try std.testing.expect(pathsEquivalent("C:value.zig", "./C:value.zig"));
+    try std.testing.expect(!pathsEquivalent("src/value.zig", "other/value.zig"));
+    try std.testing.expect(importMayResolveToPath("src/main.zig", "module", "lib/module.zig"));
 }

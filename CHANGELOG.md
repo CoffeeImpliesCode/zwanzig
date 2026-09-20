@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `just build`, `just run`, and `just lint` now use ReleaseSafe to avoid Debug analysis overhead while retaining safety checks. Self-lint uses one worker.
+- Reduced repeated type resolution and import-path normalization during path-sensitive analysis, without lowering analysis limits or disabling runtime safety checks.
 
 ## [0.15.1]
 
