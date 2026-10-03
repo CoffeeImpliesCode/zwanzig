@@ -119,6 +119,7 @@ fn expectOptionalUnwrapDiagnosticLines(
     const allocator = std.testing.allocator;
     var source = Source.init(allocator, "skript-residual.zig", code);
     defer source.deinit();
+    _ = try source.requireZirBridge();
     var type_context = TypeContext.init(allocator, &source);
     defer type_context.deinit();
 
@@ -969,4 +970,466 @@ test "lazy initialization preserves explicit standard container types" {
         \\}
     ;
     try expectOptionalUnwrapDiagnosticLines(shadowed, &.{5});
+}
+
+test "long block assignments after statement 64 dominate optional unwraps" {
+    const code: [:0]const u8 =
+        "const State = struct { value: ?u32 };\n" ++
+        "fn read(state: *State) u32 {\n" ++
+        "    _ = 0;\n" ** 70 ++
+        "    state.value = 1;\n" ++
+        "    return state.value.?;\n" ++
+        "}\n";
+    try expectOptionalUnwrapDiagnosticLines(code, &.{});
+}
+
+test "long block mutations after statement 64 invalidate optional guards" {
+    const code: [:0]const u8 =
+        "const State = struct { value: ?u32 };\n" ++
+        "fn read(state: *State) u32 {\n" ++
+        "    state.value = 1;\n" ++
+        "    _ = 0;\n" ** 70 ++
+        "    state.value = null;\n" ++
+        "    return state.value.?;\n" ++
+        "}\n";
+    try expectOptionalUnwrapDiagnosticLines(code, &.{75});
+}
+
+test "verified std array list removal needs a dominating positive length" {
+    const code: [:0]const u8 =
+        \\const imported_std = @import("std");
+        \\const Holder = struct { list: imported_std.ArrayList(u8) = .empty };
+        \\
+        \\const Own = struct {
+        \\    items: []u8 = &.{},
+        \\    fn pop(self: *Own) ?u8 {
+        \\        if (self.items.len == 0) return null;
+        \\        return self.items[0];
+        \\    }
+        \\};
+        \\const OwnHolder = struct { own: Own = .{} };
+        \\
+        \\fn safeDrain(holder: *Holder) u8 {
+        \\    while (holder.list.items.len != 0) {
+        \\        const value = holder.list.pop().?;
+        \\        return value;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn drainLocal(gpa: imported_std.mem.Allocator) !u8 {
+        \\    var list: imported_std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 'a');
+        \\    while (list.items.len != 0) {
+        \\        const value = list.pop().?;
+        \\        return value;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn drainParam(list: *imported_std.ArrayList(u8)) u8 {
+        \\    while (list.items.len != 0) {
+        \\        const value = list.pop().?;
+        \\        return value;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn drainDerefParam(list: *imported_std.ArrayList(u8)) u8 {
+        \\    while (list.*.items.len != 0) {
+        \\        const value = list.*.pop().?;
+        \\        return value;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn nestedClearThenPop(holder: *Holder, cond: bool) u8 {
+        \\    while (holder.list.items.len != 0) {
+        \\        if (cond) {
+        \\            holder.list.clearRetainingCapacity();
+        \\            return holder.list.pop().?;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn nestedLoopSecondPop(holder: *Holder) u8 {
+        \\    var last: u8 = 0;
+        \\    while (holder.list.items.len != 0) {
+        \\        for ([_]usize{ 0, 1 }) |_| {
+        \\            last = holder.list.pop().?;
+        \\        }
+        \\    }
+        \\    return last;
+        \\}
+        \\
+        \\fn drainedByContinuePayload(list: *imported_std.ArrayList(u8)) u8 {
+        \\    while (list.items.len != 0) : ({
+        \\        list.clearRetainingCapacity();
+        \\        _ = list.pop().?;
+        \\    }) {
+        \\        _ = 1;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn aliasedRootPop(holder: *Holder) u8 {
+        \\    const alias = holder;
+        \\    while (holder.list.items.len != 0) {
+        \\        _ = alias.list.pop();
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn projectPop(holder: *OwnHolder) u8 {
+        \\    while (holder.own.items.len != 0) {
+        \\        return holder.own.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn foreignList(holder: *Holder, other: *Holder) u8 {
+        \\    while (other.list.items.len != 0) {
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn drainedBeforePop(holder: *Holder) u8 {
+        \\    while (holder.list.items.len != 0) {
+        \\        holder.list.clearRetainingCapacity();
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn shadowedImport() u8 {
+        \\    const std = struct {
+        \\        fn ArrayList(comptime T: type) type {
+        \\            return struct {
+        \\                items: []T = &.{},
+        \\                fn pop(self: *@This()) ?T {
+        \\                    _ = self;
+        \\                    return null;
+        \\                }
+        \\            };
+        \\        }
+        \\    };
+        \\    const Box = struct { list: std.ArrayList(u8) };
+        \\    var state = Box{ .list = .{} };
+        \\    while (state.list.items.len != 0) {
+        \\        return state.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 51, 61, 70, 81, 88, 95, 103, 123 });
+}
+
+test "a container root re-bound through a pointer alias still invalidates the length guard" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Holder = struct { list: std.ArrayList(u8) = .empty };
+        \\
+        \\fn localRootPointerAlias(gpa: std.mem.Allocator) !u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 'a');
+        \\    const alias: *std.ArrayList(u8) = &list;
+        \\    while (list.items.len != 0) {
+        \\        alias.clearRetainingCapacity();
+        \\        return list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn transitiveAlias(holder: *Holder) u8 {
+        \\    const first = holder;
+        \\    const second = first;
+        \\    const third = second;
+        \\    while (holder.list.items.len != 0) {
+        \\        third.list.clearRetainingCapacity();
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn reboundAlias(holder: *Holder, other: *Holder) u8 {
+        \\    var alias = other;
+        \\    while (holder.list.items.len != 0) {
+        \\        alias = holder;
+        \\        alias.list.clearRetainingCapacity();
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn valueCopyKeepsItsOwnLength(gpa: std.mem.Allocator) !u8 {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(gpa, 'a');
+        \\    var copy = list;
+        \\    while (list.items.len != 0) {
+        \\        copy.clearRetainingCapacity();
+        \\        return list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\const PointerHolder = struct { list: *std.ArrayList(u8) };
+        \\
+        \\fn pointerFieldCopyStaysAlias(holder: *PointerHolder) u8 {
+        \\    var copy = holder.list;
+        \\    while (holder.list.items.len != 0) {
+        \\        copy.clearRetainingCapacity();
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+        \\fn laterRebindDoesNotAliasEarlierWrite(holder: *Holder, other: *Holder) u8 {
+        \\    const stale = other;
+        \\    var rebound = other;
+        \\    while (holder.list.items.len != 0) {
+        \\        stale.list.clearRetainingCapacity();
+        \\        rebound = holder;
+        \\        return holder.list.pop().?;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 10, 21, 31, 53 });
+}
+
+test "a field nulled inside the use loop stays an unsafe unwrap" {
+    const code: [:0]const u8 =
+        \\const Spec = struct { view: ?u32 = null };
+        \\
+        \\fn publish(specs: []Spec, out: []u32) void {
+        \\    for (specs) |spec| {
+        \\        const view = spec.view orelse return;
+        \\        _ = view;
+        \\    }
+        \\    for (specs) |*spec| {
+        \\        spec.view = null;
+        \\        out[0] = spec.view.?;
+        \\    }
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{10});
+}
+
+test "a deferred body cannot invalidate a fact before it runs" {
+    const code: [:0]const u8 =
+        \\const Context = struct {};
+        \\const RootProvider = struct { context: ?*Context = null };
+        \\const Store = struct {
+        \\    provider: ?*RootProvider = null,
+        \\    fn register(self: *Store, provider: *RootProvider) !void {
+        \\        self.provider = provider;
+        \\    }
+        \\};
+        \\const ValueRoot = struct {
+        \\    provider: ?RootProvider = null,
+        \\    context: Context = .{},
+        \\    fn register(self: *ValueRoot, store: *Store) !void {
+        \\        self.provider = .{ .context = &self.context };
+        \\        errdefer self.provider = null;
+        \\        try store.register(&self.provider.?);
+        \\    }
+        \\};
+        \\fn unwindsBeforeRegistration(root: *ValueRoot, store: *Store) !void {
+        \\    root.provider = .{ .context = &root.context };
+        \\    errdefer root.provider = null;
+        \\    try store.register(&root.provider.?);
+        \\}
+        \\fn nulledBeforeTheUnwrap(root: *ValueRoot) void {
+        \\    root.provider = .{ .context = &root.context };
+        \\    errdefer root.provider = null;
+        \\    root.provider = null;
+        \\    _ = root.provider.?;
+        \\}
+        \\fn innerScopeDeferAlreadyRan(root: *ValueRoot, take: bool) void {
+        \\    root.provider = .{ .context = &root.context };
+        \\    if (take) {
+        \\        defer root.provider = null;
+        \\    }
+        \\    _ = root.provider.?;
+        \\}
+        \\fn loopScopeDeferRanOnAnEarlierIteration(root: *ValueRoot, take: bool) void {
+        \\    root.provider = .{ .context = &root.context };
+        \\    var running = take;
+        \\    while (running) {
+        \\        defer root.provider = null;
+        \\        running = false;
+        \\    }
+        \\    _ = root.provider.?;
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 27, 34, 43 });
+}
+
+test "a deferred body outlives the assignment of a lazy-init branch" {
+    const code: [:0]const u8 =
+        \\const State = struct { field: ?u32 = null };
+        \\fn clear(state: *State) void {
+        \\    state.field = null;
+        \\}
+        \\fn deferredBranchWrite(state: *State) u32 {
+        \\    if (state.field == null) {
+        \\        defer state.field = null;
+        \\        state.field = 1;
+        \\    }
+        \\    return state.field.?;
+        \\}
+        \\fn deferredBranchLonger(state: *State, log: *u32) u32 {
+        \\    if (state.field == null) {
+        \\        defer state.field = null;
+        \\        log.* = 1;
+        \\        state.field = 2;
+        \\    }
+        \\    return state.field.?;
+        \\}
+        \\fn deferredAliasWrite(state: *State) u32 {
+        \\    if (state.field == null) {
+        \\        const alias = state;
+        \\        defer alias.field = null;
+        \\        state.field = 3;
+        \\    }
+        \\    return state.field.?;
+        \\}
+        \\fn deferredCalleeWrite(state: *State) u32 {
+        \\    if (state.field == null) {
+        \\        defer clear(state);
+        \\        state.field = 4;
+        \\    }
+        \\    return state.field.?;
+        \\}
+        \\fn errdeferredBranchWrite(state: *State) u32 {
+        \\    if (state.field == null) {
+        \\        errdefer state.field = null;
+        \\        state.field = 5;
+        \\    }
+        \\    return state.field.?;
+        \\}
+        \\fn unrelatedDeferredWrite(state: *State) u32 {
+        \\    var scratch: u32 = 0;
+        \\    if (state.field == null) {
+        \\        defer scratch = 0;
+        \\        state.field = 6;
+        \\    }
+        \\    return state.field.? + scratch;
+        \\}
+        \\fn earlierNullOverwritten(state: *State) u32 {
+        \\    if (state.field == null) {
+        \\        state.field = null;
+        \\        state.field = 7;
+        \\    }
+        \\    return state.field.?;
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 10, 18, 26, 33 });
+}
+
+test "a call that runs only after its own unwrap keeps the unwrap proven" {
+    const code: [:0]const u8 =
+        \\const Pending = struct {
+        \\    target: u32 = 0,
+        \\    inline_values: [4]u32 = .{ 0, 0, 0, 0 },
+        \\    fn args(self: *@This()) []const u32 {
+        \\        return self.inline_values[0..];
+        \\    }
+        \\};
+        \\const Fiber = struct {
+        \\    pending: ?Pending = null,
+        \\    fn clearPending(self: *Fiber) void {
+        \\        if (self.pending == null) return;
+        \\        self.pending = null;
+        \\    }
+        \\};
+        \\fn identity(value: u32) u32 {
+        \\    return value;
+        \\}
+        \\fn pick(flag: void, value: u32) u32 {
+        \\    _ = flag;
+        \\    return value;
+        \\}
+        \\fn receiverCallAfterPriorUnwrap(fiber: *Fiber) []const u32 {
+        \\    const target = fiber.pending.?.target;
+        \\    _ = target;
+        \\    return (&fiber.pending.?).args();
+        \\}
+        \\fn assignmentProvesReceiverCall(fiber: *Fiber) []const u32 {
+        \\    fiber.pending = .{ .target = 1 };
+        \\    return (&fiber.pending.?).args();
+        \\}
+        \\fn receiverCallAfterClearing(fiber: *Fiber) []const u32 {
+        \\    const target = fiber.pending.?.target;
+        \\    _ = target;
+        \\    fiber.clearPending();
+        \\    return (&fiber.pending.?).args();
+        \\}
+        \\fn receiverCallAfterNulling(fiber: *Fiber) []const u32 {
+        \\    fiber.pending = .{ .target = 1 };
+        \\    fiber.pending = null;
+        \\    return (&fiber.pending.?).args();
+        \\}
+        \\fn siblingCallBeforeTheUnwrapStillCounts(fiber: *Fiber) u32 {
+        \\    fiber.pending = .{ .target = 1 };
+        \\    const value = pick(fiber.clearPending(), fiber.pending.?.target);
+        \\    _ = value;
+        \\    return 0;
+        \\}
+        \\fn nestedCallWrapsTheUnwrap(fiber: *Fiber) u32 {
+        \\    fiber.pending = .{ .target = 1 };
+        \\    return identity(fiber.pending.?.target);
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 23, 32, 35, 40, 44 });
+}
+
+test "reassigning an alias slot preserves only the independently stored optional" {
+    const code: [:0]const u8 =
+        \\const State = struct { value: ?u32 = null };
+        \\fn independentAliasRebind(primary: *State, other: *State) u32 {
+        \\    primary.value = 3;
+        \\    var alias = primary;
+        \\    alias = other;
+        \\    return primary.value.?;
+        \\}
+        \\fn ownRootRebound(primary: *State, other: *State) u32 {
+        \\    var state = primary;
+        \\    state.value = 3;
+        \\    state = other;
+        \\    return state.value.?;
+        \\}
+        \\fn aliasedWriteStillInvalidates(primary: *State) u32 {
+        \\    primary.value = 3;
+        \\    const alias = primary;
+        \\    alias.value = null;
+        \\    return primary.value.?;
+        \\}
+        \\fn change(primary: *State, other: *State) *State {
+        \\    primary.value = null;
+        \\    return other;
+        \\}
+        \\fn rhsMutationStillInvalidates(primary: *State, other: *State) u32 {
+        \\    primary.value = 3;
+        \\    var alias = primary;
+        \\    alias = change(primary, other);
+        \\    return primary.value.?;
+        \\}
+        \\fn priorUnwrapSurvivesValueAssignment(primary: *State) u32 {
+        \\    var value = if (primary.value) |present| present else 0;
+        \\    value = primary.value.?;
+        \\    return primary.value.?;
+        \\}
+    ;
+
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 12, 18, 28, 32 });
 }

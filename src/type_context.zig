@@ -277,10 +277,10 @@ pub const TypeContext = struct {
         use_known_methods: bool,
         use_cache: bool,
     ) ?TypeInfo {
-        var statements: [ast_walk.max_block_statements]u32 = undefined;
-        const count = ast_walk.getBlockStatements(tree, block_node, &statements) orelse return null;
+        var inline_statements: [2]u32 = undefined;
+        const statements = ast_walk.getBlockStatements(tree, block_node, &inline_statements) orelse return null;
         var result: ?TypeInfo = null;
-        for (statements[0..count]) |statement| {
+        for (statements) |statement| {
             if (isTerminatingExpression(tree, statement)) return null;
             result = self.getExpressionTypeInternal(statement, use_known_methods, use_cache);
         }
