@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Syntax errors now produce `parse-error` diagnostics without stopping analysis of valid sibling files. Failed type preflight reports `frontend-error`, skips required typed checks, and preserves optional AST fallback.
+- Fixed missed divide-by-zero and unreachable-branch diagnostics under supported integer and immutable scalar guards. Floating-point and wider integer domains remain conservative. Function summaries now preserve both success and error paths, including pending caller errors.
+- Fixed state limits across call contexts. Analysis now warns and stops an incomplete function run instead of exceeding the cap. Independent constant-condition checks still report.
+- Fixed thread-limit and shutdown behavior on both frontends. `--threads` includes the calling thread, and executor shutdown waits for submitted work.
+- Fixed analysis ownership and allocation-failure handling, warm-cache declaration annotations, and reference lookup through valid alias cycles. Malformed source no longer enters semantic indexes.
+- Fixed false `unused-decl` reports for contextual constants such as `.empty` in typed initializers, assignments, and returns, without hiding unused constants in unrelated containers.
+- Fixed false project-wide `unused-decl` reports caused by missing references in malformed source or build files. Per-file checks still run on valid sibling files.
 - The default macOS development shell now uses Zig 0.16.0, avoiding the Zig 0.15.2 toolchain failure with current SDKs while retaining an explicit compatibility shell for the older frontend. (#81)
 - Fixed false positives for imported namespace and file-struct aliases, private file-as-struct methods, parameter uses in nested expressions, and allocator cleanup identity. Explicit `const Name: type = ...` aliases and functions declared to return `type` use PascalCase. Comptime parameters referenced from fields or methods of returned anonymous containers count as used.
 - Fixed false positives for intentional catch fallback expressions and captured-error storage, while unrelated catch assignments remain reported as swallowed errors.
@@ -20,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Enabled checks now control type preflight and project preparation. Compatible checkers reuse per-file analysis, while `empty-catch-engine` runs only structural checks unless state visualizations are requested. Analysis statistics count actual engine runs.
 - `just build`, `just run`, and `just lint` now use ReleaseSafe to avoid Debug analysis overhead while retaining safety checks. Self-lint uses one worker.
 - Reduced repeated type resolution and import-path normalization during path-sensitive analysis, without lowering analysis limits or disabling runtime safety checks.
 

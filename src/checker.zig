@@ -21,6 +21,12 @@ pub const Cfg = cfg_mod.Cfg;
 pub const CfgBuilder = cfg_mod.CfgBuilder;
 pub const CfgError = cfg_mod.CfgError;
 pub const CachedArtifacts = cached_artifacts_mod.CachedArtifacts;
+const analysis_cache_mod = @import("analysis_cache.zig");
+pub const AnalysisCache = analysis_cache_mod.AnalysisCache;
+pub const AnalysisMode = analysis_cache_mod.AnalysisMode;
+pub const AnalysisHandle = analysis_cache_mod.AnalysisHandle;
+
+pub const TypeRequirement = enum { none, optional, required };
 
 pub const AnalysisStats = struct {
     total_runs: u64 = 0,
@@ -89,6 +95,8 @@ pub const CheckerContext = struct {
     config: ?*const Config = null,
     /// Cached CFG artifacts for this source (optional, not owned).
     cached_artifacts: ?*CachedArtifacts = null,
+    /// Per-file analysis cache. Destroy it before the source, CFGs, and type context.
+    analysis_cache: ?*AnalysisCache = null,
     /// Directory to dump CFG DOT files for visualization.
     /// When set, checkers write CFG DOT files to this directory.
     dump_cfg_dir: ?[]const u8 = null,
@@ -159,29 +167,36 @@ pub const CheckerContext = struct {
         if (self.cached_artifacts) |artifacts| {
             const fn_index = ids.astIndex(fn_node);
             if (artifacts.getCfg(fn_index)) |cfg_ptr| {
-                return .{ .cfg = cfg_ptr, .owned = false, .allocator = allocator };
+                return .{ .cfg = cfg_ptr, .owned = false, .allocator = artifacts.allocator };
             }
         }
 
-        var builder = self.createCfgBuilder(allocator);
-        const cfg_opt = try builder.buildFromFn(source, fn_node);
-        if (cfg_opt) |cfg_value| {
-            const cfg_ptr = try allocator.create(Cfg);
-            cfg_ptr.* = cfg_value;
+        const cfg_allocator = if (self.cached_artifacts) |artifacts| artifacts.allocator else allocator;
+        var builder = self.createCfgBuilder(cfg_allocator);
+        var cfg_value = (try builder.buildFromFn(source, fn_node)) orelse return null;
+        errdefer cfg_value.deinit();
+        const cfg_ptr = try cfg_allocator.create(Cfg);
+        errdefer cfg_allocator.destroy(cfg_ptr);
+        cfg_ptr.* = cfg_value;
 
-            if (self.cached_artifacts) |artifacts| {
-                const fn_index = ids.astIndex(fn_node);
-                artifacts.addCfg(fn_index, cfg_ptr) catch |err| {
-                    cfg_ptr.deinit();
-                    allocator.destroy(cfg_ptr);
-                    return err;
-                };
-                return .{ .cfg = cfg_ptr, .owned = false, .allocator = allocator };
-            }
-
-            return .{ .cfg = cfg_ptr, .owned = true, .allocator = allocator };
+        if (self.cached_artifacts) |artifacts| {
+            try artifacts.addCfg(ids.astIndex(fn_node), cfg_ptr);
+            return .{ .cfg = cfg_ptr, .owned = false, .allocator = cfg_allocator };
         }
-        return null;
+        return .{ .cfg = cfg_ptr, .owned = true, .allocator = cfg_allocator };
+    }
+
+    /// Lease an analysis result until deinit. Graph states must not be changed;
+    /// lazy engine query caches may grow while the handle is checked out.
+    pub fn getOrAnalyze(
+        self: *const CheckerContext,
+        allocator: std.mem.Allocator,
+        source: *Source,
+        cfg_handle: *const CfgHandle,
+        checker_name: []const u8,
+        mode: AnalysisMode,
+    ) std.mem.Allocator.Error!AnalysisHandle {
+        return analysis_cache_mod.getOrAnalyze(self, allocator, source, cfg_handle, checker_name, mode);
     }
 };
 
@@ -218,6 +233,9 @@ pub const Checker = struct {
     /// Default severity for diagnostics emitted by this checker
     default_severity: Severity = .err,
 
+    /// Whether this checker can run without frontend type information.
+    type_requirement: TypeRequirement = .optional,
+
     /// Hook called after AST parsing to perform syntax-level analysis.
     /// Checkers can examine the full AST and emit diagnostics for detected issues.
     ///
@@ -242,6 +260,13 @@ pub const Checker = struct {
         context: CheckerContext,
     ) CheckerError!void {
         if (self.checkAstFn) |f| {
+            if (self.type_requirement == .required) {
+                const type_context = context.type_context orelse return;
+                type_context.ensureAvailable() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ParseError, error.AstGenFailed, error.InvalidAst => return,
+                };
+            }
             try f(source, allocator, diagnostics, context);
         }
     }
@@ -460,6 +485,56 @@ test "Checker with checkAstFn" {
     try std.testing.expectEqualStrings("Test diagnostic", diagnostics.items[0].message);
 }
 
+test "Checker required type dispatch skips frontend failures and propagates OOM" {
+    const Probe = struct {
+        fn check(
+            _: *Source,
+            _: std.mem.Allocator,
+            _: *std.ArrayList(Diagnostic),
+            _: CheckerContext,
+        ) CheckerError!void {
+            return error.Overflow;
+        }
+    };
+    const allocator = std.testing.allocator;
+    var checker: Checker = .{
+        .name = "required-probe",
+        .type_requirement = .required,
+        .checkAstFn = Probe.check,
+    };
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var source = Source.init(allocator, "required.zig", "fn foo() void {}");
+    defer source.deinit();
+    try checker.checkAst(&source, allocator, &diagnostics, .{ .build_metadata = null });
+    var types = TypeContext.init(allocator, &source);
+    defer types.deinit();
+    try std.testing.expectError(error.Overflow, checker.checkAst(&source, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &types,
+    }));
+
+    var invalid = Source.init(allocator, "invalid.zig", "fn broken( {");
+    defer invalid.deinit();
+    var invalid_types = TypeContext.init(allocator, &invalid);
+    defer invalid_types.deinit();
+    const invalid_context: CheckerContext = .{ .build_metadata = null, .type_context = &invalid_types };
+    try checker.checkAst(&invalid, allocator, &diagnostics, invalid_context);
+    checker.type_requirement = .optional;
+    try std.testing.expectError(error.Overflow, checker.checkAst(&invalid, allocator, &diagnostics, invalid_context));
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var starved = Source.init(failing.allocator(), "oom.zig", "fn foo() void {}");
+    defer starved.deinit();
+    var starved_types = TypeContext.init(failing.allocator(), &starved);
+    defer starved_types.deinit();
+    checker.type_requirement = .required;
+    try std.testing.expectError(error.OutOfMemory, checker.checkAst(&starved, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &starved_types,
+    }));
+}
+
 test "CheckerManager registration and lookup" {
     const allocator = std.testing.allocator;
 
@@ -633,6 +708,35 @@ test "CheckerContext reuses cached CFGs across callers" {
     try testing.expect(handle1.cfg == handle2.cfg);
 
     try testing.expect(artifacts.getCfg(ids.astIndex(fn_node)) != null);
+}
+
+test "CheckerContext CFG construction releases allocation failures" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "cfg-oom.zig", "fn foo() void {}");
+    defer source.deinit();
+    const tree = try source.ast();
+    const fn_node = ids.astId(@intFromEnum(tree.rootDecls()[0]));
+    try std.testing.checkAllAllocationFailures(allocator, testCfgAllocationFailure, .{ &source, fn_node, false });
+    try std.testing.checkAllAllocationFailures(allocator, testCfgAllocationFailure, .{ &source, fn_node, true });
+}
+
+fn testCfgAllocationFailure(
+    allocator: std.mem.Allocator,
+    source: *Source,
+    fn_node: ids.AstNodeId,
+    use_artifacts: bool,
+) !void {
+    var artifacts = CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    const context: CheckerContext = .{
+        .build_metadata = null,
+        .cached_artifacts = if (use_artifacts) &artifacts else null,
+    };
+    var cfg = (try context.getOrBuildCfg(allocator, source, fn_node)) orelse
+        return error.TestUnexpectedResult;
+    defer cfg.deinit();
+    try std.testing.expectEqual(cfg_mod.IrTag.fn_entry, cfg.cfg.getNode(cfg.cfg.entry).?.ir_node.tag);
+    try std.testing.expectEqual(cfg_mod.IrTag.fn_exit, cfg.cfg.getNode(cfg.cfg.exit).?.ir_node.tag);
 }
 
 test "CheckerManagerWithRules mixed registration" {

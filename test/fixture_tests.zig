@@ -108,6 +108,7 @@ test "shadowed_variable fixtures" {
 test "project-wide unused declarations" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -127,6 +128,7 @@ test "project-wide unused declarations" {
 test "project-wide unused declarations ignore duplicate names and paths" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -147,6 +149,7 @@ test "project-wide unused declarations ignore duplicate names and paths" {
 test "project-wide unused declarations ignore public aliases" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -166,6 +169,7 @@ test "project-wide unused declarations ignore public aliases" {
 test "project-wide unused declarations follow public API surfaces" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -185,6 +189,7 @@ test "project-wide unused declarations follow public API surfaces" {
 test "project-wide unused declarations ignore package API entrypoints" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -202,27 +207,10 @@ test "project-wide unused declarations ignore package API entrypoints" {
     try std.testing.expect(std.mem.indexOf(u8, analyzer.diagnostics.items[0].message, "hiddenUnused") != null);
 }
 
-test "project-wide unused declarations ignore package usingnamespace entrypoints" {
-    var analyzer = src.Analyzer.init(std.testing.allocator);
-    defer analyzer.deinit();
-
-    const allowlist = [_][]const u8{"unused-decl"};
-    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
-
-    const files = [_][]const u8{
-        "test/fixtures/project_unused_decl/usingnamespace_pkg/build.zig",
-        "test/fixtures/project_unused_decl/usingnamespace_pkg/src/lib.zig",
-        "test/fixtures/project_unused_decl/usingnamespace_pkg/src/public_api.zig",
-    };
-    try analyzer.prepareProject(&files);
-    try analyzer.analyzeProjectUnusedDecls();
-
-    try std.testing.expectEqual(@as(usize, 0), analyzer.diagnostics.items.len);
-}
-
 test "project-wide unused declarations follow transitive conditional API closure" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -249,6 +237,7 @@ test "project-wide unused declarations follow transitive conditional API closure
 test "project-wide unused declarations terminate on public alias cycles" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -273,6 +262,7 @@ test "project-wide unused declarations terminate on public alias cycles" {
 test "project-wide unused declarations use build root source file" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -294,6 +284,7 @@ test "project-wide unused declarations use build root source file" {
 test "project-wide unused declarations ignore duplicate-only inputs" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -311,6 +302,7 @@ test "project-wide unused declarations ignore duplicate-only inputs" {
 test "project-wide unused declarations follow typed receiver calls" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -329,6 +321,7 @@ test "project-wide unused declarations follow typed receiver calls" {
 test "project-wide unused declarations follow nested namespace chains" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -347,6 +340,7 @@ test "project-wide unused declarations follow nested namespace chains" {
 test "project-wide unused declarations follow result-location method calls" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -365,6 +359,7 @@ test "project-wide unused declarations follow result-location method calls" {
 test "project-wide unused declarations normalize quoted identifiers" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -383,6 +378,7 @@ test "project-wide unused declarations normalize quoted identifiers" {
 test "project-wide unused declarations ignore externally visible and special public declarations" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -400,6 +396,7 @@ test "project-wide unused declarations ignore externally visible and special pub
 test "project-wide unused declarations ignore unrelated field accesses" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -420,6 +417,7 @@ test "project-wide unused declarations ignore unrelated field accesses" {
 test "project-wide unused declarations follow nested public API surfaces" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -438,6 +436,7 @@ test "project-wide unused declarations follow nested public API surfaces" {
 test "project-wide unused declarations follow tagged union public API surfaces" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -456,6 +455,7 @@ test "project-wide unused declarations follow tagged union public API surfaces" 
 test "project-wide unused declarations count same-file function body references" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -473,6 +473,7 @@ test "project-wide unused declarations count same-file function body references"
 test "project-wide unused declarations report public constants copied from values" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -489,9 +490,10 @@ test "project-wide unused declarations report public constants copied from value
     try std.testing.expect(std.mem.indexOf(u8, analyzer.diagnostics.items[1].message, "DefaultLimit") != null);
 }
 
-test "project-wide unused declarations follow usingnamespace bare references" {
+test "malformed project sources report syntax errors without public non-use claims" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -499,17 +501,25 @@ test "project-wide unused declarations follow usingnamespace bare references" {
     const files = [_][]const u8{
         "test/fixtures/project_unused_decl/usingnamespace_main.zig",
         "test/fixtures/project_unused_decl/usingnamespace_api.zig",
+        "test/fixtures/project_unused_decl/main.zig",
+        "test/fixtures/project_unused_decl/api.zig",
     };
     try analyzer.prepareProject(&files);
+    try analyzer.analyzeFile(files[0]);
     try analyzer.analyzeProjectUnusedDecls();
 
-    try std.testing.expectEqual(@as(usize, 1), analyzer.diagnostics.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, analyzer.diagnostics.items[0].message, "unused") != null);
+    for (analyzer.diagnostics.items) |diagnostic| {
+        try std.testing.expectEqualStrings(files[0], diagnostic.file_path);
+        try std.testing.expectEqualStrings("parse-error", diagnostic.rule_id);
+        try std.testing.expectEqual(src.Severity.err, diagnostic.severity);
+    }
+    try std.testing.expect(analyzer.diagnostics.items.len != 0);
 }
 
 test "project-wide unused declarations classify error sets as types" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });
@@ -528,6 +538,7 @@ test "project-wide unused declarations classify error sets as types" {
 test "project-wide unused declarations honor suppressions" {
     var analyzer = src.Analyzer.init(std.testing.allocator);
     defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
 
     const allowlist = [_][]const u8{"unused-decl"};
     analyzer.setRuleFilter(.{ .allowlist = &allowlist });

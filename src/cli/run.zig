@@ -59,8 +59,14 @@ fn analyzeFilesParallel(
     if (files.len == 0) return;
 
     const results = try allocator.alloc(?AnalysisResult, files.len);
-    defer allocator.free(results);
     @memset(results, null);
+    defer {
+        // The executor's later defer drains tasks before these slots are inspected.
+        for (results) |*slot| {
+            if (slot.*) |*result| result.deinit(analyzer.allocator);
+        }
+        allocator.free(results);
+    }
 
     const errors = try allocator.alloc(?anyerror, files.len);
     defer allocator.free(errors);
@@ -332,6 +338,101 @@ pub fn runParsed(allocator: std.mem.Allocator, cli_args: CliArgs, io_context: *c
 
     if (analyzer.hasDiagnostics()) {
         std.process.exit(1);
+    }
+}
+
+test "analyzeFilesParallel releases results across allocation failure boundaries" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const DupeImportRule = @import("../rules/dupe_import.zig").DupeImportRule;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    const content =
+        \\const first = @import("std");
+        \\const second = @import("std");
+    ;
+    try temp_dir.writeFile("first.zig", content);
+    try temp_dir.writeFile("second.zig", content);
+    var first_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const first_path = try std.fmt.bufPrint(
+        &first_path_buffer,
+        "{s}/first.zig",
+        .{temp_dir.path()},
+    );
+    var second_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const second_path = try std.fmt.bufPrint(
+        &second_path_buffer,
+        "{s}/second.zig",
+        .{temp_dir.path()},
+    );
+    const files = [_][]const u8{ first_path, second_path };
+
+    var reference = Analyzer.initWithContext(allocator, &io_context);
+    defer reference.deinit();
+    try reference.registerRule(&DupeImportRule.rule);
+    try reference.analyzeFile(first_path);
+    try testing.expectEqual(@as(usize, 1), reference.diagnostics.items.len);
+
+    const cases = [_]struct {
+        fail_after: ?usize,
+        merge_capacity: usize,
+        retained_diagnostics: usize,
+    }{
+        // Each worker allocates one message and one result list. Let one finish,
+        // then fail the other worker's list insertion after its message clone.
+        .{ .fail_after = 3, .merge_capacity = 1, .retained_diagnostics = 1 },
+        // Both workers finish, but neither result can be merged.
+        .{ .fail_after = 4, .merge_capacity = 0, .retained_diagnostics = 0 },
+        // The first result moves to Analyzer before the second merge fails.
+        .{ .fail_after = 4, .merge_capacity = 1, .retained_diagnostics = 1 },
+        .{ .fail_after = null, .merge_capacity = 0, .retained_diagnostics = 2 },
+    };
+    for (cases) |case| {
+        var persistent = testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+        var buffers = testing.FailingAllocator.init(allocator, .{});
+        {
+            var analyzer = Analyzer.initWithContext(persistent.allocator(), &io_context);
+            defer analyzer.deinit();
+            try analyzer.registerRule(&DupeImportRule.rule);
+            try analyzer.diagnostics.ensureTotalCapacityPrecise(
+                analyzer.allocator,
+                case.merge_capacity,
+            );
+            if (case.fail_after) |count| persistent.fail_index = persistent.alloc_index + count;
+
+            // Neither FailingAllocator is thread-safe; use one analysis worker.
+            const outcome = analyzeFilesParallel(
+                &analyzer,
+                &files,
+                1,
+                buffers.allocator(),
+                &io_context,
+            );
+            if (case.fail_after != null) {
+                try testing.expectError(error.OutOfMemory, outcome);
+                try testing.expect(persistent.has_induced_failure);
+            } else {
+                try outcome;
+            }
+            try testing.expectEqual(case.retained_diagnostics, analyzer.diagnostics.items.len);
+            for (analyzer.diagnostics.items) |diagnostic| {
+                try testing.expect(
+                    std.mem.eql(u8, diagnostic.file_path, first_path) or
+                        std.mem.eql(u8, diagnostic.file_path, second_path),
+                );
+                try testing.expectEqualStrings(
+                    reference.diagnostics.items[0].message,
+                    diagnostic.message,
+                );
+                try testing.expectEqualStrings("dupe-import", diagnostic.rule_id);
+                try testing.expectEqual(@as(usize, 2), diagnostic.range.start.line);
+            }
+        }
+        // Check both allocator domains, including diagnostics already moved to Analyzer.
+        try testing.expectEqual(persistent.allocated_bytes, persistent.freed_bytes);
+        try testing.expectEqual(buffers.allocated_bytes, buffers.freed_bytes);
     }
 }
 

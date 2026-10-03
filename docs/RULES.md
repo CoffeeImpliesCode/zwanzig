@@ -94,6 +94,8 @@ Detects unused container-level `const`, `var`, and `fn` declarations that aren't
 When `unused-decl` is enabled and more than one file is analyzed, zwanzig also runs a project pass over all analyzed files. That pass reports public top-level declarations that are not referenced by any other analyzed file, while ignoring `build.zig`'s `build` entrypoint, package API roots discovered from `root_source_file` in analyzed or workspace `build.zig` files, and alias-style re-exports to avoid library facade noise. Declarations exposed through another used public declaration's type, signature, field, initializer surface, typed receiver method call, or result-location method call are treated as used. Method references through nested inline namespaces and type aliases are also resolved.
 Private file-as-struct methods called through `self.method` are treated as used, even when an unrelated field has the same name. A bare field read never counts as a method call, so a same-named field on another type does not mask an unused method.
 Cyclic type aliases and namespace re-exports stop at the repeated binding or file. They do not prevent resolution of independent declarations.
+Contextual constants such as `.empty` count as references when the result type identifies their container, including typed initialization, assignment, and return expressions. A same-named constant in another container remains eligible for an unused-declaration report.
+Project-wide unused-public reports require valid syntax in every prepared source and build file. If parsing fails, Zwanzig defers those reports rather than treating missing references as non-use. Per-file checks still run on valid siblings.
 
 **Bad:**
 ```zig
@@ -406,7 +408,9 @@ fn doThing(good_param: ?i32) void {
 
 ### unreachable-code-engine
 
-Detects path-sensitive unreachable code where the condition is a compile-time constant. Complements `unreachable-code` by handling constant `true`/`false` conditions (including const boolean identifiers and constant expressions like `(1 + 1) == 2`). Only reports when the condition is definitely constant.
+Detects constant-condition branches and proven contradictions under immutable scalar guards. Constant `true`/`false` conditions include const boolean identifiers and constant expressions such as `(1 + 1) == 2`.
+
+Path-sensitive reports require complete engine analysis and proof from enclosing guards. An absent graph node alone is not proof. Constant-condition checks still run when an engine limit prevents a complete analysis.
 
 **Bad:**
 ```zig
@@ -575,6 +579,8 @@ The checker is path-sensitive and tracks:
 - branch constraints such as `x == 0`, `x != 0`, `x > 0`, `x <= -1`
 - mixed-path outcomes (reports "possible" when some paths are safe and some are unsafe)
 
+Integer guard refinement requires a proven domain that fits signed 64-bit values: signed integers up to 64 bits and unsigned integers up to 63 bits. Floating-point, unknown, and wider domains remain conservative.
+
 Supported operations:
 - binary operators: `/` and `%`
 - builtins: `@divTrunc`, `@divFloor`, `@divExact`, `@mod`, `@rem`
@@ -605,7 +611,7 @@ fn goodGuarded(x: i32) i32 {
 
 ### empty-catch-engine
 
-Detects empty `catch {}` blocks.
+Detects empty `catch {}` blocks with structural CFG checks. Normal runs do not execute dataflow analysis for this checker. Exploded-graph, annotated-CFG, and path-trace requests enable the engine for those visualizations; plain CFG dumps do not.
 
 **Bad:**
 ```zig
@@ -629,6 +635,8 @@ Detects catch blocks that ignore errors without rethrowing or logging. An error 
 - Doesn't call any functions (potential logging)
 - Simply continues execution
 - A fallback expression in `catch` counts as intentional handling. Storing the captured error also counts as handling. Assignments unrelated to the captured error remain swallowed.
+
+If the engine reaches an analysis limit, structural checks still inspect the handler up to its catch merge. A call after the merge does not count as error handling. A handler that terminates with `unreachable` does not silently continue.
 
 **Bad:**
 ```zig

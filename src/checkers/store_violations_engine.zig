@@ -1,5 +1,4 @@
 const std = @import("std");
-const log = std.log.scoped(.store_violations_engine);
 const checker_mod = @import("../checker.zig");
 const Checker = checker_mod.Checker;
 const CheckerError = checker_mod.CheckerError;
@@ -11,7 +10,6 @@ const Config = config_mod.Config;
 const ResourceModel = config_mod.ResourceModel;
 const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
-const AnalysisEngine = engine_mod.AnalysisEngine;
 const store_mod = @import("../engine/store.zig");
 const StoreViolation = store_mod.StoreViolation;
 
@@ -20,6 +18,7 @@ pub const StoreViolationsEngineChecker = struct {
     pub const checker: Checker = .{
         .name = "store-violations-engine",
         .default_severity = .err,
+        .type_requirement = .optional,
         .checkAstFn = checkAst,
     };
 
@@ -31,7 +30,7 @@ pub const StoreViolationsEngineChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         var reported: std.AutoHashMap(ReportedKey, void) = .init(allocator);
@@ -52,42 +51,15 @@ pub const StoreViolationsEngineChecker = struct {
         context: checker_mod.CheckerContext,
         reported: *std.AutoHashMap(ReportedKey, void),
     ) CheckerError!void {
-        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch return) orelse return;
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return,
+        }) orelse return;
         defer cfg_handle.deinit();
 
-        var engine = AnalysisEngine.initWithSource(allocator, cfg_handle.cfg, src);
-        defer engine.deinit();
-        engine.setCheckerName("store-violations-engine");
-        if (context.type_context) |type_ctx| {
-            engine.setTypeContext(type_ctx);
-        }
-        if (context.cached_artifacts) |artifacts| {
-            engine.setCachedArtifacts(artifacts);
-        }
-        if (context.build_metadata) |metadata| {
-            engine.setBuildMetadata(metadata);
-        }
-        if (context.config) |config| {
-            engine.setConfig(config);
-        }
-        if (context.analysis_limits.max_worklist_steps) |steps| {
-            engine.setMaxWorklistSteps(steps);
-        }
-        if (context.analysis_limits.max_states_per_point) |max| {
-            engine.setMaxStatesPerPoint(max);
-        }
-        if (context.analysis_limits.use_widening) |use_w| {
-            engine.setUseWidening(use_w);
-        }
-        var run_ok = true;
-        engine.run() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AnalysisLimitExceeded => run_ok = false,
-        };
-        if (context.analysis_stats) |stats| {
-            stats.recordRun();
-            stats.recordWidening(engine.getGraph().getWidenedNodeCount(), engine.getGraph().getWideningConvergedCount());
-        }
+        var analysis = try context.getOrAnalyze(allocator, src, &cfg_handle, checker.name, .configured);
+        defer analysis.deinit();
+        const engine = analysis.engine;
 
         // Dump visualizations if requested
         if (context.dump_exploded_graph_dir) |dir| {
@@ -100,7 +72,7 @@ pub const StoreViolationsEngineChecker = struct {
             engine_mod.dot.writePathTracesToFile(engine.getGraph(), context.io_context, dir, src.getFilePath(), cfg_handle.cfg.fn_name, allocator);
         }
 
-        if (!run_ok) return;
+        if (!analysis.complete) return;
 
         for (engine.getGraph().nodes.items) |node| {
             for (node.state.getStoreViolations()) |violation| {
@@ -131,12 +103,9 @@ pub const StoreViolationsEngineChecker = struct {
         };
 
         const token = violation.call_token orelse ids.varIndex(violation.region);
-        const loc = src.tokenLocation(token) catch |err| {
-            log.warn("failed to map store violation location: {}", .{err});
-            return;
-        };
+        const loc = try src.tokenLocation(token);
 
-        const diag = Diagnostic.initAtLocation(
+        var diag = try Diagnostic.initAtLocation(
             allocator,
             src.getFilePath(),
             "store-violations-engine",
@@ -144,11 +113,74 @@ pub const StoreViolationsEngineChecker = struct {
             message,
             loc.line,
             loc.column,
-        ) catch return;
+        );
+        errdefer diag.deinit(allocator);
 
-        diagnostics.append(allocator, diag) catch return;
+        try diagnostics.append(allocator, diag);
     }
 };
+
+test "store_violations_engine propagates AST and CFG allocation failures" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |preparse| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const allocator = failing.allocator();
+        {
+            var source = Source.init(allocator, "store-oom.zig", "fn foo() void {}");
+            defer source.deinit();
+            if (preparse) _ = try source.ast();
+            failing.fail_index = failing.alloc_index;
+            failing.resize_fail_index = failing.resize_index;
+
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+                diagnostics.deinit(allocator);
+            }
+            try testing.expectError(error.OutOfMemory, StoreViolationsEngineChecker.checker.checkAst(
+                &source,
+                allocator,
+                &diagnostics,
+                .{ .build_metadata = null },
+            ));
+        }
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "store violation diagnostic propagates allocation failures without leaks" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStoreDiagnosticAllocationFailure, .{});
+}
+
+fn testStoreDiagnosticAllocationFailure(allocator: std.mem.Allocator) !void {
+    const code: [:0]const u8 =
+        \\fn foo(pointer: usize) void {
+        \\    free(pointer);
+        \\}
+    ;
+    var source = Source.init(allocator, "store-oom.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    for (tree.tokens.items(.tag), 0..) |tag, index| {
+        const token: u32 = @intCast(index);
+        if (tag != .identifier or !std.mem.eql(u8, tree.tokenSlice(token), "free")) continue;
+        try StoreViolationsEngineChecker.emitViolationDiagnostic(&source, allocator, &diagnostics, .{
+            .region = ids.varId(token),
+            .kind = .free_without_alloc,
+            .call_token = token,
+        });
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 2), diagnostics.items[0].range.start.line);
+        return;
+    }
+    return error.TestUnexpectedResult;
+}
 
 test "store_violations_engine reports double free" {
     const testing = std.testing;
@@ -180,6 +212,62 @@ test "store_violations_engine reports double free" {
     try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try testing.expectEqualStrings("store-violations-engine", diagnostics.items[0].rule_id);
     try testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "double-free") != null);
+}
+
+test "store_violations_engine keeps fractional and wide integer paths reachable" {
+    // Local aliases have scalar state, so integer-only refinement cannot hide behind
+    // an absent parameter value. Each resource error lies on a feasible numeric path.
+    const cases = [_]struct { value_type: []const u8, first: []const u8, second: []const u8, expected: usize }{
+        .{ .value_type = "f64", .first = "value > 0", .second = "value < 1", .expected = 1 },
+        .{ .value_type = "u64", .first = "value > 0", .second = "value > 9223372036854775807", .expected = 1 },
+        .{ .value_type = "i128", .first = "value < 0", .second = "value < -9223372036854775808", .expected = 1 },
+        .{ .value_type = "anytype", .first = "value > 0", .second = "value < 1", .expected = 1 },
+        .{ .value_type = "i32", .first = "value > 0", .second = "value < 1", .expected = 0 },
+        .{ .value_type = "i64", .first = "value > 0", .second = "value < 1", .expected = 0 },
+        .{ .value_type = "u32", .first = "value > 0", .second = "value < 1", .expected = 0 },
+    };
+    const allocator = std.testing.allocator;
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |with_types| {
+            var buffer: [1024]u8 = undefined;
+            const code = try std.fmt.bufPrintZ(
+                &buffer,
+                \\const std = @import("std");
+                \\fn check(allocator: std.mem.Allocator, input: {s}) !void {{
+                \\    const value = input;
+                \\    if ({s}) {{
+                \\        if ({s}) {{
+                \\            const ptr = try allocator.alloc(u8, 1);
+                \\            allocator.free(ptr);
+                \\            allocator.free(ptr);
+                \\        }}
+                \\    }}
+                \\}}
+            ,
+                .{ case.value_type, case.first, case.second },
+            );
+            var source = Source.init(allocator, "numeric-domain.zig", code);
+            defer source.deinit();
+            var type_context = TypeContext.init(allocator, &source);
+            defer type_context.deinit();
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+                diagnostics.deinit(allocator);
+            }
+
+            try StoreViolationsEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+                .build_metadata = null,
+                .type_context = if (with_types) &type_context else null,
+                .analysis_limits = .{ .use_widening = false },
+            });
+            try std.testing.expectEqual(case.expected, diagnostics.items.len);
+            for (diagnostics.items) |diagnostic| {
+                try std.testing.expectEqual(@as(usize, 8), diagnostic.range.start.line);
+                try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "double-free") != null);
+            }
+        }
+    }
 }
 
 test "store_violations_engine reports free without alloc" {

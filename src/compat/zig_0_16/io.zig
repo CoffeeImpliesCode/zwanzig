@@ -2,15 +2,17 @@ const std = @import("std");
 
 pub const Context = struct {
     threaded: std.Io.Threaded,
+    thread_count: usize,
 
     pub fn init(allocator: std.mem.Allocator, thread_count: usize) !Context {
-        std.debug.assert(thread_count > 0);
+        const effective_thread_count = @max(1, thread_count);
         return .{
             .threaded = .init(allocator, .{
                 // Io.async also runs work eagerly on the calling thread.
-                .async_limit = .limited(thread_count - 1),
-                .concurrent_limit = .limited(thread_count),
+                .async_limit = .limited(effective_thread_count - 1),
+                .concurrent_limit = .limited(effective_thread_count),
             }),
+            .thread_count = effective_thread_count,
         };
     }
 
@@ -25,6 +27,7 @@ pub const Context = struct {
 
 var default_context: Context = .{
     .threaded = .init_single_threaded,
+    .thread_count = 1,
 };
 
 pub fn defaultContext() *Context {
@@ -47,12 +50,19 @@ pub const Executor = struct {
     context: *Context,
     group: std.Io.Group = .init,
 
-    pub fn init(context: *Context, _: std.mem.Allocator, _: usize) !Executor {
+    /// The context must outlive the executor and use the same normalized worker count.
+    pub fn init(context: *Context, _: std.mem.Allocator, thread_count: usize) !Executor {
+        if (@max(1, thread_count) != context.thread_count) return error.ThreadCountMismatch;
         return .{ .context = context };
     }
 
     pub fn deinit(self: *Executor) void {
-        _ = self;
+        const io = self.context.io();
+        // Group.await drains every task even when canceled. Re-arm cancellation
+        // because this void cleanup method cannot return the cancellation error.
+        self.group.await(io) catch |err| switch (err) {
+            error.Canceled => io.recancel(),
+        };
     }
 
     pub fn spawn(self: *Executor, function: TaskFn, index: usize, context: *anyopaque) !void {
@@ -70,29 +80,121 @@ pub const Executor = struct {
 
 test "Executor respects a single analysis worker" {
     const Probe = struct {
-        io_context: *Context,
-        active: std.atomic.Value(usize) = .init(0),
-        peak: std.atomic.Value(usize) = .init(0),
+        caller_id: std.Thread.Id,
+        used_background_worker: std.atomic.Value(bool) = .init(false),
         completed: std.atomic.Value(usize) = .init(0),
 
         fn task(_: usize, opaque_context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(opaque_context));
-            const active = self.active.fetchAdd(1, .seq_cst) + 1;
-            _ = self.peak.fetchMax(active, .seq_cst);
-            std.Io.sleep(self.io_context.io(), .fromMilliseconds(10), .awake) catch unreachable;
-            _ = self.active.fetchSub(1, .seq_cst);
-            _ = self.completed.fetchAdd(1, .seq_cst);
+            if (std.Thread.getCurrentId() != self.caller_id) {
+                self.used_background_worker.store(true, .release);
+            }
+            _ = self.completed.fetchAdd(1, .release);
         }
     };
-    var context = try Context.init(std.testing.allocator, 1);
+    // Zero and one both mean one worker, including the calling thread.
+    for ([_][2]usize{ .{ 1, 1 }, .{ 0, 1 }, .{ 1, 0 } }) |counts| {
+        var context = try Context.init(std.testing.allocator, counts[0]);
+        defer context.deinit();
+        var executor = try Executor.init(&context, std.testing.allocator, counts[1]);
+        defer executor.deinit();
+        var probe: Probe = .{ .caller_id = std.Thread.getCurrentId() };
+        for (0..8) |index| {
+            try executor.spawn(Probe.task, index, &probe);
+            try std.testing.expectEqual(index + 1, probe.completed.load(.acquire));
+        }
+        try executor.wait();
+        try std.testing.expect(!probe.used_background_worker.load(.acquire));
+    }
+}
+
+test "Executor rejects both thread count mismatch directions" {
+    for ([_][2]usize{ .{ 2, 1 }, .{ 1, 2 } }) |counts| {
+        var context = try Context.init(std.testing.allocator, counts[0]);
+        defer context.deinit();
+        try std.testing.expectError(
+            error.ThreadCountMismatch,
+            Executor.init(&context, std.testing.allocator, counts[1]),
+        );
+    }
+}
+
+test "Executor deinit drains active work on early exit and preserves cancellation" {
+    const Probe = struct {
+        context: *Context,
+        owner_ready: std.Io.Event = .unset,
+        task_started: std.Io.Event = .unset,
+        owner_blocked: std.Io.Event = .unset,
+        task_blocked: std.Io.Event = .unset,
+        task_completed: std.atomic.Value(bool) = .init(false),
+        task_canceled: std.atomic.Value(bool) = .init(false),
+
+        const Result = struct {
+            completed_at_deinit: bool,
+            task_canceled: bool,
+            cancellation_preserved: bool,
+            early_error_preserved: bool,
+        };
+
+        fn task(_: usize, opaque_context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_context));
+            const io = self.context.io();
+            self.task_started.set(io);
+            self.task_blocked.wait(io) catch |err| switch (err) {
+                error.Canceled => self.task_canceled.store(true, .release),
+            };
+            self.task_completed.store(true, .release);
+        }
+
+        fn leaveEarly(executor: *Executor) error{EarlyExit}!void {
+            defer executor.deinit();
+            return error.EarlyExit;
+        }
+
+        fn owner(self: *@This()) !Result {
+            const io = self.context.io();
+            defer self.owner_ready.set(io);
+            var executor = try Executor.init(self.context, std.testing.allocator, 2);
+            // Keep the regression safe even if deinit incorrectly returns early.
+            defer executor.group.cancel(io);
+            // Force concurrency: Group.async may otherwise run the blocked task eagerly.
+            try executor.group.concurrent(io, task, .{
+                @as(usize, 0),
+                @as(*anyopaque, @ptrCast(self)),
+            });
+            self.task_started.waitUncancelable(io);
+            self.owner_ready.set(io);
+            self.owner_blocked.wait(io) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+            };
+
+            const early_error_preserved = if (leaveEarly(&executor)) |_| false else |err| switch (err) {
+                error.EarlyExit => true,
+            };
+            const completed_at_deinit = self.task_completed.load(.acquire);
+            const task_canceled = self.task_canceled.load(.acquire);
+            const cancellation_preserved = if (io.checkCancel()) |_| false else |err| switch (err) {
+                error.Canceled => true,
+            };
+            return .{
+                .completed_at_deinit = completed_at_deinit,
+                .task_canceled = task_canceled,
+                .cancellation_preserved = cancellation_preserved,
+                .early_error_preserved = early_error_preserved,
+            };
+        }
+    };
+    var context = try Context.init(std.testing.allocator, 2);
     defer context.deinit();
-    var executor = try Executor.init(&context, std.testing.allocator, 1);
-    defer executor.deinit();
-    var probe: Probe = .{ .io_context = &context };
-    for (0..8) |index| try executor.spawn(Probe.task, index, &probe);
-    try executor.wait();
-    try std.testing.expectEqual(@as(usize, 8), probe.completed.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), probe.peak.load(.seq_cst));
+    const io = context.io();
+    var probe: Probe = .{ .context = &context };
+    var owner = try io.concurrent(Probe.owner, .{&probe});
+    probe.owner_ready.waitUncancelable(io);
+    const result = try owner.cancel(io);
+    try std.testing.expect(result.completed_at_deinit);
+    try std.testing.expect(result.task_canceled);
+    try std.testing.expect(result.cancellation_preserved);
+    try std.testing.expect(result.early_error_preserved);
 }
 
 pub const Mutex = std.Io.Mutex;

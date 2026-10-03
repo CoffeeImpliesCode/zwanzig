@@ -8,7 +8,6 @@ const Diagnostic = checker_mod.Diagnostic;
 const Source = @import("../source.zig").Source;
 const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
-const AnalysisEngine = engine_mod.AnalysisEngine;
 
 /// Engine-based checker that detects forced optional unwraps (.?) that may panic at runtime.
 /// Uses CFG analysis to track when optionals have been checked for null.
@@ -24,6 +23,7 @@ pub const OptionalUnwrapEngineChecker = struct {
     pub const checker: Checker = .{
         .name = "optional-unwrap",
         .default_severity = .warning,
+        .type_requirement = .optional,
         .checkAstFn = checkAst,
     };
 
@@ -33,7 +33,7 @@ pub const OptionalUnwrapEngineChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         // Track reported AST nodes across all functions to avoid duplicates
@@ -55,42 +55,15 @@ pub const OptionalUnwrapEngineChecker = struct {
         context: checker_mod.CheckerContext,
         reported: *std.AutoHashMap(u32, void),
     ) CheckerError!void {
-        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch return) orelse return;
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return,
+        }) orelse return;
         defer cfg_handle.deinit();
 
-        var engine = AnalysisEngine.initWithSource(allocator, cfg_handle.cfg, src);
-        defer engine.deinit();
-        engine.setCheckerName("optional-unwrap");
-        if (context.type_context) |type_ctx| {
-            engine.setTypeContext(type_ctx);
-        }
-        if (context.cached_artifacts) |artifacts| {
-            engine.setCachedArtifacts(artifacts);
-        }
-        if (context.build_metadata) |metadata| {
-            engine.setBuildMetadata(metadata);
-        }
-        if (context.config) |config| {
-            engine.setConfig(config);
-        }
-        if (context.analysis_limits.max_worklist_steps) |steps| {
-            engine.setMaxWorklistSteps(steps);
-        }
-        if (context.analysis_limits.max_states_per_point) |max| {
-            engine.setMaxStatesPerPoint(max);
-        }
-        if (context.analysis_limits.use_widening) |use_w| {
-            engine.setUseWidening(use_w);
-        }
-        var run_ok = true;
-        engine.run() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AnalysisLimitExceeded => run_ok = false,
-        };
-        if (context.analysis_stats) |stats| {
-            stats.recordRun();
-            stats.recordWidening(engine.getGraph().getWidenedNodeCount(), engine.getGraph().getWideningConvergedCount());
-        }
+        var analysis = try context.getOrAnalyze(allocator, src, &cfg_handle, checker.name, .configured);
+        defer analysis.deinit();
+        const engine = analysis.engine;
 
         // Dump visualizations if requested
         if (context.dump_exploded_graph_dir) |dir| {
@@ -103,13 +76,41 @@ pub const OptionalUnwrapEngineChecker = struct {
             engine_mod.dot.writePathTracesToFile(engine.getGraph(), context.io_context, dir, src.getFilePath(), cfg_handle.cfg.fn_name, allocator);
         }
 
-        if (!run_ok) return;
+        if (!analysis.complete) return;
 
         // Scan AST for unwrap_optional nodes and check nullability
-        const tree = src.ast() catch return;
-        try scan.scanForUnsafeUnwraps(src, allocator, diagnostics, tree, &engine, cfg_handle.cfg, reported, fn_node, context.type_context);
+        const tree = try src.ast();
+        try scan.scanForUnsafeUnwraps(src, allocator, diagnostics, tree, engine, cfg_handle.cfg, reported, fn_node, context.type_context);
     }
 };
+
+test "optional_unwrap_engine propagates AST and CFG allocation failures" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |preparse| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        const allocator = failing.allocator();
+        {
+            var source = Source.init(allocator, "optional-oom.zig", "fn foo() void {}");
+            defer source.deinit();
+            if (preparse) _ = try source.ast();
+            failing.fail_index = failing.alloc_index;
+            failing.resize_fail_index = failing.resize_index;
+
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+                diagnostics.deinit(allocator);
+            }
+            try testing.expectError(error.OutOfMemory, OptionalUnwrapEngineChecker.checker.checkAst(
+                &source,
+                allocator,
+                &diagnostics,
+                .{ .build_metadata = null },
+            ));
+        }
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
 
 fn expectOptionalUnwrapDiagnosticLines(
     code: [:0]const u8,

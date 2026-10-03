@@ -191,8 +191,8 @@ pub fn reportUnsafeUnwrap(
     if (main_token >= token_starts.len) return;
 
     const unwrap_offset = token_starts[main_token];
-    const loc = src.byteToLocation(unwrap_offset) catch return;
-    const diag = Diagnostic.initAtLocation(
+    const loc = try src.byteToLocation(unwrap_offset);
+    var diag = try Diagnostic.initAtLocation(
         allocator,
         src.getFilePath(),
         "optional-unwrap",
@@ -200,6 +200,42 @@ pub fn reportUnsafeUnwrap(
         "forced optional unwrap can panic at runtime",
         loc.line,
         loc.column,
-    ) catch return;
+    );
+    errdefer diag.deinit(allocator);
     try diagnostics.append(allocator, diag);
+}
+
+test "optional unwrap diagnostic propagates allocation failures without leaks" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnwrapDiagnosticAllocationFailure, .{});
+}
+
+fn testUnwrapDiagnosticAllocationFailure(allocator: std.mem.Allocator) !void {
+    const code: [:0]const u8 =
+        \\fn foo(value: ?u8) u8 {
+        \\    return value.?;
+        \\}
+    ;
+    var source = Source.init(allocator, "optional-oom.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (tag != .unwrap_optional) continue;
+        try reportUnsafeUnwrap(
+            &source,
+            allocator,
+            &diagnostics,
+            tree.nodes.items(.main_token)[index],
+            tree.tokens.items(.start),
+        );
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 2), diagnostics.items[0].range.start.line);
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

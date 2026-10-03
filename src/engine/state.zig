@@ -212,12 +212,10 @@ pub const ProgramState = struct {
     pub fn clone(self: *const ProgramState, allocator: std.mem.Allocator) !ProgramState {
         var new_call_stack: std.ArrayList(CallSite) = .empty;
         errdefer new_call_stack.deinit(allocator);
-        for (self.call_stack.items) |cs| {
-            try new_call_stack.append(allocator, cs);
-        }
-        var new_env = try self.env.clone();
+        try new_call_stack.appendSlice(allocator, self.call_stack.items);
+        var new_env = try self.env.clone(allocator);
         errdefer new_env.deinit();
-        var new_constraints = try self.constraints.clone();
+        var new_constraints = try self.constraints.clone(allocator);
         errdefer new_constraints.deinit();
         var new_store = try self.store.clone(allocator);
         errdefer new_store.deinit();
@@ -540,9 +538,7 @@ pub const ProgramState = struct {
         // Clone call stack from self (same context assumption)
         var new_call_stack: std.ArrayList(CallSite) = .empty;
         errdefer new_call_stack.deinit(allocator);
-        for (self.call_stack.items) |cs| {
-            try new_call_stack.append(allocator, cs);
-        }
+        try new_call_stack.appendSlice(allocator, self.call_stack.items);
 
         return .{
             .env = new_env,
@@ -650,7 +646,7 @@ test "ProgramState with constraints" {
     try testing.expect(!state.isSatisfiable());
 }
 
-test "ProgramState clone includes constraints" {
+test "ProgramState clone preserves infeasible constraints" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -658,11 +654,14 @@ test "ProgramState clone includes constraints" {
     defer state.deinit();
 
     try state.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 42));
+    try state.addConstraint(Constraint.intCompare(ids.varId(1), .ne, 42));
 
     var state2 = try state.clone(allocator);
     defer state2.deinit();
 
     try testing.expect(state.eql(&state2));
+    try testing.expect(!state2.isSatisfiable());
+    try testing.expect(!state.isSatisfiable());
 }
 
 test "ProgramState satisfiability" {
@@ -800,24 +799,136 @@ test "ProgramState call stack operations" {
     try testing.expectEqual(@as(?CallSite, null), state.peekCallSite());
 }
 
-test "ProgramState clone preserves inline depth and call stack" {
+test "ProgramState clone keeps an independent calling context" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     var cfg = Cfg.init(allocator);
     defer cfg.deinit();
+    var callee_cfg = Cfg.init(allocator);
+    defer callee_cfg.deinit();
+    const first = CallSite{ .call_node = ids.cfgId(1), .caller_cfg = &cfg, .return_node = ids.cfgId(2) };
+    const second = CallSite{ .call_node = ids.cfgId(3), .caller_cfg = &callee_cfg, .return_node = ids.cfgId(4) };
+    const third = CallSite{ .call_node = ids.cfgId(5), .caller_cfg = &cfg, .return_node = ids.cfgId(6) };
 
     var state = ProgramState.init(allocator);
     defer state.deinit();
-
     state.incrementInlineDepth();
-    try state.pushCallSite(CallSite{ .call_node = ids.cfgId(1), .caller_cfg = &cfg, .return_node = ids.cfgId(2) });
+    try state.pushCallSite(first);
+    state.incrementInlineDepth();
+    try state.pushCallSite(second);
+    const original_hash = state.computeHash();
+    const original_context = state.contextHash();
 
-    var state2 = try state.clone(allocator);
-    defer state2.deinit();
+    var copy = try state.clone(allocator);
+    defer copy.deinit();
+    try testing.expect(state.eql(&copy));
+    try testing.expectEqual(original_hash, copy.computeHash());
+    try testing.expectEqual(original_context, copy.contextHash());
+    try testing.expectEqual(state.getInlineDepth(), copy.getInlineDepth());
 
-    try testing.expectEqual(state.getInlineDepth(), state2.getInlineDepth());
-    try testing.expectEqual(state.call_stack.items.len, state2.call_stack.items.len);
+    try testing.expectEqual(second, copy.popCallSite().?);
+    copy.decrementInlineDepth();
+    try copy.pushCallSite(third);
+    try testing.expectEqual(second, state.peekCallSite().?);
+    try testing.expectEqual(original_hash, state.computeHash());
+    try testing.expectEqual(original_context, state.contextHash());
+    try testing.expect(copy.computeHash() != original_hash);
+
+    try testing.expectEqual(second, state.popCallSite().?);
+    try state.pushCallSite(first);
+    try testing.expectEqual(third, copy.popCallSite().?);
+    try testing.expectEqual(first, copy.popCallSite().?);
+    try testing.expect(copy.popCallSite() == null);
+    try testing.expectEqual(first, state.peekCallSite().?);
+}
+
+test "ProgramState clone outlives its source allocator" {
+    const testing = std.testing;
+    var cfg = Cfg.init(testing.allocator);
+    defer cfg.deinit();
+    const call_site = CallSite{ .call_node = ids.cfgId(1), .caller_cfg = &cfg, .return_node = ids.cfgId(2) };
+    const metadata = BuildMetadata.init(.{ .arch = .aarch64, .os = .linux, .abi = null }, .release_fast);
+
+    var copy = blk: {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var source = ProgramState.init(arena.allocator());
+        defer source.deinit();
+        try source.setVar(ids.varId(1), .{ .concrete_int = 5 });
+        try source.addConstraint(Constraint.intCompare(ids.varId(1), .gt, 0));
+        try source.addConstraint(Constraint.nullCheck(ids.varId(2), false));
+        try source.addConstraint(Constraint.boolCheck(ids.varId(3), true));
+        try source.trackAllocation(ids.varId(4));
+        source.setErrorState(.error_active);
+        source.incrementInlineDepth();
+        try source.pushCallSite(call_site);
+        source.build_metadata = &metadata;
+        const source_hash = source.computeHash();
+
+        var result = try source.clone(testing.allocator);
+        errdefer result.deinit();
+        try testing.expect(source.eql(&result));
+        try testing.expectEqual(source_hash, result.computeHash());
+        break :blk result;
+    };
+    defer copy.deinit();
+
+    try testing.expect(copy.getVar(ids.varId(1)).?.eql(.{ .concrete_int = 5 }));
+    try testing.expect(copy.isSatisfiable());
+    try testing.expect(copy.hasNonNullConstraint(ids.varId(2)));
+    try testing.expect(copy.isErrorPath());
+    try testing.expectEqual(@as(u32, 1), copy.getInlineDepth());
+    try testing.expectEqual(metadata.target.os, copy.build_metadata.?.target.os);
+    try testing.expectEqual(metadata.optimize_mode, copy.build_metadata.?.optimize_mode);
+    try testing.expectEqual(ResourceState.allocated, copy.getRegionState(ids.varId(4)).?);
+    const original_hash = copy.computeHash();
+    try copy.setVar(ids.varId(1), .{ .concrete_int = 7 });
+    try testing.expect(copy.computeHash() != original_hash);
+    try copy.trackFree(ids.varId(4), 12);
+    try testing.expectEqual(ResourceState.freed, copy.getRegionState(ids.varId(4)).?);
+    try copy.addConstraint(Constraint.boolCheck(ids.varId(3), false));
+    try testing.expect(!copy.isSatisfiable());
+    try testing.expectEqual(call_site, copy.popCallSite().?);
+    try copy.pushCallSite(call_site);
+    try testing.expectEqual(call_site, copy.peekCallSite().?);
+}
+
+test "ProgramState cloning cleans up all domains on allocation failure" {
+    const testing = std.testing;
+    var cfg = Cfg.init(testing.allocator);
+    defer cfg.deinit();
+    const call_site = CallSite{ .call_node = ids.cfgId(1), .caller_cfg = &cfg, .return_node = ids.cfgId(2) };
+    var source = ProgramState.init(testing.allocator);
+    defer source.deinit();
+    try source.setVar(ids.varId(1), .{ .concrete_int = 5 });
+    try source.addConstraint(Constraint.intCompare(ids.varId(1), .gt, 0));
+    try source.addConstraint(Constraint.intCompare(ids.varId(1), .lt, 10));
+    try source.addConstraint(Constraint.nullCheck(ids.varId(2), false));
+    try source.addConstraint(Constraint.boolCheck(ids.varId(3), true));
+    try source.trackAllocation(ids.varId(4));
+    try source.trackFree(ids.varId(4), 10);
+    try source.trackFree(ids.varId(4), 11);
+    source.incrementInlineDepth();
+    try source.pushCallSite(call_site);
+    const source_hash = source.computeHash();
+
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, original: *const ProgramState, expected_hash: u64) !void {
+            var copy = try original.clone(allocator);
+            defer copy.deinit();
+            try std.testing.expect(original.eql(&copy));
+            try std.testing.expectEqual(expected_hash, copy.computeHash());
+            try std.testing.expectEqual(original.peekCallSite(), copy.peekCallSite());
+            try std.testing.expect(copy.isSatisfiable());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Harness.run, .{ &source, source_hash });
+    source.invalidateCache();
+    try testing.expectEqual(source_hash, source.computeHash());
+    try testing.expect(source.getVar(ids.varId(1)).?.eql(.{ .concrete_int = 5 }));
+    try testing.expectEqual(call_site, source.peekCallSite().?);
+    try testing.expectEqual(ResourceState.freed, source.getRegionState(ids.varId(4)).?);
 }
 
 test "ProgramState equality includes inline depth" {

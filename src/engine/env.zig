@@ -21,14 +21,12 @@ pub const Environment = struct {
         self.bindings.deinit();
     }
 
-    pub fn clone(self: *const Environment) !Environment {
-        var new_env = Environment.init(self.allocator);
-        errdefer new_env.deinit();
-        var iter = self.bindings.iterator();
-        while (iter.next()) |entry| {
-            try new_env.bindings.put(entry.key_ptr.*, entry.value_ptr.*);
-        }
-        return new_env;
+    /// Copy bindings into independent storage owned by allocator.
+    pub fn clone(self: *const Environment, allocator: std.mem.Allocator) !Environment {
+        return .{
+            .bindings = try self.bindings.cloneWithAllocator(allocator),
+            .allocator = allocator,
+        };
     }
 
     pub fn get(self: *const Environment, var_id: VarId) ?AbstractValue {
@@ -164,13 +162,63 @@ test "Environment equality and cloning" {
     try env1.set(ids.varId(1), .{ .concrete_int = 10 });
     try env1.set(ids.varId(2), .non_null);
 
-    var env2 = try env1.clone();
+    var env2 = try env1.clone(allocator);
     defer env2.deinit();
 
     try testing.expect(env1.eql(&env2));
 
     try env2.set(ids.varId(1), .{ .concrete_int = 20 });
+    env2.remove(ids.varId(2));
+    try env1.set(ids.varId(3), .{ .concrete_bool = true });
     try testing.expect(!env1.eql(&env2));
+    try testing.expect(env1.get(ids.varId(1)).?.eql(.{ .concrete_int = 10 }));
+    try testing.expect(env1.get(ids.varId(2)).?.eql(.non_null));
+    try testing.expect(env2.get(ids.varId(3)) == null);
+}
+
+test "Environment clone outlives its source allocator" {
+    const testing = std.testing;
+
+    var copy = blk: {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var source = Environment.init(arena.allocator());
+        defer source.deinit();
+        try source.set(ids.varId(1), .{ .int_range = .{ .min = -3, .max = 7 } });
+        try source.set(ids.varId(2), .null_val);
+        try source.set(ids.varId(3), .{ .concrete_bool = false });
+
+        break :blk try source.clone(testing.allocator);
+    };
+    defer copy.deinit();
+
+    try testing.expect(copy.get(ids.varId(1)).?.eql(.{ .int_range = .{ .min = -3, .max = 7 } }));
+    try testing.expect(copy.get(ids.varId(2)).?.eql(.null_val));
+    try testing.expect(copy.get(ids.varId(3)).?.eql(.{ .concrete_bool = false }));
+    try copy.set(ids.varId(1), .{ .concrete_int = 5 });
+    copy.remove(ids.varId(2));
+    try testing.expect(copy.get(ids.varId(1)).?.eql(.{ .concrete_int = 5 }));
+    try testing.expect(copy.get(ids.varId(2)) == null);
+}
+
+test "Environment cloning preserves its source on allocation failure" {
+    const testing = std.testing;
+    var source = Environment.init(testing.allocator);
+    defer source.deinit();
+    try source.set(ids.varId(1), .{ .concrete_int = 42 });
+    try source.set(ids.varId(2), .non_null);
+    const source_hash = source.computeHash();
+
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, original: *const Environment) !void {
+            var copy = try original.clone(allocator);
+            defer copy.deinit();
+            try std.testing.expect(original.eql(&copy));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Harness.run, .{&source});
+    try testing.expectEqual(source_hash, source.computeHash());
+    try testing.expect(source.get(ids.varId(1)).?.eql(.{ .concrete_int = 42 }));
 }
 
 test "Environment widen with overlapping variables" {

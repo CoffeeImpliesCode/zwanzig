@@ -106,9 +106,11 @@ pub const UnusedDeclRule = struct {
 
         var type_ctx = TypeContext.init(allocator, src);
         defer type_ctx.deinit();
+        var reference_paths = try ReferencePaths.init(allocator, tree, parent_map);
+        defer reference_paths.deinit();
 
         for (decls.items) |decl| {
-            if (!try isDeclUsed(tree, allocator, decl, parent_map, &type_ctx)) {
+            if (!try isDeclUsed(tree, allocator, decl, parent_map, &type_ctx, &reference_paths)) {
                 const range = try src.byteRangeToSourceRange(decl.byte_offset, decl.byte_offset + decl.name.len);
 
                 // Use ZIR-based type info for more descriptive messages
@@ -410,14 +412,123 @@ pub const UnusedDeclRule = struct {
         return false;
     }
 
+    /// Names select paths to inspect; the scanner still decides scope and receiver identity.
+    const ReferencePaths = struct {
+        arena: std.heap.ArenaAllocator,
+        parents: []u32 = &.{},
+        active: []usize = &.{},
+        generation: usize = 0,
+        names: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+        roots: std.AutoHashMapUnmanaged(u32, void) = .empty,
+        reflection_calls: std.ArrayList(u32) = .empty,
+        active_roots: std.ArrayList(u32) = .empty,
+
+        fn init(allocator: std.mem.Allocator, tree: *const std.zig.Ast, parents: []const u32) !ReferencePaths {
+            var self = ReferencePaths{ .arena = std.heap.ArenaAllocator.init(allocator) };
+            errdefer self.deinit();
+            const arena = self.arena.allocator();
+            self.parents = try arena.dupe(u32, parents);
+            self.active = try arena.alloc(usize, parents.len);
+            @memset(self.active, 0);
+            for (tree.rootDecls()) |root| try self.roots.put(arena, @intFromEnum(root), {});
+            for (tree.nodes.items(.tag), 0..) |tag, node_index| {
+                if (node_index == 0) continue;
+                const node: u32 = @intCast(node_index);
+                var links = ParentLinks{ .parents = self.parents, .parent = node };
+                var container_buffer: [2]std.zig.Ast.Node.Index = undefined;
+                if (tree.fullContainerDecl(&container_buffer, @enumFromInt(node))) |container| {
+                    links.optional(container.ast.arg);
+                    for (container.ast.members) |member| links.link(@intFromEnum(member));
+                } else {
+                    ast_walk.walkChildren(ParentLinks, tree, node, &links, ParentLinks.visit) catch unreachable;
+                }
+                // Runtime walks omit declaration metadata, but liveness scans it.
+                if (tag == .fn_decl) links.link(@intFromEnum(tree.nodes.items(.data)[node].node_and_node[0]));
+                if (tree.fullVarDecl(@enumFromInt(node))) |full| {
+                    links.optional(full.ast.type_node);
+                    links.optional(full.ast.align_node);
+                    links.optional(full.ast.addrspace_node);
+                    links.optional(full.ast.section_node);
+                }
+                const name = switch (tag) {
+                    .identifier, .enum_literal => normalizeIdentifier(tree.tokenSlice(tree.nodes.items(.main_token)[node])),
+                    .field_access => import_resolver.fieldAccessName(tree, node),
+                    else => null,
+                };
+                if (name) |normalized| {
+                    const result = try self.names.getOrPut(arena, normalized);
+                    if (!result.found_existing) result.value_ptr.* = .empty;
+                    try result.value_ptr.append(arena, node);
+                }
+                if (call_resolver.isCallNode(tag)) {
+                    var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+                    const call = tree.fullCall(&call_buffer, @enumFromInt(node)) orelse continue;
+                    const method = import_resolver.fieldAccessName(tree, @intFromEnum(call.ast.fn_expr)) orelse continue;
+                    if (std.mem.eql(u8, method, "refAllDecls") or std.mem.eql(u8, method, "refAllDeclsRecursive")) {
+                        try self.reflection_calls.append(arena, node);
+                    }
+                }
+            }
+            return self;
+        }
+
+        fn deinit(self: *ReferencePaths) void {
+            self.arena.deinit();
+        }
+
+        fn select(self: *ReferencePaths, name: []const u8, include_reflection: bool) !void {
+            self.generation += 1;
+            self.active_roots.clearRetainingCapacity();
+            if (self.names.get(name)) |nodes| {
+                for (nodes.items) |node| try self.markPath(node);
+            }
+            if (include_reflection) {
+                for (self.reflection_calls.items) |node| try self.markPath(node);
+            }
+        }
+
+        fn markPath(self: *ReferencePaths, initial: u32) !void {
+            var node = initial;
+            while (node != 0 and node < self.parents.len and self.active[node] != self.generation) {
+                self.active[node] = self.generation;
+                const parent = self.parents[node];
+                if (parent == 0 and self.roots.contains(node)) {
+                    try self.active_roots.append(self.arena.allocator(), node);
+                }
+                node = parent;
+            }
+        }
+
+        const ParentLinks = struct {
+            parents: []u32,
+            parent: u32,
+
+            fn link(self: *ParentLinks, child: u32) void {
+                if (child != 0 and child < self.parents.len and self.parents[child] == 0) {
+                    self.parents[child] = self.parent;
+                }
+            }
+
+            fn optional(self: *ParentLinks, child: std.zig.Ast.Node.OptionalIndex) void {
+                if (child.unwrap()) |node| self.link(@intFromEnum(node));
+            }
+
+            fn visit(_: *const std.zig.Ast, child: u32, self: *ParentLinks) error{}!void {
+                self.link(child);
+            }
+        };
+    };
+
     fn isDeclUsed(
         tree: *const std.zig.Ast,
         allocator: std.mem.Allocator,
         decl: DeclInfo,
         parent_map: []const u32,
         type_ctx: *TypeContext,
+        reference_paths: *ReferencePaths,
     ) RuleError!bool {
-        var scanner = UsageScanner.init(allocator, tree, decl, parent_map, type_ctx);
+        try reference_paths.select(decl.normalized_name, decl.owner_container != null);
+        var scanner = UsageScanner.init(allocator, tree, decl, parent_map, type_ctx, reference_paths);
         defer scanner.deinit();
         return scanner.scanRoot();
     }
@@ -437,6 +548,7 @@ pub const UnusedDeclRule = struct {
         receiver_type_node: ?u32,
         parent_map: []const u32,
         type_ctx: *TypeContext,
+        reference_paths: *const ReferencePaths,
         inside_owner_container: bool = false,
         shadowed: bool = false,
         shadow_stack: std.ArrayListUnmanaged(bool) = .empty,
@@ -448,6 +560,7 @@ pub const UnusedDeclRule = struct {
             decl: DeclInfo,
             parent_map: []const u32,
             type_ctx: *TypeContext,
+            reference_paths: *const ReferencePaths,
         ) UsageScanner {
             return .{
                 .allocator = allocator,
@@ -464,6 +577,7 @@ pub const UnusedDeclRule = struct {
                 .receiver_type_node = decl.receiver_type_node,
                 .parent_map = parent_map,
                 .type_ctx = type_ctx,
+                .reference_paths = reference_paths,
             };
         }
 
@@ -473,9 +587,8 @@ pub const UnusedDeclRule = struct {
         }
 
         fn scanRoot(self: *UsageScanner) RuleError!bool {
-            const root_decls = self.tree.rootDecls();
-            for (root_decls) |decl_idx| {
-                if (try self.scanNode(@intFromEnum(decl_idx))) return true;
+            for (self.reference_paths.active_roots.items) |node| {
+                if (try self.scanNode(node)) return true;
             }
             return false;
         }
@@ -506,12 +619,15 @@ pub const UnusedDeclRule = struct {
         fn scanNode(self: *UsageScanner, node: u32) RuleError!bool {
             if (node == 0) return false;
             if (node >= self.datas.len) return false;
+            if (self.reference_paths.active[node] != self.reference_paths.generation) return false;
 
             const tag = self.tags[node];
             const data = self.datas[node];
 
             switch (tag) {
                 .identifier => return self.isIdentifierUsed(node),
+                .enum_literal => return !self.is_function and
+                    self.isTokenName(self.main_tokens[node]) and self.resultLocationTargetsOwner(node),
                 .field_access => return self.scanFieldAccess(@intCast(node), data),
                 .fn_decl => return self.scanFnDecl(node),
                 .fn_proto,
@@ -590,7 +706,7 @@ pub const UnusedDeclRule = struct {
             const callee = @intFromEnum(call.ast.fn_expr);
             if (callee < self.tags.len and self.tags[callee] == .enum_literal and
                 self.is_function and self.owner_container != null and
-                self.resultLocationCallTargetsOwner(node))
+                self.resultLocationTargetsOwner(node))
             {
                 const token = self.main_tokens[callee];
                 if (self.isTokenName(token)) return true;
@@ -599,7 +715,7 @@ pub const UnusedDeclRule = struct {
             return self.scanChildren(node);
         }
 
-        fn resultLocationCallTargetsOwner(self: *UsageScanner, node: u32) bool {
+        fn resultLocationTargetsOwner(self: *UsageScanner, node: u32) bool {
             const local_files = [_]import_resolver.File{.{ .path = "", .tree = self.tree }};
             const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
                 .files = &local_files,
@@ -1322,6 +1438,27 @@ test "skript regression: result-location method calls use private declarations" 
     try expectSingleUnusedDecl(code, "genuinelyUnused");
 }
 
+test "contextual constants match the file container without promoting nested homonyms" {
+    const code: [:0]const u8 =
+        "const Self = @This();\n" ++
+        "const empty: Self = .{};\n" ++
+        "pub const Other = struct {\n" ++
+        "    const empty: @This() = .{};\n" ++
+        "};\n" ++
+        "pub fn make() Self { return .empty; }\n";
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "contextual-constant.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.items[0].range.start.line);
+}
+
 test "skript regression: refAllDecls reaches private container declarations" {
     const code: [:0]const u8 =
         \\const std = @import("std");
@@ -1688,6 +1825,33 @@ test "same-named field read does not mark method used" {
         \\}
     ;
     try expectSingleUnusedDecl(code, "bump");
+}
+
+test "indexed declaration references retain parameter and local shadowing" {
+    try expectSingleUnusedDecl(
+        \\const hidden = 1;
+        \\const Visible = u32;
+        \\pub fn run(hidden: Visible) Visible {
+        \\    _ = hidden;
+        \\    { const hidden = 2; _ = hidden; }
+        \\    return 0;
+        \\}
+    , "hidden");
+}
+
+test "indexed declaration references retain nested signatures and initializers" {
+    try expectSingleUnusedDecl(
+        \\const Parameter = u32;
+        \\const Return = u64;
+        \\const Value = u8;
+        \\const unused = 1;
+        \\pub const Namespace = struct {
+        \\    pub fn run(_: Parameter) Return {
+        \\        const value: Value = 0;
+        \\        return value;
+        \\    }
+        \\};
+    , "unused");
 }
 
 test "anonymous struct namespace reference counts as used" {

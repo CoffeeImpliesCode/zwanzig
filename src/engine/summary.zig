@@ -17,9 +17,10 @@ pub const FunctionSummary = struct {
     preconditions: std.ArrayList(Constraint),
     /// Postconditions: constraints on the return value
     postconditions: std.ArrayList(Constraint),
-    /// Whether the function can return an error
+    /// Whether an error outcome is possible, including unresolved return types.
+    /// Unless always_returns_error is true, the success outcome remains possible.
     may_return_error: bool,
-    /// Whether the function always returns an error
+    /// Whether every returning path is proven to produce an error.
     always_returns_error: bool,
     /// Whether the function may not return (e.g., @panic, noreturn)
     may_not_return: bool,
@@ -113,16 +114,19 @@ pub const FunctionSummary = struct {
         return true;
     }
 
-    /// Apply this summary to a program state, updating it with the postconditions.
-    /// Returns true if the resulting state is satisfiable, false if postconditions
-    /// contradict existing constraints (infeasible state).
+    /// Apply postconditions once per call. An always-error summary produces only
+    /// error_active; otherwise this state preserves the caller's pending error.
+    /// When may_return_error and !always_returns_error, the caller must also fork
+    /// this result, set the fork to error_active, and enqueue both outcomes.
+    /// Returns false if postconditions contradict existing constraints.
+    /// Fork only a satisfiable result; do not reapply the summary to the fork.
     pub fn applyToState(self: *FunctionSummary, state: *ProgramState) !bool {
         // Apply postconditions
         for (self.postconditions.items) |postcond| {
             try state.addConstraint(postcond);
         }
 
-        // Update error state based on summary
+        // A possible error is a separate outcome, not a state overwrite.
         if (self.always_returns_error) {
             state.setErrorState(.error_active);
         }
@@ -377,6 +381,33 @@ test "FunctionSummary apply to state" {
 
     // Constraint should be added to state
     try std.testing.expectEqual(@as(usize, 1), state.constraintCount());
+}
+
+test "FunctionSummary possible error retains the successful outcome" {
+    const allocator = std.testing.allocator;
+    var summary = FunctionSummary.init(allocator, ids.astId(1));
+    defer summary.deinit();
+    summary.setErrorBehavior(true, false);
+
+    var state = ProgramState.init(allocator);
+    defer state.deinit();
+    try std.testing.expect(summary.isApplicable(&state));
+    try std.testing.expect(try summary.applyToState(&state));
+    try std.testing.expect(state.isNormalPath());
+}
+
+test "FunctionSummary successful call preserves a pending caller error" {
+    const allocator = std.testing.allocator;
+    var summary = FunctionSummary.init(allocator, ids.astId(1));
+    defer summary.deinit();
+    summary.markPure();
+
+    var state = ProgramState.init(allocator);
+    defer state.deinit();
+    state.setErrorState(.error_active);
+    try std.testing.expect(summary.isApplicable(&state));
+    try std.testing.expect(try summary.applyToState(&state));
+    try std.testing.expect(state.isErrorPath());
 }
 
 test "FunctionSummary error behavior propagation" {

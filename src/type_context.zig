@@ -56,6 +56,11 @@ pub const TypeContext = struct {
     // Core Type Query API
     // =========================================================================
 
+    /// Require type information while preserving frontend and allocation errors.
+    pub fn ensureAvailable(self: *TypeContext) zir_bridge_mod.ZirBridgeError!void {
+        _ = try self.source.requireZirBridge();
+    }
+
     /// Check if type information is available.
     pub fn isAvailable(self: *TypeContext) bool {
         return self.source.hasTypeInfo();
@@ -1212,6 +1217,17 @@ test "TypeContext basic creation" {
     defer ctx.deinit();
 
     try std.testing.expect(ctx.isAvailable());
+}
+
+test "TypeContext required availability preserves frontend failure" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "test.zig", "const x = @zwanzigUnsupportedBuiltin();");
+    defer source.deinit();
+    var context = TypeContext.init(allocator, &source);
+    defer context.deinit();
+
+    try std.testing.expect(!context.isAvailable());
+    try std.testing.expectError(error.AstGenFailed, context.ensureAvailable());
 }
 
 test "TypeContext getDeclType" {

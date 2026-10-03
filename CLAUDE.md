@@ -12,15 +12,15 @@ Zwanzig is a static analyzer and linter for Zig. It uses a modular rule-based ar
 zig build              # Build the project
 zig build test         # Run all tests
 zig build run -- <files>  # Run analyzer on files
-zig fmt src            # Format code with the canonical Zig 0.15.2 shell
-zig fmt --check src/   # Check canonical formatting
+nix develop .#zig015 -c zig fmt src           # Canonical formatter
+nix develop .#zig015 -c zig fmt --check src/  # Check canonical formatting
 ```
 
 With `just` (recommended):
 ```bash
 just build    # Build
 just test     # Run tests
-just lint     # Format check + shellcheck
+just lint     # Shellcheck + doc versions + self-analysis (+ fmt on 0.15.2)
 just ci       # Full CI: build + test + lint
 ```
 
@@ -31,23 +31,26 @@ just ci       # Full CI: build + test + lint
 
 ## Requirements
 
-For any code changes, run both tests and linting:
-- `just test`
-- `just lint`
+For code changes, run tests and lint in both pinned shells:
+- `nix develop -c just test`
+- `nix develop -c just lint`
+- `nix develop .#zig015 -c just test`
+- `nix develop .#zig015 -c just lint`
 
 `just lint` also runs zwanzig on its own code. All issues should be fixed before submitting changes. If this is complicated or not possible, ask the user.
 
 All new rules/checkers must have test fixtures.
 
-All code must be formatted with `zig fmt` from Zig 0.15.2, which is the
-project's sole canonical formatter. The Zig 0.16.0 shell is used to validate
-the alternate embedded frontend; its formatter output is not authoritative.
+Format all code with Zig 0.15.2, the sole canonical formatter. Use
+`nix develop .#zig015 -c just fmt`. The default Zig 0.16.0 shell validates
+the current embedded frontend. Its formatter output is not authoritative.
+`just lint` checks formatting only in the Zig 0.15.2 compatibility shell.
 
 Any changes or additions to the existing rules/checkers must be documented.
 
 ## Changelog
 
-After completing a user-visible change, add a short entry to the `## [Unreleased]` section of `CHANGELOG.md` under `### Added`, `### Changed`, `### Fixed`, or `### Removed` as appropriate. Keep the entry user-focused (what changed from the user's perspective, not implementation detail) and include the related issue and/or PR number, e.g. `(#42)` or `(PR #42)`. Skip the entry for purely internal changes (refactors, test-only changes, CI tweaks) that a user would not notice.
+After completing a user-visible change, add a short entry to the `## [Unreleased]` section of `CHANGELOG.md` under `### Added`, `### Changed`, `### Fixed`, or `### Removed` as appropriate. Keep the entry user-focused (what changed from the user's perspective, not implementation detail) and include the related issue or PR number when one exists, e.g. `(#42)` or `(PR #42)`. Do not invent a number for local changes. Skip the entry for purely internal changes (refactors, test-only changes, CI tweaks) that a user would not notice.
 
 The format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
@@ -57,17 +60,19 @@ When asked to release: create a PR for the version bump, wait for required check
 
 ## Development Environment
 
-Uses Nix flakes for reproducible dev environments. The default shell uses Zig 0.15.2:
+Nix flakes provide the pinned development environments. The default shell uses Zig 0.16.0:
 
 ```bash
 nix develop
 ```
 
-Use the Zig 0.16.0 shell to validate the alternate embedded frontend:
+Use the compatibility shell for Zig 0.15.2 and canonical formatting:
 
 ```bash
-nix develop .#zig016
+nix develop .#zig015
 ```
+
+Both Darwin shells retain the macOS SDK workaround. Do not remove it based on a Linux run or an assumed 0.16 linker fix.
 
 ## Infrastructure
 

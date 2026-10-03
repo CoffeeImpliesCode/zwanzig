@@ -1,108 +1,99 @@
 # Task: Zwanzig Correctness Fixes and Analysis Improvements
 
-Overview: Finish the remaining correctness work after VarId mapping and basic engine infrastructure landed. The focus now is on real constraint extraction, accurate error-path summaries, CFG-based unreachable detection, artifact caching, and documentation updates.
+This plan originally covered missing branch constraints, error-path summaries, unreachable-code proofs, and persistent analysis artifacts. The sections below separate implemented behavior from remaining scope.
 
-## Step 1: Implement branch constraint extraction
+## Verification status
 
-### Status Quo
-- VarId mapping and scope-aware resolution are in place.
-- `AnalysisEngine.extractBranchConstraint` only handles literal booleans and a placeholder operand encoding.
-- `CfgBuilder` does not encode comparison details, so conditions like `x == 0` or `x != null` do not yield constraints.
+Both frontend CLIs passed smoke checks for guarded integer divides, contradictory guards, conservative floating-point and wide-integer guards, hard call-context limits, and constant warnings under limits. Cold and warm disk-cache runs produced identical diagnostics. Compatible checkers reused one engine run, and one-worker and two-worker runs produced identical diagnostics. Contextual constant references retained the expected unused homonym report.
 
-### Objectives
-Extract simple, sound constraints from branch conditions and apply them on branch edges to enable path pruning and refined states.
+Use `nix develop` for Zig 0.16.0 and `nix develop .#zig015` for Zig 0.15.2. Only Zig 0.15.2 defines canonical formatting.
 
-### Tech Notes
-- Parse the condition AST directly for binary comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) and null checks.
-- Map identifiers to canonical VarIds using the existing resolver.
-- Emit `Constraint.intCompare` for integer literals and `Constraint.nullCheck` for optional comparisons.
-- Keep boolean checks for `if (flag)` and literal conditions.
-- Do not invent constraints for complex expressions; return null when uncertain.
+Full `just test` and `just lint` runs, including analyzer self-checks, passed for the revision these steps were written against. Later edits are not covered by that result. The verification status of the current revision is recorded in [the migration plan](../ZIG_0_16_MIGRATION_PLAN.md#current-status).
 
-### Acceptance Criteria
-- `just test` passes with new constraint extraction tests.
-- Fixture: `if (x == null) {}` applies a null constraint to `x` on the true branch.
-- Fixture: `if (x < 0) {}` applies an integer constraint on the true branch.
-- `just lint` passes.
+### Performance measurements
 
-## Step 2: Fix summary error-path correctness
+The measured runs that motivated the indexing and reuse work used frozen input snapshots, one analysis worker, nice level 15 and unchanged default analysis limits, and compared diagnostic multisets, exit status and analysis-limit warnings before and after each change. Those workloads, their timings and their hashes are private evidence and are not published here.
 
-### Status Quo
-- Summary computation only detects `try`/`try_error` edges.
-- Explicit error returns (`return error.Foo`) and error-union returns are not reflected in summaries.
-- `FunctionSummary.applyToState` only marks error state for `always_returns_error`.
+## Step 1: Extract branch constraints
 
-### Objectives
-Ensure summaries conservatively preserve error behavior so callers see error paths when a callee can return errors.
+### Implemented
+- The extractor reads condition ASTs and resolves identifiers to canonical VarIds. It no longer depends on placeholder comparison operands.
+- Integer comparisons, null checks, boolean checks, and literal conditions can refine branch states.
+- Integer guards require a proven safe signed-i64 domain. Floating-point, unknown, and wider values remain conservative.
+- Uncertain expressions do not establish path-pruning constraints.
 
-### Tech Notes
-- Inspect return expressions in `computeSummary` to detect explicit error values.
-- When `TypeContext` is available, treat error-union return types as `may_return_error`.
-- If summary applicability is unclear (missing types or ambiguous control flow), fall back to inlining.
-- Apply `may_return_error` by forking or marking error paths in `applyToState` (keep conservative).
+### Remaining scope
+Richer numeric domains and additional expression forms remain future work. The current integer domain does not establish general arithmetic soundness for every Zig type.
 
-### Acceptance Criteria
-- `just test` passes with summary error-path tests.
-- Fixture: function returning `error.Foo` sets `may_return_error` in its summary.
-- Fixture: caller of error-returning function shows an error path in the exploded graph.
-- `just lint` passes.
+### Acceptance criteria
+- A supported optional comparison applies the correct null constraint on each branch.
+- `if (x < 0) {}` refines `x` only when its integer domain supports the proof.
+- Unsupported numeric domains do not cause false path pruning or suppress reachable diagnostics.
+- The full dual-frontend test and lint gates pass.
 
-## Step 3: Use CFG/exploded graph reachability for unreachable code
+## Step 2: Preserve summary error paths
 
-### Status Quo
-- The AST rule handles obvious unreachable code after returns.
-- `unreachable-code-engine` only reports constant conditions via AST evaluation.
-- The exploded graph is not used to detect unreachable CFG nodes.
+### Implemented
+- Summary computation accounts for explicit error returns and available error-union return information.
+- Mixed success/error summaries fork caller states into success and error paths.
+- Summary application preserves an error already pending in the caller.
 
-### Objectives
-Report unreachable code based on CFG reachability and path feasibility, not just constant conditions.
+### Remaining scope
+A full error-union value redesign and cross-file call execution remain roadmap work. Current summary branching does not imply either feature.
 
-### Tech Notes
-- Add or extend an engine-based checker to scan CFG nodes with no reachable exploded states.
-- Report only when **no** feasible states reach a node (conservative).
-- Map unreachable CFG nodes back to source ranges for diagnostics.
+### Acceptance criteria
+- A summary for `return error.Foo` preserves the possible error outcome.
+- A mixed-return callee retains both caller outcomes.
+- A successful callee outcome does not erase a pending caller error.
+- The full dual-frontend test and lint gates pass.
 
-### Acceptance Criteria
-- `just test` passes with engine-based unreachable code tests.
-- Fixture: `if (true) { return; } doSomething();` marks `doSomething()` as unreachable.
-- Fixture: loop with guaranteed early return marks trailing code unreachable.
-- `just lint` passes.
+## Step 3: Prove limited path-based unreachability
 
-## Step 4: Cache intermediate artifacts (typed IR/CFG/summaries)
+### Implemented
+- The AST checks retain constant-condition and obvious unreachable-code diagnostics.
+- `unreachable-code-engine` also uses path constraints for a limited proof under immutable scalar enclosing guards.
+- Path-based proofs require complete function analysis. A missing exploded-graph node alone does not prove unreachable code.
+- Hard state caps count all call contexts at each CFG point. A limit stops the incomplete analysis and emits a warning.
+- A limit disables incomplete path proofs, not independently established constant-condition warnings.
 
-### Status Quo
-- Cache infrastructure and `CachedArtifacts` exist, but only minimal metadata is stored.
-- CFGs, summaries, and typed IR are rebuilt on every run even with `--cache`.
+### Remaining scope
+The original plan proposed scanning every CFG node without exploded states. That broad rule is not implemented and is not a sound replacement for the restricted proof. General loop and trailing-code proofs require separate support.
 
-### Objectives
-Persist and reuse intermediate artifacts while still recomputing diagnostics on every run.
+### Acceptance criteria
+- Contradictory supported enclosing guards can establish an unreachable path after complete analysis.
+- Mutable guards and incomplete analyses do not establish that proof.
+- A hard state cap does not exceed its configured count across call contexts.
+- Constant warnings remain visible when path analysis reaches a limit.
+- The full dual-frontend test and lint gates pass.
 
-### Tech Notes
-- Serialize CFGs and summaries into `CachedArtifacts` after analysis.
-- On cache hit, load artifacts and reuse them where safe (no diagnostics caching).
-- Guard reuse by cache version and build metadata; fall back to recomputation when missing.
+## Step 4: Reuse CFG and function-analysis artifacts
 
-### Acceptance Criteria
-- `just test` passes with artifact caching tests.
-- Running the analyzer twice on unchanged input reuses cached CFG/summaries but still produces diagnostics.
-- `just lint` passes.
+### Implemented
+- `--cache` persists CFG artifacts, not only metadata. Diagnostics are recomputed on every run.
+- Warm CFGs regain live declaration annotations before type-aware analysis. Cache identity and artifact versions guard reuse.
+- Within a file, compatible configured function analyses use exclusive mutable leases from `AnalysisCache`. Plain or unstable owned CFGs remain uncached.
+- The per-file `TypeContext` outlives its `AnalysisCache`.
+- Cache admission occurs after checker lazy queries. Retention is bounded to 64 entries and 16 MiB of live engine-owned allocation payload.
+- The payload bound is not an RSS limit. Separately owned artifact allocations are outside it. Statistics count actual analysis runs.
 
-## Step 5: Update documentation for adjustments
+### Remaining scope
+Full persisted ZIR, typed IR, and summaries remain future work. In-memory function-analysis reuse does not provide cross-run persistence for these artifacts. No performance improvement is claimed without measurements.
 
-### Status Quo
-- `docs/IMPLEMENTATION.md` documents VarId mapping and current cache behavior.
-- Diagnostic ownership, constraint extraction semantics, and CFG-based unreachable detection are not documented.
+### Acceptance criteria
+- Repeated analysis with `--cache` reuses compatible CFGs and still computes diagnostics.
+- Warm CFG type annotations produce the same diagnostic behavior as cold analysis.
+- Incompatible analyses do not share mutable state. Retained engine payload stays within the cache admission limits.
+- The full dual-frontend test and lint gates pass. Separate measurements establish any performance claim.
 
-### Objectives
-Update internal and user-facing docs to reflect the completed adjustments.
+## Step 5: Keep documentation aligned
 
-### Tech Notes
-- Document diagnostic ownership (messages are owned by `Diagnostic`).
-- Document branch constraint extraction and summary error-path behavior.
-- Update cache documentation to reflect artifact reuse once implemented.
-- Add a note about CFG/exploded-graph-based unreachable detection.
+### Documentation contract
+- `docs/IMPLEMENTATION.md` describes diagnostic ownership, constraint extraction, summary branching, limited unreachable proofs, and both cache lifetimes.
+- User-facing docs distinguish supported proofs from general CFG reachability.
+- Plans distinguish implementation from validation. They do not treat pending gates or performance measurements as passed.
+- Persistent typed IR/summaries, additional parity rules, full sentinel-value propagation, the error-union value redesign, and cross-file call execution remain roadmap work.
 
-### Acceptance Criteria
-- `docs/IMPLEMENTATION.md` covers diagnostic ownership, constraint extraction, summary error paths, and artifact caching.
-- `README.md` (and/or `docs/RULES.md`) mentions CFG-based unreachable detection if user-facing.
-- `just lint` passes.
+### Acceptance criteria
+- Documentation matches the implemented behavior and states its limits.
+- Future rules and richer domains are not listed as shipped features.
+- Release and validation claims retain their actual verification status.

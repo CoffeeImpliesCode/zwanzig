@@ -35,7 +35,7 @@ pub const SwallowedErrorChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
         // Find all function declarations and analyze each one
@@ -54,44 +54,23 @@ pub const SwallowedErrorChecker = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         context: checker_mod.CheckerContext,
     ) CheckerError!void {
-        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch return) orelse return;
+        var cfg_handle = (context.getOrBuildCfg(allocator, src, fn_node) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidAst => return,
+        }) orelse return;
         defer cfg_handle.deinit();
 
-        const tree = src.ast() catch return;
+        const tree = try src.ast();
         const data = tree.nodes.items(.data);
         const node_tags = tree.nodes.items(.tag);
         const parent_map = try allocator.alloc(u32, node_tags.len);
         defer allocator.free(parent_map);
         @memset(parent_map, 0);
         ast_walk.fillParentMap(tree, ids.astIndex(fn_node), parent_map);
-        // Run the analysis engine with a worklist limit to avoid pathological cases
-        var engine = AnalysisEngine.initWithSource(allocator, cfg_handle.cfg, src);
-        defer engine.deinit();
-        engine.setCheckerName("swallowed-error");
-        if (context.cached_artifacts) |artifacts| {
-            engine.setCachedArtifacts(artifacts);
-        }
-        if (context.build_metadata) |metadata| {
-            engine.setBuildMetadata(metadata);
-        }
-        if (context.analysis_limits.max_worklist_steps) |steps| {
-            engine.setMaxWorklistSteps(steps);
-        }
-        if (context.analysis_limits.max_states_per_point) |max| {
-            engine.setMaxStatesPerPoint(max);
-        }
-        if (context.analysis_limits.use_widening) |use_w| {
-            engine.setUseWidening(use_w);
-        }
-        var engine_ok = true;
-        engine.run() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.AnalysisLimitExceeded => engine_ok = false,
-        };
-        if (context.analysis_stats) |stats| {
-            stats.recordRun();
-            stats.recordWidening(engine.getGraph().getWidenedNodeCount(), engine.getGraph().getWideningConvergedCount());
-        }
+
+        var analysis = try context.getOrAnalyze(allocator, src, &cfg_handle, checker.name, .plain);
+        defer analysis.deinit();
+        const engine = analysis.engine;
 
         // Dump visualizations if requested
         if (context.dump_exploded_graph_dir) |dir| {
@@ -111,7 +90,7 @@ pub const SwallowedErrorChecker = struct {
                 const handler_ast = ids.astId(@intFromEnum(data[catch_ast].node_and_node[1]));
                 if (!isBlockHandler(tree, handler_ast)) continue;
                 const payload_token = catchPayloadToken(tree, ids.astId(catch_ast));
-                const engine_ptr: ?*const AnalysisEngine = if (engine_ok) &engine else null;
+                const engine_ptr: ?*const AnalysisEngine = if (analysis.complete) engine else null;
                 if (try isErrorSwallowed(
                     cfg_handle.cfg,
                     cfg_node.index,
@@ -124,16 +103,16 @@ pub const SwallowedErrorChecker = struct {
                 )) {
                     // Get source range from IR node
                     if (cfg_node.ir_node.source_range) |range| {
-                        const diag = Diagnostic.init(
+                        var diag = try Diagnostic.init(
                             allocator,
                             src.getFilePath(),
                             "swallowed-error",
                             .warning,
                             "Error is swallowed without logging or rethrowing. Consider handling the error properly.",
                             range,
-                        ) catch return;
-
-                        diagnostics.append(allocator, diag) catch return;
+                        );
+                        errdefer diag.deinit(allocator);
+                        try diagnostics.append(allocator, diag);
                     }
                 }
             }
@@ -197,6 +176,7 @@ pub const SwallowedErrorChecker = struct {
         defer visited.deinit();
 
         try current_nodes.append(allocator, entry);
+        var reaches_merge_from_handler = false;
 
         while (current_nodes.items.len > 0) {
             const node_idx = current_nodes.pop() orelse continue;
@@ -204,8 +184,9 @@ pub const SwallowedErrorChecker = struct {
             if (visited.contains(node_idx)) continue;
             try visited.put(node_idx, {});
 
-            // Stop if we reach the merge node
+            // Completion is an edge to this catch's merge, not a handler node count.
             if (merge_node != null and node_idx == merge_node.?) {
+                reaches_merge_from_handler = true;
                 continue;
             }
 
@@ -221,13 +202,11 @@ pub const SwallowedErrorChecker = struct {
                 else => {},
             }
 
-            // Find successors within the handler
+            // Standalone handlers reach their merge through catch_success edges.
+            // The merge check above stops before statements after the catch.
             for (cfg.edges.items) |edge| {
                 if (edge.from == node_idx) {
-                    // Don't follow edges that leave the handler context
-                    if (edge.kind != .catch_success) {
-                        try current_nodes.append(allocator, edge.to);
-                    }
+                    try current_nodes.append(allocator, edge.to);
                 }
             }
         }
@@ -266,23 +245,9 @@ pub const SwallowedErrorChecker = struct {
             return true;
         }
 
-        // Also flag as swallowed if there's no return and no call even without engine check
-        // This catches cases where the CFG structure shows a non-empty handler that
-        // doesn't do anything useful
-        if (!has_return and !has_call and !has_input_progress and handler_entry != merge_node) {
-            // Verify the handler actually has statements by checking it's not just going to merge
-            var nodes_in_handler: u32 = 0;
-            var iter = visited.iterator();
-            while (iter.next()) |_| {
-                nodes_in_handler += 1;
-            }
-            // If we visited more than just the entry node, there's a handler body
-            if (nodes_in_handler > 1) {
-                return true;
-            }
-        }
-
-        return false;
+        // Empty handlers were excluded above. With incomplete analysis, require
+        // a CFG path from the non-empty handler to its normal continuation.
+        return !has_return and !has_call and !has_input_progress and reaches_merge_from_handler;
     }
 
     const ErrorStoreFinder = struct {
@@ -766,6 +731,50 @@ test "swallowed_error - detects swallowed error with assignment only" {
     try testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
 }
 
+test "swallowed_error - fallback stops at the handler merge and requires completion" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn fail() error{Failed}!void {
+        \\    return error.Failed;
+        \\}
+        \\fn afterCatch() void {}
+        \\fn unsafeControl() void {
+        \\    var ignored = false;
+        \\    fail() catch {
+        \\        ignored = true;
+        \\    };
+        \\    afterCatch();
+        \\    _ = ignored;
+        \\}
+        \\fn terminatingHandler() void {
+        \\    var ignored = false;
+        \\    fail() catch {
+        \\        ignored = true;
+        \\        unreachable;
+        \\    };
+        \\    _ = ignored;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // A later call cannot handle this error; an unreachable handler cannot resume.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
+        try std.testing.expectEqual(@as(usize, 7), diagnostics.items[0].range.start.line);
+    }
+}
+
 test "skript regression: malformed input recovery is not a swallowed error" {
     const allocator = std.testing.allocator;
     const code: [:0]const u8 =
@@ -793,15 +802,22 @@ test "skript regression: malformed input recovery is not a swallowed error" {
     var source = Source.init(allocator, "skript-regression.zig", code);
     defer source.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
-    defer {
-        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
-        diagnostics.deinit(allocator);
+    // The AST fallback must retain recovery handling when analysis stops early.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        var stats: checker_mod.AnalysisStats = .{};
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_stats = &stats,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
+        try std.testing.expectEqual(@as(usize, 16), diagnostics.items[0].range.start.line);
+        try std.testing.expectEqual(@as(u64, 3), stats.total_runs);
     }
-
-    try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
-        .build_metadata = null,
-    });
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
 }
