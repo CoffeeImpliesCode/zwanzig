@@ -16,8 +16,8 @@
 - Typed preflight follows enabled checker demand. Frontend failures emit `frontend-error`. Required typed checks skip the file, while optional checks can use AST fallback.
 - Parser errors emit diagnostics and skip malformed files without stopping valid sibling files. Both pinned frontends reject `usingnamespace`.
 - Earlier CLI smoke checks covered parser recovery, frontend mismatch reporting, AST-only selections, cold/warm cache equivalence, and one-worker/two-worker diagnostic equivalence. They describe the revision they were run against, not the current one.
-- What has actually been run against the current revision is a bounded native packaging smoke: a Zig 0.16.0 build of this tree completed successfully, and `zwanzig --threads 1 --max-steps 1` over a small throwaway loop fixture exited 1 and reported `analysis-limit-exceeded` from each of the two enabled dataflow rules. That checks the build and the budget-exhaustion CLI contract on one fixture. It is not consumer-corpus acceptance.
-- Full `just test` and `just lint` gates, the Zig 0.15.2 formatting check, and analyzer self-checks have not been run for the current revision and remain pending. Earlier passing gate results belong to the revisions they were run against and are not evidence for this one. See [Current checkpoint and remaining verification](#current-checkpoint-and-remaining-verification).
+- Current Linux verification: `just ci` passed in both pinned shells. Each run passed a ReleaseSafe build, all 736 tests, documentation-version checks, ShellCheck, and self-analysis of 107 source files. Zig 0.15.2 canonical formatter checks also passed for `src` and the frontend-matrix fixtures.
+- CLI smokes passed in both shells: version reporting, clean and violating fixtures, rejected unknown and assignment-form options, empty input selection, deferred mutation, analysis-budget errors, type-versus-value names, division by zero, and shared frontend diagnostic parity. These checks do not establish consumer-corpus performance.
 - A successful release tag and its published artifacts remain external verification. The open Task 10 checklist still applies.
 
 Both Nix shells currently apply the Darwin SDK workaround. The 2026-08-21 inventory recorded a successful 0.16 build without it on one Darwin host. That result does not establish that every supported Darwin host can omit it. This Linux session cannot verify Darwin behavior. Keep the workaround until supported-host evidence justifies its removal.
@@ -507,14 +507,14 @@ git commit -m "docs: add Zig 0.16 migration breakage inventory"
 
 ### Task 7 (checkpoint): Expand Phases 2–4 into a detailed plan
 
-**Status: policy review closed.** The compatibility code, frontend fixtures, and CI/release configurations are implemented. Current validation is separate from that implementation status. Full dual-frontend gates and successful-release verification remain pending.
+**Status: policy review closed.** The compatibility code, frontend fixtures, and CI/release configurations are implemented. Current Linux dual-frontend gates passed. Successful-release verification remains pending.
 
 #### Current status
 
 - `build.zig` selects the 0.15.2/0.16.0 build-script APIs. `src/compat.zig` selects the I/O and ZIR adapters. The shared analyzer receives an explicit I/O context.
 - The 2026-08-21 inventory recorded 16 main-target and 8 fixture-target compile errors before spike fixes. Its 15 shared `check-fixtures` failures are a historical baseline.
 - That inventory's Darwin result applied to one host. Both current Nix shells retain the SDK workaround. No current Darwin verification is available from this Linux session.
-- Earlier migration entries recorded passing fixture, cache, executor, test, and lint checks. They do not verify the current repairs.
+- Both current local `just ci` runs passed; each executed 685 unit tests and 51 fixture-suite tests.
 - CI configures both pinned frontends. The release workflow configures one named artifact per platform/frontend pair. Successful release-tag verification remains open.
 
 #### Objectives
@@ -558,9 +558,9 @@ remaining work.
 
 #### Current status
 
-The shared, matching, and mismatching frontend fixtures are implemented. The earlier migration checklist recorded successful matrix checks. Full revalidation for the current changes remains pending in the checklist below.
+The shared, matching, and mismatching frontend fixtures passed the current test suite in both pinned shells. The shared fixture also produced identical CLI diagnostic objects in both shells. The separate `check-fixtures` compilation sweep remains unverified for this revision.
 
-The following implementation contract describes the existing matrix. It is not a claim that its current full-suite gates have passed.
+The following implementation contract describes the existing matrix.
 
 #### Objectives
 
@@ -621,10 +621,10 @@ the same diagnostic fields under both builds.
 
 #### Acceptance criteria
 
-- [ ] `nix develop -c just test` passes for the current changes, including the 0.16 matching and mismatching assertions.
-- [ ] `nix develop .#zig015 -c just test` passes with the inverse fixture selection.
+- [x] `nix develop -c just test` passes for the current changes, including the 0.16 matching and mismatching assertions.
+- [x] `nix develop .#zig015 -c just test` passes with the inverse fixture selection.
 - [ ] `nix develop -c zig build check-fixtures` and `nix develop .#zig015 -c zig build check-fixtures` introduce no unexplained failures. Compare with the dated inventory's 15-failure baseline rather than silently filtering failures. Matching fixtures must compile.
-- [ ] The shared fixture produces identical expected diagnostic fields in both toolchains. `nix develop .#zig015 -c zig fmt --check test/fixtures/frontend_matrix` passes with the canonical formatter. `@Int` is parseable in 0.15.2 but fails at AstGen.
+- [x] The shared fixture produces identical expected diagnostic fields in both toolchains. `nix develop .#zig015 -c zig fmt --check test/fixtures/frontend_matrix` passes with the canonical formatter. `@Int` is parseable in 0.15.2 but fails at AstGen.
 
 ---
 
@@ -632,7 +632,7 @@ the same diagnostic fields under both builds.
 
 #### Current status
 
-`.github/workflows/build.yml` configures a two-entry frontend matrix. Zig 0.15.2 uses `.#zig015`, and Zig 0.16.0 uses the default shell (`.`). Each leg invokes `just ci`. The earlier checklist recorded passing gates, but current local and CI results require fresh verification.
+`.github/workflows/build.yml` configures a two-entry frontend matrix. Zig 0.15.2 uses `.#zig015`, and Zig 0.16.0 uses the default shell (`.`). Each leg invokes `just ci`. Both current local runs passed. Workflow YAML syntax and matrix values were checked locally; a current GitHub Actions run remains unverified.
 
 #### Implementation contract
 
@@ -648,7 +648,7 @@ the same diagnostic fields under both builds.
 - [x] Only the canonical 0.15.2 leg is configured to upload SARIF.
 - [x] Cache keys and restore prefixes contain the frontend identity.
 - [ ] A current code-changing CI run verifies both legs and the aggregate result.
-- [ ] The workflow YAML validates. Current local equivalents `nix develop -c just ci` and `nix develop .#zig015 -c just ci` pass.
+- [x] The workflow YAML validates. Current local equivalents `nix develop -c just ci` and `nix develop .#zig015 -c just ci` pass.
 
 ---
 
@@ -699,7 +699,7 @@ make the embedded language frontend unambiguous before download.
 
 #### Current status
 
-The implementation and policy decisions are recorded above. The current changes still require full dual-frontend test and lint gates. Task 10's successful-release criteria remain external and unverified. Task 7 records the adopted support lifetime, canonical formatter, and deferred launcher.
+The implementation and policy decisions are recorded above. Full dual-frontend build, test, and lint gates passed locally on Linux. Task 10's successful-release criteria remain external and unverified. Task 7 records the adopted support lifetime, canonical formatter, and deferred launcher.
 
 #### Objectives
 
@@ -725,5 +725,5 @@ actually passed.
   contradictory statements in `README.md`, `docs/USAGE.md`, `CLAUDE.md`, or
   `docs/DEVELOPMENT.md`.
 - [x] This plan separates historical checkmarks, implemented configuration, current validation, and external release verification.
-- [ ] The current implementation run passes `just test` and `just lint` under both pinned shells.
+- [x] The current implementation run passes `just test` and `just lint` under both pinned shells.
 - [ ] Any claimed performance improvement has measurements. No speedup is established by this documentation update.

@@ -2,6 +2,7 @@ zig-out/
 zig-cache/
 .zig-cache
 .zwanzig-cache/
+/results.sarif
 test-cache-tmp/
 test-cache-tmp2/
 test-cache-tmp3/
