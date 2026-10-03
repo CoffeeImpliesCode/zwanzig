@@ -33,3 +33,7 @@ pub const ExplodedNode = graph.ExplodedNode;
 pub const ExplodedGraph = graph.ExplodedGraph;
 
 pub const AnalysisEngine = analysis.AnalysisEngine;
+
+test {
+    _ = graph;
+}

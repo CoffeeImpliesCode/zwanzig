@@ -1,23 +1,25 @@
 const std = @import("std");
 
 pub const Context = struct {
-    threaded: ?std.Io.Threaded,
+    threaded: std.Io.Threaded,
 
     pub fn init(allocator: std.mem.Allocator, thread_count: usize) !Context {
+        std.debug.assert(thread_count > 0);
         return .{
             .threaded = .init(allocator, .{
-                .async_limit = .limited(thread_count),
+                // Io.async also runs work eagerly on the calling thread.
+                .async_limit = .limited(thread_count - 1),
                 .concurrent_limit = .limited(thread_count),
             }),
         };
     }
 
     pub fn deinit(self: *Context) void {
-        if (self.threaded) |*threaded| threaded.deinit();
+        self.threaded.deinit();
     }
 
     pub fn io(self: *Context) std.Io {
-        return self.threaded.?.io();
+        return self.threaded.io();
     }
 };
 
@@ -66,6 +68,33 @@ pub const Executor = struct {
     }
 };
 
+test "Executor respects a single analysis worker" {
+    const Probe = struct {
+        io_context: *Context,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+
+        fn task(_: usize, opaque_context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(opaque_context));
+            const active = self.active.fetchAdd(1, .seq_cst) + 1;
+            _ = self.peak.fetchMax(active, .seq_cst);
+            std.Io.sleep(self.io_context.io(), .fromMilliseconds(10), .awake) catch unreachable;
+            _ = self.active.fetchSub(1, .seq_cst);
+            _ = self.completed.fetchAdd(1, .seq_cst);
+        }
+    };
+    var context = try Context.init(std.testing.allocator, 1);
+    defer context.deinit();
+    var executor = try Executor.init(&context, std.testing.allocator, 1);
+    defer executor.deinit();
+    var probe: Probe = .{ .io_context = &context };
+    for (0..8) |index| try executor.spawn(Probe.task, index, &probe);
+    try executor.wait();
+    try std.testing.expectEqual(@as(usize, 8), probe.completed.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 1), probe.peak.load(.seq_cst));
+}
+
 pub const Mutex = std.Io.Mutex;
 
 pub fn initMutex() Mutex {
@@ -112,7 +141,8 @@ pub fn closeDir(context: *Context, directory: *Directory) void {
 
 pub fn nextDir(context: *Context, directory: *Directory) !?DirectoryEntry {
     if (directory.iterator == null) {
-        directory.iterator = directory.dir.iterate();
+        const iterator: std.Io.Dir.Iterator = directory.dir.iterate();
+        directory.iterator = iterator;
     }
     const entry = try directory.iterator.?.next(context.io()) orelse return null;
     return .{
@@ -143,7 +173,10 @@ pub fn readFileAlloc(
             // The reader exposes the underlying failure through `reader.err`.
             // zwanzig-disable-next-line: swallowed-error
         ) catch |err| switch (err) {
-            error.ReadFailed => reader.err.?,
+            error.ReadFailed => blk: {
+                std.debug.assert(reader.err != null);
+                break :blk reader.err.?;
+            },
             error.OutOfMemory, error.StreamTooLong => |e| e,
         };
     }

@@ -1,6 +1,5 @@
 const std = @import("std");
 const TypeContext = @import("../type_context.zig").TypeContext;
-const call_utils = @import("../analysis/call_utils.zig");
 const import_resolver = @import("../analysis/import_resolver.zig");
 const call_resolver = @import("../analysis/call_resolver.zig");
 const Rule = @import("../rule.zig").Rule;
@@ -644,20 +643,6 @@ pub const UnusedDeclRule = struct {
                 }
             }
             return false;
-        }
-
-        fn typeNameMatchesOwner(type_name: []const u8, owner_name: []const u8) bool {
-            var name = type_name;
-            while (name.len > 0 and (name[0] == '?' or name[0] == '*')) {
-                name = name[1..];
-            }
-            while (std.mem.startsWith(u8, name, "const ")) {
-                name = name["const ".len..];
-            }
-            while (std.mem.startsWith(u8, name, "volatile ")) {
-                name = name["volatile ".len..];
-            }
-            return std.mem.eql(u8, normalizeIdentifier(name), normalizeIdentifier(owner_name));
         }
 
         fn scanChildren(self: *UsageScanner, node: u32) RuleError!bool {

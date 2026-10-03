@@ -5,6 +5,52 @@ const call_resolver = @import("../../analysis/call_resolver.zig");
 const import_resolver = @import("../../analysis/import_resolver.zig");
 const ids = @import("../../ids.zig");
 const TypeContext = @import("../../type_context.zig").TypeContext;
+const assertions = @import("../../assertions.zig");
+
+pub fn isGuardedByAssertion(
+    tree: *const std.zig.Ast,
+    unwrap_node: u32,
+    target: u32,
+    parent_map: []const u32,
+    type_context: ?*TypeContext,
+    scope: *const assertions.AssertionScope,
+) bool {
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    var block = unwrap_node;
+    for (0..64) |_| {
+        if (block >= parent_map.len) return false;
+        block = parent_map[block];
+        if (block == 0 or block >= tags.len) return false;
+        switch (tags[block]) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => break,
+            else => {},
+        }
+    } else return false;
+    var statements: [ast_walk.max_block_statements]u32 = undefined;
+    const count = ast_walk.getBlockStatements(tree, block, &statements) orelse return false;
+    const before = tree.nodeMainToken(@enumFromInt(unwrap_node));
+    var fact = false;
+    for (statements[0..count]) |statement| {
+        if (tree.firstToken(@enumFromInt(statement)) >= before) break;
+        if (statementMayMutateStorageBefore(tree, statement, target, tags, datas, block, unwrap_node, type_context))
+            fact = false;
+        if (tree.lastToken(@enumFromInt(statement)) >= before) continue;
+        const is_try = tags[statement] == .@"try";
+        const call_node = if (is_try) @intFromEnum(datas[statement].node) else statement;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, @enumFromInt(call_node)) orelse continue;
+        if (call.ast.params.len != 1) continue;
+        const name = assertions.resolveDebugAssertionName(tree, call.ast.fn_expr, scope) orelse
+            if (is_try) assertions.resolveAssertionName(tree, call.ast.fn_expr, scope) orelse continue else continue;
+        if (assertions.constraintKindForName(name) != .boolean) continue;
+        const condition = @intFromEnum(call.ast.params[0]);
+        if (conditionImpliesNotNull(tree, condition, target) and
+            !statementMayMutateStorage(tree, condition, target, tags, datas, block, type_context))
+            fact = true;
+    }
+    return fact;
+}
 
 pub fn isGuardedByLazyInit(
     tree: *const std.zig.Ast,
@@ -1469,7 +1515,12 @@ fn argumentMayMutateStorage(
                 if (!storageRootMatches(tree, argument, target)) return false;
                 return argumentExpressionMayEscape(type_context, argument);
             },
-            .address_of, .deref => return storageRootMatches(tree, argument, target),
+            .address_of => {
+                const pointee = @intFromEnum(datas[argument].node);
+                if (storageFieldsAreDisjoint(tree, pointee, target, type_context)) return false;
+                return storageRootMatches(tree, argument, target);
+            },
+            .deref => return storageRootMatches(tree, argument, target),
             .array_access => {
                 const base = @intFromEnum(datas[argument].node_and_node[0]);
                 if (storageRootMatches(tree, base, target)) return true;
@@ -2000,31 +2051,6 @@ fn firstParameterNode(tree: *const std.zig.Ast, fn_node: u32) ?u32 {
     const proto = tree.fullFnProto(&buffer, @enumFromInt(fn_node)) orelse return null;
     if (proto.ast.params.len == 0) return null;
     return @intFromEnum(proto.ast.params[0]);
-}
-
-fn getMethodNameFromCall(
-    tree: *const std.zig.Ast,
-    call_node: u32,
-    tags: []const std.zig.Ast.Node.Tag,
-    datas: []const std.zig.Ast.Node.Data,
-) ?[]const u8 {
-    if (call_node >= tags.len) return null;
-
-    if (!call_utils.isCallNode(tags[call_node])) {
-        return null;
-    }
-
-    // Get the callee
-    var call_buf: [1]std.zig.Ast.Node.Index = undefined;
-    const full_call = tree.fullCall(&call_buf, @enumFromInt(call_node)) orelse return null;
-    const callee = @intFromEnum(full_call.ast.fn_expr);
-
-    if (callee >= tags.len) return null;
-    if (tags[callee] != .field_access) return null;
-
-    // Get the method name
-    const field_token = datas[callee].node_and_token[1];
-    return tree.tokenSlice(field_token);
 }
 
 fn methodAssignsToField(

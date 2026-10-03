@@ -297,6 +297,43 @@ const CallableInfo = struct {
 pub const ProjectTypeResolver = struct {
     files: []const import_resolver.File,
     file_index: usize,
+    active_binding: ?*const BindingFrame = null,
+
+    const BindingFrame = struct {
+        file_index: usize,
+        reference_node: usize,
+        name: []const u8,
+        previous: ?*const BindingFrame,
+    };
+
+    fn forFile(self: ProjectTypeResolver, file_index: usize) ProjectTypeResolver {
+        var resolver = self;
+        resolver.file_index = file_index;
+        return resolver;
+    }
+
+    fn enterBinding(
+        self: ProjectTypeResolver,
+        name: []const u8,
+        node: usize,
+        frame: *BindingFrame,
+    ) ?ProjectTypeResolver {
+        var active = self.active_binding;
+        while (active) |entry| : (active = entry.previous) {
+            if (entry.file_index == self.file_index and
+                entry.reference_node == node and
+                std.mem.eql(u8, entry.name, name)) return null;
+        }
+        frame.* = .{
+            .file_index = self.file_index,
+            .reference_node = node,
+            .name = name,
+            .previous = self.active_binding,
+        };
+        var resolver = self;
+        resolver.active_binding = frame;
+        return resolver;
+    }
 
     fn currentFile(self: ProjectTypeResolver) import_resolver.File {
         return self.files[self.file_index];
@@ -620,10 +657,7 @@ pub const ProjectTypeResolver = struct {
                 const field_token = access[1];
                 if (field_token >= tree.tokens.len or tree.tokenTag(field_token) != .identifier) return null;
                 const receiver_type = self.resolveExprType(receiver_node) orelse return null;
-                const target_resolver = ProjectTypeResolver{
-                    .files = self.files,
-                    .file_index = receiver_type.file_index,
-                };
+                const target_resolver = self.forFile(receiver_type.file_index);
                 const method_name = import_resolver.normalizeIdentifier(tree.tokenSlice(field_token));
                 const proto_node = target_resolver.findMemberFunctionProto(
                     receiver_type,
@@ -641,7 +675,7 @@ pub const ProjectTypeResolver = struct {
             },
             .enum_literal => {
                 const expected = self.resolveExpectedTypeNode(call_node, depth + 1) orelse return null;
-                const owner_resolver = ProjectTypeResolver{ .files = self.files, .file_index = expected.file_index };
+                const owner_resolver = self.forFile(expected.file_index);
                 const owner = owner_resolver.resolveTypeNode(expected.node_index) orelse return null;
                 const name = import_resolver.normalizeIdentifier(tree.tokenSlice(tree.nodeMainToken(@enumFromInt(callee))));
                 const proto = self.findMemberFunctionProto(owner, name) orelse return null;
@@ -737,11 +771,14 @@ pub const ProjectTypeResolver = struct {
         name: []const u8,
         reference_node: usize,
     ) BindingResolution {
-        var binding = self.findNearestBinding(name, reference_node);
+        var frame: BindingFrame = undefined;
+        // Keep "found" on a cycle so callers do not retry through root lookup.
+        const resolver = self.enterBinding(name, reference_node, &frame) orelse return .{ .found = true };
+        var binding = resolver.findNearestBinding(name, reference_node);
         const declaration_node = binding.declaration_node orelse return binding;
         const full = self.currentFile().tree.fullVarDecl(@enumFromInt(declaration_node)) orelse return binding;
-        binding.resolved = self.resolveVarDeclType(full, declaration_node, name);
-        binding.is_type_namespace = self.varDeclIsTypeNamespace(full);
+        binding.resolved = resolver.resolveVarDeclType(full, declaration_node, name);
+        binding.is_type_namespace = resolver.varDeclIsTypeNamespace(full);
         return binding;
     }
 
@@ -1108,8 +1145,10 @@ pub const ProjectTypeResolver = struct {
         node_index: usize,
         decl_name: []const u8,
     ) ?ResolvedType {
+        var frame: BindingFrame = undefined;
+        const resolver = self.enterBinding(decl_name, node_index, &frame) orelse return null;
         if (full.ast.type_node.unwrap()) |type_node| {
-            if (self.resolveTypeNode(@intFromEnum(type_node))) |resolved| return resolved;
+            if (resolver.resolveTypeNode(@intFromEnum(type_node))) |resolved| return resolved;
         }
 
         const init_node = full.ast.init_node.unwrap() orelse return null;
@@ -1118,13 +1157,13 @@ pub const ProjectTypeResolver = struct {
         const tags = tree.nodes.items(.tag);
         if (init_index >= tags.len) return null;
         if (import_resolver.isBuiltinCallTag(tags[init_index])) {
-            return self.resolveBuiltinType(@intCast(init_index));
+            return resolver.resolveBuiltinType(@intCast(init_index));
         }
         if (isContainerTag(tags[init_index])) {
             return .{ .file_index = self.file_index, .type_name = decl_name, .container_node = @intCast(init_index) };
         }
-        if (isRootDeclNode(tree, node_index) and !self.varDeclIsTypeNamespace(full)) return null;
-        return self.resolveInitializerType(init_index);
+        if (isRootDeclNode(tree, node_index) and !resolver.varDeclIsTypeNamespace(full)) return null;
+        return resolver.resolveInitializerType(init_index);
     }
 
     fn resolveInitializerType(self: ProjectTypeResolver, node: usize) ?ResolvedType {
@@ -1212,10 +1251,7 @@ pub const ProjectTypeResolver = struct {
 
     fn resolveCallType(self: ProjectTypeResolver, node: u32) ?ResolvedType {
         if (self.resolveCallReturnTypeNode(node)) |return_type| {
-            const return_resolver = ProjectTypeResolver{
-                .files = self.files,
-                .file_index = return_type.file_index,
-            };
+            const return_resolver = self.forFile(return_type.file_index);
             if (return_resolver.resolveTypeNode(return_type.node_index)) |resolved| {
                 return resolved;
             }
@@ -1419,10 +1455,7 @@ pub const ProjectTypeResolver = struct {
         const pair = self.currentFile().tree.nodes.items(.data)[node].node_and_node;
         const base_node = @intFromEnum(pair[0]);
         const type_node = self.resolveExprTypeNode(base_node) orelse return null;
-        const resolver = ProjectTypeResolver{
-            .files = self.files,
-            .file_index = type_node.file_index,
-        };
+        const resolver = self.forFile(type_node.file_index);
         return resolver.resolveTypeNode(type_node.node_index);
     }
 
@@ -1456,10 +1489,7 @@ pub const ProjectTypeResolver = struct {
             .array_access => {
                 const pair = tree.nodes.items(.data)[node].node_and_node;
                 const base_type = self.resolveExprTypeNode(@intFromEnum(pair[0])) orelse return null;
-                const base_resolver = ProjectTypeResolver{
-                    .files = self.files,
-                    .file_index = base_type.file_index,
-                };
+                const base_resolver = self.forFile(base_type.file_index);
                 var visited: [64]u32 = undefined;
                 return base_resolver.resolveArrayElementTypeNode(base_type.node_index, &visited, 0);
             },
@@ -1652,18 +1682,12 @@ pub const ProjectTypeResolver = struct {
                 }
                 const init_node = full.ast.init_node.unwrap() orelse return null;
                 const init_type = self.resolveInitializerResultTypeNode(@intFromEnum(init_node)) orelse return null;
-                const init_resolver = ProjectTypeResolver{
-                    .files = self.files,
-                    .file_index = init_type.file_index,
-                };
+                const init_resolver = self.forFile(init_type.file_index);
                 return init_resolver.resolveArrayElementTypeNode(init_type.node_index, visited, depth + 1);
             },
             .field_access => {
                 const type_ref = self.resolveExprTypeNode(node) orelse return null;
-                const type_resolver = ProjectTypeResolver{
-                    .files = self.files,
-                    .file_index = type_ref.file_index,
-                };
+                const type_resolver = self.forFile(type_ref.file_index);
                 return type_resolver.resolveArrayElementTypeNode(type_ref.node_index, visited, depth + 1);
             },
             else => return null,
@@ -1671,10 +1695,7 @@ pub const ProjectTypeResolver = struct {
     }
 
     pub fn resolveFieldTypeNode(self: ProjectTypeResolver, base_type: ResolvedType, field_name: []const u8) ?ResolvedTypeNode {
-        const target = ProjectTypeResolver{
-            .files = self.files,
-            .file_index = base_type.file_index,
-        };
+        const target = self.forFile(base_type.file_index);
         if (base_type.container_node) |container_node| {
             return target.resolveContainerFieldTypeNode(
                 base_type.file_index,
@@ -1688,7 +1709,7 @@ pub const ProjectTypeResolver = struct {
     fn resolveRootFieldTypeNode(self: ProjectTypeResolver, file_index: usize, field_name: []const u8) ?ResolvedTypeNode {
         const tree = self.files[file_index].tree;
         const tags = tree.nodes.items(.tag);
-        const target = ProjectTypeResolver{ .files = self.files, .file_index = file_index };
+        const target = self.forFile(file_index);
         for (tree.rootDecls()) |decl_node| {
             const node = @intFromEnum(decl_node);
             if (node >= tags.len) continue;
@@ -1792,10 +1813,7 @@ pub const ProjectTypeResolver = struct {
     }
 
     fn resolveMemberType(self: ProjectTypeResolver, base_type: ResolvedType, member_name: []const u8) ?ResolvedType {
-        const member_resolver = ProjectTypeResolver{
-            .files = self.files,
-            .file_index = base_type.file_index,
-        };
+        const member_resolver = self.forFile(base_type.file_index);
         if (base_type.container_node) |container_node| {
             return member_resolver.resolveContainerFieldType(
                 base_type.file_index,
@@ -1823,17 +1841,10 @@ pub const ProjectTypeResolver = struct {
             const decl_name = import_resolver.normalizeIdentifier(tree.tokenSlice(name_token));
             if (!std.mem.eql(u8, decl_name, name)) continue;
 
-            const nested_resolver = ProjectTypeResolver{ .files = self.files, .file_index = file_index };
+            const nested_resolver = self.forFile(file_index);
             if (nested_resolver.resolveVarDeclType(full, node_index, decl_name)) |resolved| return resolved;
         }
         return null;
-    }
-
-    fn resolveFieldType(self: ProjectTypeResolver, base_type: ResolvedType, field_name: []const u8) ?ResolvedType {
-        if (base_type.container_node) |container_node| {
-            return self.resolveContainerFieldType(base_type.file_index, container_node, field_name);
-        }
-        return self.resolveRootFieldType(base_type.file_index, field_name);
     }
 
     fn resolveRootFieldType(self: ProjectTypeResolver, file_index: usize, field_name: []const u8) ?ResolvedType {
@@ -1881,7 +1892,7 @@ pub const ProjectTypeResolver = struct {
             const name = import_resolver.normalizeIdentifier(tree.tokenSlice(name_token));
             if (!std.mem.eql(u8, name, field_name)) return null;
 
-            const nested_resolver = ProjectTypeResolver{ .files = self.files, .file_index = file_index };
+            const nested_resolver = self.forFile(file_index);
             return nested_resolver.resolveVarDeclType(full, node, name);
         }
 
@@ -1892,7 +1903,7 @@ pub const ProjectTypeResolver = struct {
 
         if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), field_name)) return null;
 
-        const nested_resolver = ProjectTypeResolver{ .files = self.files, .file_index = file_index };
+        const nested_resolver = self.forFile(file_index);
         if (field.ast.type_expr.unwrap()) |type_node| {
             return nested_resolver.resolveTypeNode(@intFromEnum(type_node));
         }
@@ -2144,4 +2155,62 @@ fn findParentNode(tree: *const std.zig.Ast, child: u32) ?u32 {
         if (match.stop) return @intCast(index);
     }
     return null;
+}
+
+test "ProjectTypeResolver rejects cyclic aliases without hiding valid receivers" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const A = B;
+        \\const B = A;
+        \\const Good = struct {};
+        \\fn run(x: A, good: Good) void { x.run(); good.run(); }
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    const files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree }};
+    const resolver: ProjectTypeResolver = .{ .files = &files, .file_index = 0 };
+    var checked: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (tag != .field_access) continue;
+        const receiver = @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]);
+        const name = import_resolver.identifierName(&tree, receiver) orelse continue;
+        const resolved = resolver.resolveExprType(receiver);
+        if (std.mem.eql(u8, name, "x")) {
+            try std.testing.expectEqual(@as(?ResolvedType, null), resolved);
+        } else {
+            const good = resolved orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("Good", good.type_name.?);
+        }
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
+}
+
+test "ProjectTypeResolver rejects cross-file member alias cycles" {
+    const allocator = std.testing.allocator;
+    var first = try std.zig.Ast.parse(allocator,
+        \\const b = @import("b.zig");
+        \\pub const A = b.B;
+        \\fn run(x: A) void { x.run(); }
+    , .zig);
+    defer first.deinit(allocator);
+    var second = try std.zig.Ast.parse(allocator,
+        \\const a = @import("a.zig");
+        \\pub const B = a.A;
+    , .zig);
+    defer second.deinit(allocator);
+    const files = [_]import_resolver.File{
+        .{ .path = "a.zig", .tree = &first },
+        .{ .path = "b.zig", .tree = &second },
+    };
+    const resolver: ProjectTypeResolver = .{ .files = &files, .file_index = 0 };
+    for (first.nodes.items(.tag), 0..) |tag, node| {
+        if (tag != .field_access) continue;
+        const receiver = @intFromEnum(first.nodes.items(.data)[node].node_and_token[0]);
+        const name = import_resolver.identifierName(&first, receiver) orelse continue;
+        if (!std.mem.eql(u8, name, "x")) continue;
+        try std.testing.expectEqual(@as(?ResolvedType, null), resolver.resolveExprType(receiver));
+        return;
+    }
+    return error.TestUnexpectedResult;
 }

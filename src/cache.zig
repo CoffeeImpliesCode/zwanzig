@@ -180,9 +180,7 @@ pub const Cache = struct {
     }
 
     pub fn get(self: *Cache, key: CacheKey) !?[]u8 {
-        if (self.cache_dir == null) {
-            return null;
-        }
+        const cache_dir = self.cache_dir orelse return null;
 
         try compat.lockMutex(&self.mutex, self.io_context);
         defer compat.unlockMutex(&self.mutex, self.io_context);
@@ -190,7 +188,7 @@ pub const Cache = struct {
         var path_buf: [256]u8 = undefined;
         const cache_path = try Cache.getCachePath(key, &path_buf);
         var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ self.cache_dir.?, cache_path });
+        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ cache_dir, cache_path });
 
         const contents = compat.readFileAlloc(self.io_context, self.allocator, full_path, 10 * 1024 * 1024) catch |err| {
             return switch (err) {
@@ -226,9 +224,7 @@ pub const Cache = struct {
     }
 
     pub fn put(self: *Cache, key: CacheKey, data: []const u8) !void {
-        if (self.cache_dir == null) {
-            return;
-        }
+        const cache_dir = self.cache_dir orelse return;
 
         try compat.lockMutex(&self.mutex, self.io_context);
         defer compat.unlockMutex(&self.mutex, self.io_context);
@@ -236,7 +232,7 @@ pub const Cache = struct {
         var path_buf: [256]u8 = undefined;
         const cache_path = try Cache.getCachePath(key, &path_buf);
         var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ self.cache_dir.?, cache_path });
+        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ cache_dir, cache_path });
 
         const entry = CacheEntry.init(key, @intCast(data.len), compat.timestamp(self.io_context));
         const header = entry.encode();
@@ -248,9 +244,7 @@ pub const Cache = struct {
     }
 
     pub fn invalidate(self: *Cache, key: CacheKey) !void {
-        if (self.cache_dir == null) {
-            return;
-        }
+        const cache_dir = self.cache_dir orelse return;
 
         try compat.lockMutex(&self.mutex, self.io_context);
         defer compat.unlockMutex(&self.mutex, self.io_context);
@@ -259,7 +253,7 @@ pub const Cache = struct {
         const cache_path = try Cache.getCachePath(key, &path_buf);
 
         var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ self.cache_dir.?, cache_path });
+        const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ cache_dir, cache_path });
 
         compat.deleteFile(self.io_context, full_path) catch |err| {
             if (err != error.FileNotFound) {
@@ -269,9 +263,7 @@ pub const Cache = struct {
     }
 
     pub fn clear(self: *Cache) !void {
-        if (self.cache_dir == null) {
-            return;
-        }
+        const cache_dir = self.cache_dir orelse return;
 
         try compat.lockMutex(&self.mutex, self.io_context);
         defer compat.unlockMutex(&self.mutex, self.io_context);
@@ -284,7 +276,7 @@ pub const Cache = struct {
             files_to_delete.deinit(self.allocator);
         }
 
-        var directory = try compat.openDir(self.io_context, self.cache_dir.?, true);
+        var directory = try compat.openDir(self.io_context, cache_dir, true);
         defer compat.closeDir(self.io_context, &directory);
 
         while (try compat.nextDir(self.io_context, &directory)) |entry| {
@@ -296,7 +288,7 @@ pub const Cache = struct {
 
         for (files_to_delete.items) |name| {
             var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ self.cache_dir.?, name });
+            const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ cache_dir, name });
             try compat.deleteFile(self.io_context, full_path);
         }
     }

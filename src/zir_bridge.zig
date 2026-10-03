@@ -14,3 +14,7 @@ pub const FnInfo = bridge.FnInfo;
 pub const CallExprTypeInfo = bridge.CallExprTypeInfo;
 pub const ZirBridgeError = bridge.ZirBridgeError;
 pub const ZirBridge = bridge.ZirBridge;
+
+test {
+    _ = bridge;
+}

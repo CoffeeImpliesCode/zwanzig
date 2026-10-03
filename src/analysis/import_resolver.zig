@@ -15,6 +15,20 @@ pub fn findFileIndexByPath(files: []const File, path: []const u8) ?usize {
 }
 
 pub fn filePubliclyImportsPath(files: []const File, file_index: usize, target_path: []const u8) bool {
+    var visited: [64]usize = undefined;
+    return filePubliclyImportsPathVisited(files, file_index, target_path, &visited, 0);
+}
+
+fn filePubliclyImportsPathVisited(
+    files: []const File,
+    file_index: usize,
+    target_path: []const u8,
+    visited: *[64]usize,
+    depth: usize,
+) bool {
+    if (depth >= visited.len) return false;
+    if (std.mem.indexOfScalar(usize, visited[0..depth], file_index) != null) return false;
+    visited[depth] = file_index;
     if (file_index >= files.len) return false;
 
     const file = files[file_index];
@@ -26,7 +40,7 @@ pub fn filePubliclyImportsPath(files: []const File, file_index: usize, target_pa
         if (!isVarDeclTag(tags[idx])) continue;
         if (publicVarDeclImportsPath(file.tree, @intCast(idx), file.path, target_path)) return true;
     }
-    return publicUsingnamespaceImportsPath(files, file.tree, file.path, target_path);
+    return usingnamespaceImportsPathVisited(files, file.tree, file.path, target_path, true, visited, depth + 1);
 }
 
 pub fn nodeImportsPath(
@@ -70,37 +84,28 @@ pub fn fileUsingnamespaceImportsPath(
     importer_path: []const u8,
     target_path: []const u8,
 ) bool {
-    const token_tags = tree.tokens.items(.tag);
-
-    for (token_tags, 0..) |_, token_index| {
-        if (!std.mem.eql(u8, tree.tokenSlice(@intCast(token_index)), "usingnamespace")) continue;
-
-        const import_token = nextNonCommentToken(token_tags, token_index + 1) orelse continue;
-        if (!std.mem.eql(u8, tree.tokenSlice(@intCast(import_token)), "@import")) continue;
-
-        const import_path = importPathFromBuiltinToken(tree, import_token) orelse continue;
-        if (importMayResolveToPath(importer_path, import_path, target_path)) return true;
-        if (resolveImportToFileIndex(files, importer_path, import_path)) |file_index| {
-            if (filePubliclyImportsPath(files, file_index, target_path)) return true;
-        }
-    }
-
-    return false;
+    var visited: [64]usize = undefined;
+    return usingnamespaceImportsPathVisited(files, tree, importer_path, target_path, false, &visited, 0);
 }
 
-pub fn publicUsingnamespaceImportsPath(
+fn usingnamespaceImportsPathVisited(
     files: []const File,
     tree: *const std.zig.Ast,
     importer_path: []const u8,
     target_path: []const u8,
+    public_only: bool,
+    visited: *[64]usize,
+    depth: usize,
 ) bool {
     const token_tags = tree.tokens.items(.tag);
 
     for (token_tags, 0..) |_, token_index| {
         if (!std.mem.eql(u8, tree.tokenSlice(@intCast(token_index)), "usingnamespace")) continue;
 
-        const pub_token = prevNonCommentToken(token_tags, token_index) orelse continue;
-        if (tree.tokenTag(@intCast(pub_token)) != .keyword_pub) continue;
+        if (public_only) {
+            const pub_token = prevNonCommentToken(token_tags, token_index) orelse continue;
+            if (tree.tokenTag(@intCast(pub_token)) != .keyword_pub) continue;
+        }
 
         const import_token = nextNonCommentToken(token_tags, token_index + 1) orelse continue;
         if (!std.mem.eql(u8, tree.tokenSlice(@intCast(import_token)), "@import")) continue;
@@ -108,7 +113,7 @@ pub fn publicUsingnamespaceImportsPath(
         const import_path = importPathFromBuiltinToken(tree, import_token) orelse continue;
         if (importMayResolveToPath(importer_path, import_path, target_path)) return true;
         if (resolveImportToFileIndex(files, importer_path, import_path)) |file_index| {
-            if (filePubliclyImportsPath(files, file_index, target_path)) return true;
+            if (filePubliclyImportsPathVisited(files, file_index, target_path, visited, depth)) return true;
         }
     }
 
@@ -336,20 +341,6 @@ pub fn normalizeIdentifier(ident: []const u8) []const u8 {
         return ident[2 .. ident.len - 1];
     }
     return ident;
-}
-
-pub fn fileStem(path: []const u8) []const u8 {
-    const basename = std.fs.path.basename(path);
-    if (std.mem.endsWith(u8, basename, ".zig")) return basename[0 .. basename.len - ".zig".len];
-    return basename;
-}
-
-pub fn nodeStart(tree: *const std.zig.Ast, node: usize) ?usize {
-    const main_tokens = tree.nodes.items(.main_token);
-    if (node >= main_tokens.len) return null;
-    const token = main_tokens[node];
-    if (token >= tree.tokens.len) return null;
-    return tree.tokens.items(.start)[token];
 }
 
 pub fn isVarDeclTag(tag: std.zig.Ast.Node.Tag) bool {
@@ -585,4 +576,23 @@ test "conditional namespace aliases do not reexport their condition" {
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/native.zig"));
     try std.testing.expect(filePubliclyImportsPath(&files, 0, "src/fallback.zig"));
     try std.testing.expect(!filePubliclyImportsPath(&files, 0, "src/condition.zig"));
+}
+
+test "cyclic namespace imports still find reachable files" {
+    const allocator = std.testing.allocator;
+    var first = try std.zig.Ast.parse(allocator, "pub usingnamespace @import(\"b.zig\");", .zig);
+    defer first.deinit(allocator);
+    var second = try std.zig.Ast.parse(allocator,
+        \\pub usingnamespace @import("a.zig");
+        \\pub usingnamespace @import("c.zig");
+    , .zig);
+    defer second.deinit(allocator);
+    const files = [_]File{
+        .{ .path = "a.zig", .tree = &first },
+        .{ .path = "b.zig", .tree = &second },
+    };
+    try std.testing.expect(!filePubliclyImportsPath(&files, 0, "missing.zig"));
+    try std.testing.expect(filePubliclyImportsPath(&files, 0, "c.zig"));
+    try std.testing.expect(!fileUsingnamespaceImportsPath(&files, &first, "a.zig", "missing.zig"));
+    try std.testing.expect(fileUsingnamespaceImportsPath(&files, &first, "a.zig", "c.zig"));
 }

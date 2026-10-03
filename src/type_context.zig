@@ -961,12 +961,6 @@ pub const TypeContext = struct {
         return source[start..end];
     }
 
-    fn isErrorTypeName(name: []const u8) bool {
-        return std.mem.eql(u8, name, "anyerror") or
-            std.mem.indexOf(u8, name, "Error") != null or
-            std.mem.indexOf(u8, name, "error") != null;
-    }
-
     pub fn getTypeFromAstNode(self: *TypeContext, ast_node: u32) ?TypeInfo {
         const tree = self.source.ast() catch return null;
         return self.getTypeFromTree(tree, ast_node, 0);

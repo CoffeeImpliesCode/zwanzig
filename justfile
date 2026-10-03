@@ -2,13 +2,13 @@ default:
     @just --list
 
 build:
-    zig build
+    zig build -Doptimize=ReleaseSafe
 
 test:
     zig build test
 
 run:
-    zig build run
+    zig build run -Doptimize=ReleaseSafe
 
 run-release:
     zig build run -Doptimize=ReleaseFast
@@ -19,7 +19,7 @@ fmt:
 
     zig_version="$(zig version)"
     if [ "$zig_version" != "0.15.2" ]; then
-        echo "zig fmt is canonical under Zig 0.15.2; use 'nix develop -c just fmt'" >&2
+        echo "zig fmt is canonical under Zig 0.15.2; use 'nix develop .#zig015 -c just fmt'" >&2
         exit 1
     fi
     zig fmt src
@@ -49,9 +49,9 @@ lint:
     esac
 
     if [ -n "${CI:-}" ]; then
-        zig build run -- --use-widening --format sarif src/**/*.zig > results.sarif || true
+        zig build run -Doptimize=ReleaseSafe -- --threads 1 --use-widening --format sarif src/**/*.zig > results.sarif
     else
-        zig build run -- --use-widening src/**/*.zig
+        zig build run -Doptimize=ReleaseSafe -- --threads 1 --use-widening src/**/*.zig
     fi
 
 validate:

@@ -66,6 +66,8 @@ pub fn scanForUnsafeUnwraps(
         // Get the variable being unwrapped
         const unwrapped_node = @intFromEnum(datas[ast_node].node_and_token[0]);
 
+        if (guards.isGuardedByAssertion(tree, ast_node, unwrapped_node, parent_map, type_context, &assertion_scope)) continue;
+
         // Check if the unwrap is guarded by short-circuit evaluation (and/or operators)
         // or by a ternary if expression. These are AST-level guards that the CFG
         // doesn't track because short-circuit evaluation is implicit.

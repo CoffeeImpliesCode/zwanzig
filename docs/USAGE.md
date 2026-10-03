@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-zig build
+zig build -Doptimize=ReleaseSafe
 ```
 
 For a reproducible source build with the Zig 0.16.0 frontend, use the default development shell:
@@ -18,6 +18,9 @@ To build with the Zig 0.15.2 frontend, select the dedicated compatibility shell:
 nix develop .#zig015 -c just build
 ```
 
+`just build` also uses `ReleaseSafe`. This mode keeps runtime safety checks without the analysis overhead of Debug builds.
+Use plain `zig build` when you need a Debug binary.
+
 ## Run the CLI
 
 If `zwanzig` is on your PATH:
@@ -29,7 +32,7 @@ zwanzig
 From the repository (without installing):
 
 ```bash
-zig build run -- src/
+zig build run -Doptimize=ReleaseSafe -- src/
 ```
 
 Show the version:
@@ -159,6 +162,14 @@ Zwanzig analyzes files in parallel (one worker per CPU core by default). Control
 zwanzig --threads 4 src/
 ```
 
+On a busy machine, analyze each project's source directory with one worker:
+
+```bash
+zwanzig --threads 1 ~/projects/example/src/
+```
+
+Do not pass the project root unless you also want to analyze its dependency and generated-source directories.
+
 ## Incremental caching
 
 Speed up repeated runs with `--cache`:
@@ -178,7 +189,7 @@ Add `.zwanzig-cache/` to `.gitignore`.
 Enable debug logging at build time with `-Dlog-level`:
 
 ```bash
-zig build run -Dlog-level=debug -- src/
+zig build run -Doptimize=ReleaseSafe -Dlog-level=debug -- src/
 ```
 
 Available log levels: `err`, `warn`, `info` (default), `debug`.
