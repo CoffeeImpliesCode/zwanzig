@@ -1,4 +1,6 @@
 const std = @import("std");
+const import_resolver = @import("../analysis/import_resolver.zig");
+const call_resolver = @import("../analysis/call_resolver.zig");
 const Rule = @import("../rule.zig").Rule;
 const Source = @import("../source.zig").Source;
 const Diagnostic = @import("../diagnostic.zig").Diagnostic;
@@ -131,26 +133,30 @@ pub const IdentifierStyleRule = struct {
         if (proto.name_token) |name_token| {
             if (token_tags[name_token] == .identifier) {
                 const name = tree.tokenSlice(name_token);
-                if (!shouldSkipName(name) and !isCamelCase(name)) {
-                    const byte_offset = token_starts[name_token];
-                    const loc = try src.byteToLocation(byte_offset);
-                    const message = try std.fmt.allocPrint(
-                        allocator,
-                        "function '{s}' should use camelCase naming",
-                        .{name},
-                    );
-                    defer allocator.free(message);
-
-                    const diag = try Diagnostic.initAtLocation(
-                        allocator,
-                        src.getFilePath(),
-                        "identifier-style",
-                        .warning,
-                        message,
-                        loc.line,
-                        loc.column,
-                    );
-                    try diagnostics.append(allocator, diag);
+                if (!shouldSkipName(name)) {
+                    if (isBuiltinTypeExpr(tree, @intFromEnum(proto.ast.return_type))) {
+                        if (!isPascalCase(name)) {
+                            try emitDiagnostic(
+                                src,
+                                allocator,
+                                diagnostics,
+                                token_starts[name_token],
+                                name,
+                                "type factory",
+                                .pascal_case,
+                            );
+                        }
+                    } else if (!isCamelCase(name)) {
+                        try emitDiagnostic(
+                            src,
+                            allocator,
+                            diagnostics,
+                            token_starts[name_token],
+                            name,
+                            "function",
+                            .camel_case,
+                        );
+                    }
                 }
             }
         }
@@ -189,9 +195,46 @@ pub const IdentifierStyleRule = struct {
         else
             null;
 
-        // First, try to use ZIR-based type information for definitive classification.
-        // This provides more accurate results than heuristics when available.
-        const type_classification = classifyDeclWithTypeInfo(src, name, node_idx);
+        // An explicit `: type` is definitive even when nested ZIR reports a constant value.
+        const is_explicit_type_alias = if (full.ast.type_node.unwrap()) |type_node|
+            isBuiltinTypeExpr(tree, @intFromEnum(type_node))
+        else
+            false;
+
+        // A direct import is a namespace alias even when ZIR reports a constant value.
+        if (is_const and !is_explicit_type_alias) {
+            if (init_idx_opt) |init_idx| {
+                if (init_idx < tags.len) {
+                    if (isDirectImport(tree, tags, token_tags, init_idx)) {
+                        if (!isLowerSnakeCase(name) and !isPascalCase(name)) {
+                            try emitDiagnostic(
+                                src,
+                                allocator,
+                                diagnostics,
+                                token_starts[name_token],
+                                name,
+                                "namespace",
+                                .snake_case,
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        const is_known_type_factory = if (is_const)
+            if (init_idx_opt) |init_idx|
+                isKnownTypeFactoryCall(tree, tags, datas, token_tags, init_idx)
+            else
+                false
+        else
+            false;
+
+        const type_classification: DeclClassification = if (is_explicit_type_alias or is_known_type_factory)
+            .type_decl
+        else
+            classifyDeclWithTypeInfo(src, name, node_idx);
         switch (type_classification) {
             .type_decl => {
                 // ZIR confirms this is a type - must be PascalCase
@@ -320,6 +363,115 @@ pub const IdentifierStyleRule = struct {
         if (!isLowerSnakeCase(name)) {
             try emitDiagnostic(src, allocator, diagnostics, token_starts[name_token], name, "variable", .snake_case);
         }
+    }
+
+    fn isKnownTypeFactoryCall(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        init_idx: usize,
+    ) bool {
+        if (init_idx >= tags.len) return false;
+        switch (tags[init_idx]) {
+            .call, .call_comma, .call_one, .call_one_comma => {},
+            else => return false,
+        }
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&buffer, @enumFromInt(init_idx)) orelse return false;
+        return isKnownTypeFactoryCallee(tree, tags, datas, token_tags, @intFromEnum(call.ast.fn_expr));
+    }
+
+    fn isKnownTypeFactoryCallee(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+    ) bool {
+        if (node_idx >= tags.len or tags[node_idx] != .field_access) return false;
+        const access = datas[node_idx].node_and_token;
+        const field_token = access[1];
+        if (field_token >= token_tags.len or token_tags[field_token] != .identifier) return false;
+        if (!isKnownTypeFactoryName(tree.tokenSlice(field_token))) return false;
+        return isStdQualifiedValue(
+            tree,
+            tags,
+            datas,
+            token_tags,
+            @intFromEnum(access[0]),
+        );
+    }
+
+    fn isKnownTypeFactoryName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "HashMap") or
+            std.mem.eql(u8, name, "HashMapUnmanaged") or
+            std.mem.eql(u8, name, "AutoHashMap") or
+            std.mem.eql(u8, name, "AutoHashMapUnmanaged") or
+            std.mem.eql(u8, name, "StringHashMap") or
+            std.mem.eql(u8, name, "StringHashMapUnmanaged") or
+            std.mem.eql(u8, name, "ArrayHashMap") or
+            std.mem.eql(u8, name, "ArrayHashMapUnmanaged");
+    }
+
+    fn isStdQualifiedValue(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+    ) bool {
+        if (node_idx >= tags.len) return false;
+        return switch (tags[node_idx]) {
+            .identifier => blk: {
+                const files = [_]import_resolver.File{
+                    .{ .path = "", .tree = tree },
+                };
+                const resolver = call_resolver.ProjectTypeResolver{
+                    .files = &files,
+                    .file_index = 0,
+                };
+                break :blk resolver.isVerifiedImportBinding(node_idx, "std");
+            },
+            .field_access => isStdQualifiedValue(
+                tree,
+                tags,
+                datas,
+                token_tags,
+                @intFromEnum(datas[node_idx].node_and_token[0]),
+            ),
+            .unwrap_optional,
+            .grouped_expression,
+            => isStdQualifiedValue(
+                tree,
+                tags,
+                datas,
+                token_tags,
+                @intFromEnum(datas[node_idx].node_and_token[0]),
+            ),
+            else => false,
+        };
+    }
+
+    fn isDirectImport(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        token_tags: []const std.zig.Token.Tag,
+        init_idx: usize,
+    ) bool {
+        const builtin_name = builtinCallName(tree, tags, token_tags, init_idx) orelse return false;
+        if (!std.mem.eql(u8, builtin_name, "@import")) return false;
+
+        var params_buf: [2]std.zig.Ast.Node.Index = undefined;
+        const params = tree.builtinCallParams(&params_buf, @enumFromInt(init_idx)) orelse return false;
+        if (params.len != 1) return false;
+
+        const import_path_idx = @intFromEnum(params[0]);
+        if (import_path_idx >= tags.len) return false;
+        return switch (tags[import_path_idx]) {
+            .string_literal, .multiline_string_literal => true,
+            else => false,
+        };
     }
 
     /// Check if the init expression is likely a type alias (field access on import, or PascalCase identifier)
@@ -635,12 +787,22 @@ pub const IdentifierStyleRule = struct {
         const call_info = tree.fullCall(&buf, @enumFromInt(init_idx)) orelse return false;
         const callee_idx = @intFromEnum(call_info.ast.fn_expr);
         if (!isTypeAliasCallee(tree, tags, datas, token_tags, callee_idx)) return false;
+        const is_verified_std_factory = isKnownTypeFactoryCallee(
+            tree,
+            tags,
+            datas,
+            token_tags,
+            callee_idx,
+        );
 
         var saw_type_arg = false;
         for (call_info.ast.params) |param| {
             const arg_idx = @intFromEnum(param);
             if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, arg_idx)) {
                 saw_type_arg = true;
+                continue;
+            }
+            if (is_verified_std_factory and isStdQualifiedValue(tree, tags, datas, token_tags, arg_idx)) {
                 continue;
             }
             if (isTypeFactoryLiteral(tags, datas, arg_idx)) {
@@ -959,18 +1121,21 @@ pub const IdentifierStyleRule = struct {
         try emitDiagnostic(src, allocator, diagnostics, token_starts[token], name, "parameter", .snake_case);
     }
 
+    fn isBuiltinTypeExpr(tree: *const std.zig.Ast, node_idx: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node_idx >= tags.len) return false;
+        if (tags[node_idx] != .identifier) return false;
+        const ident_token = tree.nodes.items(.main_token)[node_idx];
+        if (tree.tokenTag(ident_token) != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(ident_token), "type");
+    }
+
     fn isTypeParam(tree: *const std.zig.Ast, param: std.zig.Ast.full.FnProto.Param) bool {
         if (param.anytype_ellipsis3 != null) return true;
         const comptime_token = param.comptime_noalias orelse return false;
         if (tree.tokenTag(comptime_token) != .keyword_comptime) return false;
         const type_expr = param.type_expr orelse return false;
-        const type_idx = @intFromEnum(type_expr);
-        const tags = tree.nodes.items(.tag);
-        if (type_idx >= tags.len) return false;
-        if (tags[type_idx] != .identifier) return false;
-        const ident_token = tree.nodes.items(.main_token)[type_idx];
-        if (tree.tokenTag(ident_token) != .identifier) return false;
-        return std.mem.eql(u8, tree.tokenSlice(ident_token), "type");
+        return isBuiltinTypeExpr(tree, @intFromEnum(type_expr));
     }
 
     fn checkIfPayloads(
@@ -1267,4 +1432,60 @@ test "classifyDeclWithTypeInfo returns unknown for nonexistent" {
     const node_idx = @intFromEnum(root_decls[0]);
     const classification = IdentifierStyleRule.classifyDeclWithTypeInfo(&source, "nonexistent", node_idx);
     try std.testing.expectEqual(IdentifierStyleRule.DeclClassification.unknown, classification);
+}
+
+test "skript residual: std.HashMap generated type keeps PascalCase" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const RuntimeMap = std.HashMap(
+        \\    MapKey,
+        \\    Value,
+        \\    MapKey.Context,
+        \\    std.hash_map.default_max_load_percentage,
+        \\);
+        \\const BadValue = std.hash_map.default_max_load_percentage;
+    ;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "BadValue") != null);
+}
+
+test "skript control: shadowed std binding rejects factory exemption" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const MapKey = struct {};
+        \\const Value = struct {};
+        \\fn make() void {
+        \\    const std = @import("other.zig");
+        \\    const RuntimeMap = std.HashMap(
+        \\        MapKey,
+        \\        Value,
+        \\        MapKey.Context,
+        \\        std.hash_map.default_max_load_percentage,
+        \\    );
+        \\}
+    ;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "RuntimeMap") != null);
 }

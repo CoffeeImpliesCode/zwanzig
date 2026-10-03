@@ -187,6 +187,8 @@ pub const SentinelAllocRule = struct {
         bridge: ?*const ZirBridge,
         call_node: u32,
     ) bool {
+        if (isInferredSentinelBinding(tree, tags, parent_map, call_node)) return true;
+
         const context_type = findContextType(
             tree,
             tags,
@@ -200,6 +202,32 @@ pub const SentinelAllocRule = struct {
             call_node,
         ) orelse return false;
         return context_type.hasSentinel();
+    }
+
+    fn isInferredSentinelBinding(
+        tree: *const Ast,
+        tags: []const Ast.Node.Tag,
+        parent_map: []const u32,
+        call_node: u32,
+    ) bool {
+        var node = call_node;
+        var depth: u32 = 0;
+        while (node < parent_map.len and depth < 64) : (depth += 1) {
+            const parent = parent_map[node];
+            if (parent == 0 or parent >= tags.len) return false;
+
+            switch (tags[parent]) {
+                .grouped_expression, .unwrap_optional, .@"try" => node = parent,
+                .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
+                    const full = tree.fullVarDecl(@enumFromInt(parent)) orelse return false;
+                    if (full.ast.type_node.unwrap() != null) return false;
+                    const init_node = full.ast.init_node.unwrap() orelse return false;
+                    return @intFromEnum(init_node) == node;
+                },
+                else => return false,
+            }
+        }
+        return false;
     }
 
     fn findContextType(

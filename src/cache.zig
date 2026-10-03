@@ -27,6 +27,7 @@ pub const CacheKey = struct {
         tool_version: []const u8,
         type_info_available: bool,
         enabled_rules: []const []const u8,
+        project_fingerprint: ?*const [32]u8,
     ) CacheKey {
         var key: CacheKey = undefined;
         std.crypto.hash.sha2.Sha256.hash(file_content, &key.file_hash, .{});
@@ -56,6 +57,10 @@ pub const CacheKey = struct {
         for (enabled_rules) |rule_name| {
             config_hasher.update(rule_name);
             config_hasher.update("\x00");
+        }
+        if (project_fingerprint) |fingerprint| {
+            config_hasher.update("\x00project-fingerprint\x00");
+            config_hasher.update(fingerprint);
         }
         config_hasher.final(&key.config_hash);
 
@@ -309,7 +314,7 @@ test "CacheKey: init and cache path" {
     };
 
     const rules = [_][]const u8{ "rule1", "rule2" };
-    const key = CacheKey.init("test content", &target, "1.0.0", false, &rules);
+    const key = CacheKey.init("test content", &target, "1.0.0", false, &rules, null);
 
     var buf: [256]u8 = undefined;
     const path = try Cache.getCachePath(key, &buf);
@@ -321,9 +326,9 @@ test "CacheKey: init and cache path" {
 
 test "CacheKey: eql" {
     const rules = [_][]const u8{"rule1"};
-    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules);
-    const key2 = CacheKey.init("test", null, "1.0.0", false, &rules);
-    const key3 = CacheKey.init("different", null, "1.0.0", false, &rules);
+    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules, null);
+    const key2 = CacheKey.init("test", null, "1.0.0", false, &rules, null);
+    const key3 = CacheKey.init("different", null, "1.0.0", false, &rules, null);
 
     try std.testing.expect(key1.eql(key2));
     try std.testing.expect(!key1.eql(key3));
@@ -331,15 +336,15 @@ test "CacheKey: eql" {
 
 test "CacheKey: version changes invalidate" {
     const rules = [_][]const u8{"rule1"};
-    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules);
-    const key2 = CacheKey.init("test", null, "1.0.1", false, &rules);
+    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules, null);
+    const key2 = CacheKey.init("test", null, "1.0.1", false, &rules, null);
 
     try std.testing.expect(!key1.eql(key2));
 }
 
 test "CacheKey version hash includes the embedded Zig frontend version" {
     const rules = [_][]const u8{};
-    const key = CacheKey.init("test", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test", null, "1.0.0", false, &rules, null);
 
     // Regression guard: if version_hash were derived from the tool version
     // alone, two binaries embedding different Zig frontends would share
@@ -356,16 +361,16 @@ test "CacheKey version hash includes the embedded Zig frontend version" {
 test "CacheKey: config changes invalidate" {
     const rules1 = [_][]const u8{"rule1"};
     const rules2 = [_][]const u8{ "rule1", "rule2" };
-    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules1);
-    const key2 = CacheKey.init("test", null, "1.0.0", false, &rules2);
+    const key1 = CacheKey.init("test", null, "1.0.0", false, &rules1, null);
+    const key2 = CacheKey.init("test", null, "1.0.0", false, &rules2, null);
 
     try std.testing.expect(!key1.eql(key2));
 }
 
 test "CacheKey: deterministic across runs" {
     const rules = [_][]const u8{ "rule1", "rule2" };
-    const key1 = CacheKey.init("test content", null, "1.0.0", false, &rules);
-    const key2 = CacheKey.init("test content", null, "1.0.0", false, &rules);
+    const key1 = CacheKey.init("test content", null, "1.0.0", false, &rules, null);
+    const key2 = CacheKey.init("test content", null, "1.0.0", false, &rules, null);
 
     try std.testing.expect(key1.eql(key2));
     try std.testing.expect(std.mem.eql(u8, &key1.file_hash, &key2.file_hash));
@@ -375,7 +380,7 @@ test "CacheKey: deterministic across runs" {
 
 test "CacheEntry: write and read" {
     const rules = [_][]const u8{"rule1"};
-    const key = CacheKey.init("test", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test", null, "1.0.0", false, &rules, null);
     const entry = CacheEntry.init(key, 42, 123);
     const encoded = entry.encode();
     const read_entry = try CacheEntry.decode(&encoded);
@@ -398,7 +403,7 @@ test "Cache: put and get" {
     defer cache.deinit();
 
     const rules = [_][]const u8{"rule1"};
-    const key = CacheKey.init("test content", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test content", null, "1.0.0", false, &rules, null);
     const data = "cached data";
 
     try cache.put(key, data);
@@ -425,7 +430,7 @@ test "Cache: get non-existent key returns null" {
     defer cache.deinit();
 
     const rules = [_][]const u8{"rule1"};
-    const key = CacheKey.init("non-existent", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("non-existent", null, "1.0.0", false, &rules, null);
     const result = try cache.get(key);
 
     try std.testing.expectEqual(@as(?[]u8, null), result);
@@ -443,7 +448,7 @@ test "Cache: invalidate removes entry" {
     defer cache.deinit();
 
     const rules = [_][]const u8{"rule1"};
-    const key = CacheKey.init("test", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test", null, "1.0.0", false, &rules, null);
     try cache.put(key, "data");
 
     try cache.invalidate(key);
@@ -464,8 +469,8 @@ test "Cache: clear removes all entries" {
     defer cache.deinit();
 
     const rules = [_][]const u8{"rule1"};
-    const key1 = CacheKey.init("test1", null, "1.0.0", false, &rules);
-    const key2 = CacheKey.init("test2", null, "1.0.0", false, &rules);
+    const key1 = CacheKey.init("test1", null, "1.0.0", false, &rules, null);
+    const key2 = CacheKey.init("test2", null, "1.0.0", false, &rules, null);
 
     try cache.put(key1, "data1");
     try cache.put(key2, "data2");
@@ -492,7 +497,7 @@ test "Cache: handles access denied gracefully" {
     defer cache.deinit();
 
     const rules = [_][]const u8{"rule1"};
-    const key = CacheKey.init("test", null, "1.0.0", false, &rules);
+    const key = CacheKey.init("test", null, "1.0.0", false, &rules, null);
 
     try cache.put(key, "data");
 

@@ -4,13 +4,13 @@ const CfgNode = @import("../../cfg.zig").CfgNode;
 const EdgeKind = @import("../../cfg.zig").EdgeKind;
 const ProgramState = @import("../state.zig").ProgramState;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         pub fn bindPayloadAlias(self: *_Engine, state: *ProgramState, payload_token: u32, expr_node: u32, current_cfg: *const Cfg) !void {
             const var_id = ids.varId(payload_token);
             state.resetRegion(var_id);
             try state.setVar(var_id, .unknown);
-            if (_Engine.var_resolution.resolveVarIdFromExpr(self, expr_node, current_cfg)) |alias_target| {
+            if (_Engine.VarResolution.resolveVarIdFromExpr(self, expr_node, current_cfg)) |alias_target| {
                 if (alias_target != var_id) {
                     try state.trackAlias(var_id, alias_target);
                 }

@@ -16,8 +16,7 @@ pub const DeinitLifecycleRule = struct {
     };
 
     const DeferredCleanup = struct {
-        receiver: []const u8,
-        method: []const u8,
+        call: MethodCall,
         has_defer: bool = false,
         has_errdefer: bool = false,
         defer_stmt: ?u32 = null,
@@ -27,11 +26,22 @@ pub const DeinitLifecycleRule = struct {
     const MethodCall = struct {
         receiver: []const u8,
         method: []const u8,
-    };
+        resource: ?[]const u8 = null,
 
-    const ActiveCleanup = struct {
-        receiver: []const u8,
-        method: []const u8,
+        fn eql(a: MethodCall, b: MethodCall) bool {
+            if (!std.mem.eql(u8, a.receiver, b.receiver)) return false;
+            if (!std.mem.eql(u8, a.method, b.method)) return false;
+
+            if (a.resource) |resource| {
+                const other_resource = b.resource orelse return false;
+                return std.mem.eql(u8, resource, other_resource);
+            }
+            return b.resource == null;
+        }
+
+        fn cleanedResource(call: MethodCall) []const u8 {
+            return call.resource orelse call.receiver;
+        }
     };
 
     const cleanup_methods = [_][]const u8{
@@ -53,8 +63,8 @@ pub const DeinitLifecycleRule = struct {
         const tags = tree.nodes.items(.tag);
         const datas = tree.nodes.items(.data);
 
-        var receiver_arena = std.heap.ArenaAllocator.init(allocator);
-        defer receiver_arena.deinit();
+        var identity_arena = std.heap.ArenaAllocator.init(allocator);
+        defer identity_arena.deinit();
 
         var scanner = Scanner{
             .src = src,
@@ -62,11 +72,11 @@ pub const DeinitLifecycleRule = struct {
             .tags = tags,
             .datas = datas,
             .allocator = allocator,
-            .receiver_allocator = receiver_arena.allocator(),
+            .identity_allocator = identity_arena.allocator(),
             .diagnostics = diagnostics,
-            .active_cleanup_receivers = .empty,
+            .active_cleanups = .empty,
         };
-        defer scanner.active_cleanup_receivers.deinit(allocator);
+        defer scanner.active_cleanups.deinit(allocator);
 
         for (tags, 0..) |tag, i| {
             switch (tag) {
@@ -93,9 +103,9 @@ pub const DeinitLifecycleRule = struct {
         tags: []const Ast.Node.Tag,
         datas: []const Ast.Node.Data,
         allocator: std.mem.Allocator,
-        receiver_allocator: std.mem.Allocator,
+        identity_allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
-        active_cleanup_receivers: std.ArrayList(ActiveCleanup),
+        active_cleanups: std.ArrayList(MethodCall),
 
         fn scanNode(self: *Scanner, node: u32) RuleError!void {
             if (node == 0 or node >= self.tags.len) return;
@@ -133,8 +143,7 @@ pub const DeinitLifecycleRule = struct {
                     if (!isCleanupMethod(call.method)) continue;
                     try self.recordDeferredCleanup(
                         &deferred_cleanups,
-                        call.receiver,
-                        call.method,
+                        call,
                         stmt,
                         is_defer,
                     );
@@ -143,18 +152,15 @@ pub const DeinitLifecycleRule = struct {
 
             try self.reportDuplicateDeferredCleanup(deferred_cleanups.items);
 
-            const active_base = self.active_cleanup_receivers.items.len;
-            defer self.active_cleanup_receivers.shrinkRetainingCapacity(active_base);
+            const active_base = self.active_cleanups.items.len;
+            defer self.active_cleanups.shrinkRetainingCapacity(active_base);
 
             for (statements, 0..) |stmt, idx| {
                 switch (self.tags[stmt]) {
                     .@"defer", .@"errdefer" => {
                         if (try self.extractDeferredMethodCall(stmt)) |call| {
-                            if (isCleanupMethod(call.method) and !self.hasActiveCleanup(call.receiver, call.method)) {
-                                try self.active_cleanup_receivers.append(self.allocator, .{
-                                    .receiver = call.receiver,
-                                    .method = call.method,
-                                });
+                            if (isCleanupMethod(call.method) and !self.hasActiveCleanup(call)) {
+                                try self.active_cleanups.append(self.allocator, call);
                             }
                         }
                     },
@@ -162,10 +168,13 @@ pub const DeinitLifecycleRule = struct {
                 }
 
                 if (try self.extractDirectCleanupCall(stmt)) |call| {
-                    if (self.hasActiveCleanup(call.receiver, call.method) and
-                        (try self.findTryReinit(statements[idx + 1 ..], call.receiver)) != null)
+                    if (self.hasActiveCleanup(call) and
+                        (try self.findTryReinit(
+                            statements[idx + 1 ..],
+                            call.cleanedResource(),
+                        )) != null)
                     {
-                        try self.emitCleanupBeforeTryReinit(stmt, call.receiver, call.method);
+                        try self.emitCleanupBeforeTryReinit(stmt, call);
                     }
                 }
 
@@ -244,10 +253,19 @@ pub const DeinitLifecycleRule = struct {
             if (method_token >= token_tags.len or token_tags[method_token] != .identifier) return null;
             if (receiver_node == 0 or receiver_node >= self.tags.len) return null;
             const receiver = (try self.canonicalReceiver(receiver_node)) orelse return null;
+            const method = self.tree.tokenSlice(method_token);
+            const resource = if (cleanupMethodUsesResourceArgument(method) and
+                full_call.ast.params.len > 0)
+                (try self.canonicalResource(
+                    @intFromEnum(full_call.ast.params[0]),
+                )) orelse return null
+            else
+                null;
 
             return .{
                 .receiver = receiver,
-                .method = self.tree.tokenSlice(method_token),
+                .method = method,
+                .resource = resource,
             };
         }
 
@@ -284,27 +302,45 @@ pub const DeinitLifecycleRule = struct {
             }
 
             var canonical: std.ArrayList(u8) = .empty;
-            errdefer canonical.deinit(self.receiver_allocator);
+            errdefer canonical.deinit(self.identity_allocator);
 
             var idx = part_count;
             while (idx > 0) : (idx -= 1) {
-                if (canonical.items.len > 0) try canonical.append(self.receiver_allocator, '.');
-                try canonical.appendSlice(self.receiver_allocator, parts[idx - 1]);
+                if (canonical.items.len > 0) try canonical.append(self.identity_allocator, '.');
+                try canonical.appendSlice(self.identity_allocator, parts[idx - 1]);
             }
 
-            return try canonical.toOwnedSlice(self.receiver_allocator);
+            return try canonical.toOwnedSlice(self.identity_allocator);
+        }
+
+        fn canonicalResource(self: *const Scanner, resource_node: u32) RuleError!?[]const u8 {
+            if (try self.canonicalReceiver(resource_node)) |resource| return resource;
+            if (resource_node == 0 or resource_node >= self.tags.len) return null;
+
+            const token_tags = self.tree.tokens.items(.tag);
+            const first_token = self.tree.firstToken(@enumFromInt(resource_node));
+            const last_token = self.tree.lastToken(@enumFromInt(resource_node));
+            if (first_token > last_token or last_token >= token_tags.len) return null;
+
+            var canonical: std.ArrayList(u8) = .empty;
+            errdefer canonical.deinit(self.identity_allocator);
+
+            var token = first_token;
+            while (token <= last_token) : (token += 1) {
+                try canonical.appendSlice(self.identity_allocator, self.tree.tokenSlice(token));
+            }
+            return try canonical.toOwnedSlice(self.identity_allocator);
         }
 
         fn recordDeferredCleanup(
             self: *Scanner,
             cleanups: *std.ArrayList(DeferredCleanup),
-            receiver: []const u8,
-            method: []const u8,
+            call: MethodCall,
             stmt: u32,
             is_defer: bool,
         ) RuleError!void {
             for (cleanups.items) |*cleanup| {
-                if (std.mem.eql(u8, cleanup.receiver, receiver) and std.mem.eql(u8, cleanup.method, method)) {
+                if (cleanup.call.eql(call)) {
                     if (is_defer) {
                         cleanup.has_defer = true;
                         if (cleanup.defer_stmt == null) cleanup.defer_stmt = stmt;
@@ -316,10 +352,7 @@ pub const DeinitLifecycleRule = struct {
                 }
             }
 
-            var cleanup = DeferredCleanup{
-                .receiver = receiver,
-                .method = method,
-            };
+            var cleanup = DeferredCleanup{ .call = call };
             if (is_defer) {
                 cleanup.has_defer = true;
                 cleanup.defer_stmt = stmt;
@@ -330,31 +363,42 @@ pub const DeinitLifecycleRule = struct {
             try cleanups.append(self.allocator, cleanup);
         }
 
-        fn reportDuplicateDeferredCleanup(self: *Scanner, cleanups: []const DeferredCleanup) RuleError!void {
+        fn reportDuplicateDeferredCleanup(
+            self: *Scanner,
+            cleanups: []const DeferredCleanup,
+        ) RuleError!void {
             for (cleanups) |cleanup| {
                 if (!(cleanup.has_defer and cleanup.has_errdefer)) continue;
                 const report_stmt = cleanup.errdefer_stmt orelse cleanup.defer_stmt orelse continue;
-                try self.emitDuplicateDeferredCleanup(report_stmt, cleanup.receiver, cleanup.method);
+                try self.emitDuplicateDeferredCleanup(report_stmt, cleanup.call);
             }
         }
 
-        fn hasActiveCleanup(self: *const Scanner, receiver: []const u8, method: []const u8) bool {
-            for (self.active_cleanup_receivers.items) |active| {
-                if (std.mem.eql(u8, active.receiver, receiver) and std.mem.eql(u8, active.method, method)) return true;
+        fn hasActiveCleanup(self: *const Scanner, call: MethodCall) bool {
+            for (self.active_cleanups.items) |active| {
+                if (active.eql(call)) return true;
             }
             return false;
         }
 
-        fn findTryReinit(self: *const Scanner, statements: []const u32, receiver: []const u8) RuleError!?u32 {
+        fn findTryReinit(
+            self: *const Scanner,
+            statements: []const u32,
+            resource: []const u8,
+        ) RuleError!?u32 {
             for (statements) |stmt| {
-                if (try self.assignmentToReceiverIsTry(stmt, receiver)) |is_try| {
+                if (try self.assignmentToResourceIsTry(stmt, resource)) |is_try| {
                     return if (is_try) stmt else null;
                 }
             }
             return null;
         }
 
-        fn assignmentToReceiverIsTry(self: *const Scanner, stmt: u32, receiver: []const u8) RuleError!?bool {
+        fn assignmentToResourceIsTry(
+            self: *const Scanner,
+            stmt: u32,
+            resource: []const u8,
+        ) RuleError!?bool {
             if (stmt >= self.tags.len or !isAssignTag(self.tags[stmt])) return null;
 
             const pair = self.datas[stmt].node_and_node;
@@ -362,8 +406,8 @@ pub const DeinitLifecycleRule = struct {
             const rhs = @intFromEnum(pair[1]);
             if (lhs == 0 or lhs >= self.tags.len) return null;
 
-            const lhs_receiver = (try self.canonicalReceiver(lhs)) orelse return null;
-            if (!std.mem.eql(u8, lhs_receiver, receiver)) return null;
+            const lhs_resource = (try self.canonicalResource(lhs)) orelse return null;
+            if (!std.mem.eql(u8, lhs_resource, resource)) return null;
 
             if (rhs == 0 or rhs >= self.tags.len) return false;
             return self.tags[rhs] == .@"try";
@@ -372,15 +416,21 @@ pub const DeinitLifecycleRule = struct {
         fn emitDuplicateDeferredCleanup(
             self: *Scanner,
             stmt: u32,
-            receiver: []const u8,
-            method: []const u8,
+            call: MethodCall,
         ) RuleError!void {
             const loc = try self.src.tokenLocation(self.tree.nodes.items(.main_token)[stmt]);
-            const message = try std.fmt.allocPrint(
-                self.allocator,
-                "'{s}.{s}' is registered in both defer and errdefer within the same scope; this can run cleanup twice on error unwind",
-                .{ receiver, method },
-            );
+            const message = if (call.resource) |resource|
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "'{s}.{s}({s})' is registered in both defer and errdefer within the same scope; this can run cleanup twice on error unwind",
+                    .{ call.receiver, call.method, resource },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "'{s}.{s}' is registered in both defer and errdefer within the same scope; this can run cleanup twice on error unwind",
+                    .{ call.receiver, call.method },
+                );
             defer self.allocator.free(message);
 
             const diag = try Diagnostic.initAtLocation(
@@ -398,15 +448,28 @@ pub const DeinitLifecycleRule = struct {
         fn emitCleanupBeforeTryReinit(
             self: *Scanner,
             stmt: u32,
-            receiver: []const u8,
-            method: []const u8,
+            call: MethodCall,
         ) RuleError!void {
             const loc = try self.src.tokenLocation(self.tree.nodes.items(.main_token)[stmt]);
-            const message = try std.fmt.allocPrint(
-                self.allocator,
-                "'{s}.{s}()' appears before a fallible reinitialization while deferred cleanup is active; error unwind may call '{s}.{s}()' twice",
-                .{ receiver, method, receiver, method },
-            );
+            const message = if (call.resource) |resource|
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "'{s}.{s}({s})' appears before a fallible reinitialization while deferred cleanup is active; error unwind may call '{s}.{s}({s})' twice",
+                    .{
+                        call.receiver,
+                        call.method,
+                        resource,
+                        call.receiver,
+                        call.method,
+                        resource,
+                    },
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "'{s}.{s}()' appears before a fallible reinitialization while deferred cleanup is active; error unwind may call '{s}.{s}()' twice",
+                    .{ call.receiver, call.method, call.receiver, call.method },
+                );
             defer self.allocator.free(message);
 
             const diag = try Diagnostic.initAtLocation(
@@ -427,6 +490,10 @@ pub const DeinitLifecycleRule = struct {
             if (std.mem.eql(u8, method, known_method)) return true;
         }
         return false;
+    }
+
+    fn cleanupMethodUsesResourceArgument(method: []const u8) bool {
+        return std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy");
     }
 
     fn isAssignTag(tag: Ast.Node.Tag) bool {

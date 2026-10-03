@@ -4,7 +4,7 @@ const Cfg = @import("../../cfg.zig").Cfg;
 const ProgramState = @import("../state.zig").ProgramState;
 const EngineError = @import("../base.zig").EngineError;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         pub fn applyDeferredReleases(self: *_Engine, state: *ProgramState, defer_node: u32, current_cfg: *const Cfg) EngineError!void {
             const src = self.source orelse return;
@@ -48,12 +48,12 @@ pub fn mixin(comptime _Engine: type) type {
 
             switch (tags[node]) {
                 .call, .call_comma, .call_one, .call_one_comma => {
-                    if (_Engine.resource_calls.resolveResourceCallFromExpr(self, tree, node)) |call_info| {
-                        const call_token = _Engine.ownership.resolveCallToken(self, call_info.call_node);
+                    if (_Engine.ResourceCalls.resolveResourceCallFromExpr(self, tree, node)) |call_info| {
+                        const call_token = _Engine.Ownership.resolveCallToken(self, call_info.call_node);
                         switch (call_info.kind) {
                             .free => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (_Engine.var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                    if (_Engine.VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
                                         if (error_only) {
                                             try state.trackErrdeferredFree(var_id, call_token, scope_node);
                                         } else {
@@ -64,7 +64,7 @@ pub fn mixin(comptime _Engine: type) type {
                             },
                             .free_owned => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (_Engine.var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                    if (_Engine.VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
                                         if (error_only) {
                                             try state.trackErrdeferredFreeOwned(var_id, call_token, scope_node);
                                         } else {
@@ -75,7 +75,7 @@ pub fn mixin(comptime _Engine: type) type {
                             },
                             .close => {
                                 if (call_info.target_expr) |arg_node| {
-                                    if (_Engine.var_resolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
+                                    if (_Engine.VarResolution.resolveVarIdFromExpr(self, arg_node, current_cfg)) |var_id| {
                                         if (error_only) {
                                             try state.trackErrdeferredClose(var_id, call_token, scope_node);
                                         } else {
@@ -122,7 +122,7 @@ pub fn mixin(comptime _Engine: type) type {
                 .@"if", .if_simple => {
                     const full_if = tree.fullIf(@enumFromInt(node)) orelse return;
                     if (full_if.payload_token) |tok| {
-                        try _Engine.payloads.bindPayloadAlias(self, state, tok, @intFromEnum(full_if.ast.cond_expr), current_cfg);
+                        try _Engine.Payloads.bindPayloadAlias(self, state, tok, @intFromEnum(full_if.ast.cond_expr), current_cfg);
                         try scanDeferredBody(self, state, @intFromEnum(full_if.ast.then_expr), current_cfg, error_only, scope_node);
                         state.resetRegion(ids.varId(tok));
                     } else {
@@ -130,7 +130,7 @@ pub fn mixin(comptime _Engine: type) type {
                     }
                     if (full_if.ast.else_expr.unwrap()) |else_node| {
                         if (full_if.error_token) |tok| {
-                            try _Engine.payloads.bindPayloadUnknown(self, state, tok);
+                            try _Engine.Payloads.bindPayloadUnknown(self, state, tok);
                             try scanDeferredBody(self, state, @intFromEnum(else_node), current_cfg, error_only, scope_node);
                             state.resetRegion(ids.varId(tok));
                         } else {
@@ -141,7 +141,7 @@ pub fn mixin(comptime _Engine: type) type {
                 .@"while", .while_simple, .while_cont => {
                     const full_while = tree.fullWhile(@enumFromInt(node)) orelse return;
                     if (full_while.payload_token) |tok| {
-                        try _Engine.payloads.bindPayloadAlias(self, state, tok, @intFromEnum(full_while.ast.cond_expr), current_cfg);
+                        try _Engine.Payloads.bindPayloadAlias(self, state, tok, @intFromEnum(full_while.ast.cond_expr), current_cfg);
                         try scanDeferredBody(self, state, @intFromEnum(full_while.ast.then_expr), current_cfg, error_only, scope_node);
                         state.resetRegion(ids.varId(tok));
                     } else {
@@ -149,7 +149,7 @@ pub fn mixin(comptime _Engine: type) type {
                     }
                     if (full_while.ast.else_expr.unwrap()) |else_node| {
                         if (full_while.error_token) |tok| {
-                            try _Engine.payloads.bindPayloadUnknown(self, state, tok);
+                            try _Engine.Payloads.bindPayloadUnknown(self, state, tok);
                             try scanDeferredBody(self, state, @intFromEnum(else_node), current_cfg, error_only, scope_node);
                             state.resetRegion(ids.varId(tok));
                         } else {
@@ -160,7 +160,7 @@ pub fn mixin(comptime _Engine: type) type {
                 .@"for", .for_simple => {
                     const full_for = tree.fullFor(@enumFromInt(node)) orelse return;
                     if (full_for.payload_token != 0) {
-                        try _Engine.payloads.bindForPayloads(self, state, full_for.payload_token);
+                        try _Engine.Payloads.bindForPayloads(self, state, full_for.payload_token);
                         try scanDeferredBody(self, state, @intFromEnum(full_for.ast.then_expr), current_cfg, error_only, scope_node);
                     } else {
                         try scanDeferredBody(self, state, @intFromEnum(full_for.ast.then_expr), current_cfg, error_only, scope_node);

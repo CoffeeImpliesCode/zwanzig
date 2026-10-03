@@ -2,7 +2,7 @@ const ids = @import("../../ids.zig");
 const Cfg = @import("../../cfg.zig").Cfg;
 const VarResolver = @import("../var_resolver.zig").VarResolver;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         pub fn resolveVarIdFromVarDecl(self: *_Engine, var_decl_node: u32) ?ids.VarId {
             const src = self.source orelse return null;

@@ -539,12 +539,12 @@ test "shadowed variable: parameter shadowed by local" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -553,7 +553,7 @@ test "shadowed variable: parameter shadowed by local" {
     try ShadowedVariableRule.rule.checkFn(&src, allocator, &diagnostics);
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings("shadowed-variable", diagnostics.items[0].rule_name);
+    try std.testing.expectEqualStrings("shadowed-variable", diagnostics.items[0].rule_id);
 }
 
 test "shadowed variable: outer block shadowed by inner block" {
@@ -570,12 +570,12 @@ test "shadowed variable: outer block shadowed by inner block" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -596,12 +596,12 @@ test "shadowed variable: no shadow for underscore prefix" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -623,12 +623,12 @@ test "shadowed variable: no shadow for different names" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -652,12 +652,12 @@ test "shadowed variable: for loop payload shadowed" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -680,12 +680,12 @@ test "shadowed variable: if payload shadowed" {
         \\}
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);
@@ -708,12 +708,12 @@ test "shadowed variable: nested containers don't leak scope" {
         \\};
     ;
 
-    var src = try Source.initText(allocator, source_text);
-    defer src.deinit(allocator);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
 
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer {
-        for (diagnostics.items) |diag| {
+        for (diagnostics.items) |*diag| {
             diag.deinit(allocator);
         }
         diagnostics.deinit(allocator);

@@ -1,7 +1,7 @@
 const std = @import("std");
 const AbstractValue = @import("../value.zig").AbstractValue;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         /// Evaluate a literal expression to an AbstractValue.
         /// Returns null if the node is not a literal or cannot be evaluated.

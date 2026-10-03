@@ -9,7 +9,7 @@ const IrNode = graph.IrNode;
 const CfgNodeId = ids.CfgNodeId;
 const TypeInfo = type_context_mod.TypeInfo;
 
-pub fn mixin(comptime _Builder: type) type {
+pub fn Mixin(comptime _Builder: type) type {
     return struct {
         pub fn processReturnWithTry(
             self: *_Builder,
@@ -119,7 +119,7 @@ pub fn mixin(comptime _Builder: type) type {
             // Success path: continue to var decl (try_success edge)
             // Annotate var decl with type info
             var decl_ir = IrNode.initFull(.var_decl, var_decl_node, var_range);
-            decl_ir = _Builder.type_annotation.annotateWithType(self, decl_ir, source, var_decl_node);
+            decl_ir = _Builder.TypeAnnotation.annotateWithType(self, decl_ir, source, var_decl_node);
             const decl_node = try cfg.addNode(decl_ir);
             try cfg.addEdgeWithKind(try_node, decl_node, .try_success);
 
@@ -156,7 +156,7 @@ pub fn mixin(comptime _Builder: type) type {
             // Create the var decl node that both paths lead to
             // Annotate with type information
             var decl_ir = IrNode.initFull(.var_decl, var_decl_node, var_range);
-            decl_ir = _Builder.type_annotation.annotateWithType(self, decl_ir, source, var_decl_node);
+            decl_ir = _Builder.TypeAnnotation.annotateWithType(self, decl_ir, source, var_decl_node);
             const decl_node = try cfg.addNode(decl_ir);
 
             // Success path: no error, value is unwrapped, goes to var decl

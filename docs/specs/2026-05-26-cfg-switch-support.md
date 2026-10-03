@@ -74,7 +74,7 @@ Out of scope (deliberate, separate follow-ups):
 .@"switch", .switch_comma => try switch_flow.processSwitch(self, cfg, source, ast_node, prev_node),
 ```
 
-A `pub const switch_flow = builder_switch_flow.mixin(@This());` declaration
+A `pub const SwitchFlow = builder_switch_flow.Mixin(@This());` declaration
 is added next to the existing mixin declarations.
 
 ### Inline switch as RHS

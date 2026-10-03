@@ -591,10 +591,11 @@ test "detects return of field access on call with local buffer" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 
@@ -611,10 +612,11 @@ test "allows return of non-local-derived value" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 
@@ -634,10 +636,11 @@ test "detects return via switch expression" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 
@@ -654,10 +657,11 @@ test "detects return of address of local buffer" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 
@@ -674,10 +678,11 @@ test "detects return of slice derived from local buffer" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 
@@ -699,10 +704,11 @@ test "ignores non-pointer return type" {
         \\}
     ;
 
-    var src = Source.initForTest("test.zig", source_text);
+    var src = Source.init(allocator, "test.zig", source_text);
+    defer src.deinit();
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    defer for (diagnostics.items) |d| d.deinit(allocator);
+    defer for (diagnostics.items) |*d| d.deinit(allocator);
 
     try ReturnLocalPointerRule.rule.check(&src, allocator, &diagnostics);
 

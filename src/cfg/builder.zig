@@ -32,11 +32,11 @@ pub const CfgBuilder = struct {
     /// Optional directory to dump CFG DOT files for visualization.
     dump_cfg_dir: ?[]const u8 = null,
     io_context: *compat.Context = compat.defaultContext(),
-    pub const type_annotation = builder_type_annotation.mixin(@This());
-    pub const statements = builder_statements.mixin(@This());
-    pub const control_flow = builder_control_flow.mixin(@This());
-    pub const error_flow = builder_error_flow.mixin(@This());
-    pub const switch_flow = builder_switch_flow.mixin(@This());
+    pub const TypeAnnotation = builder_type_annotation.Mixin(@This());
+    pub const Statements = builder_statements.Mixin(@This());
+    pub const ControlFlow = builder_control_flow.Mixin(@This());
+    pub const ErrorFlow = builder_error_flow.Mixin(@This());
+    pub const SwitchFlow = builder_switch_flow.Mixin(@This());
 
     pub const ProcessResult = struct {
         last: ?CfgNodeId,
@@ -189,21 +189,21 @@ pub const CfgBuilder = struct {
         const tag = tags[ast_node];
 
         return switch (tag) {
-            .block, .block_semicolon, .block_two, .block_two_semicolon => try statements.processBlock(self, cfg, source, ast_node, prev_node),
-            .@"return" => try statements.processReturn(self, cfg, source, ast_node, prev_node),
-            .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => try statements.processVarDecl(self, cfg, source, ast_node, prev_node),
-            .assign => try statements.processAssign(self, cfg, source, ast_node, prev_node),
-            .call, .call_comma, .call_one, .call_one_comma, .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => try statements.processCall(self, cfg, source, ast_node, prev_node),
-            .@"if", .if_simple => try control_flow.processIf(self, cfg, source, ast_node, prev_node),
-            .while_simple, .while_cont, .@"while" => try control_flow.processWhile(self, cfg, source, ast_node, prev_node),
-            .for_simple, .@"for" => try control_flow.processFor(self, cfg, source, ast_node, prev_node),
-            .@"defer" => try error_flow.processDefer(self, cfg, source, ast_node, prev_node),
-            .@"errdefer" => try error_flow.processErrdefer(self, cfg, source, ast_node, prev_node),
-            .@"try" => try error_flow.processTry(self, cfg, source, ast_node, prev_node),
-            .@"catch" => try error_flow.processCatch(self, cfg, source, ast_node, prev_node),
-            .@"switch", .switch_comma => try switch_flow.processSwitch(self, cfg, source, ast_node, prev_node),
-            .unreachable_literal => try statements.processUnreachable(self, cfg, source, ast_node, prev_node),
-            else => try statements.processGenericExpr(self, cfg, source, ast_node, prev_node),
+            .block, .block_semicolon, .block_two, .block_two_semicolon => try Statements.processBlock(self, cfg, source, ast_node, prev_node),
+            .@"return" => try Statements.processReturn(self, cfg, source, ast_node, prev_node),
+            .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => try Statements.processVarDecl(self, cfg, source, ast_node, prev_node),
+            .assign => try Statements.processAssign(self, cfg, source, ast_node, prev_node),
+            .call, .call_comma, .call_one, .call_one_comma, .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => try Statements.processCall(self, cfg, source, ast_node, prev_node),
+            .@"if", .if_simple => try ControlFlow.processIf(self, cfg, source, ast_node, prev_node),
+            .while_simple, .while_cont, .@"while" => try ControlFlow.processWhile(self, cfg, source, ast_node, prev_node),
+            .for_simple, .@"for" => try ControlFlow.processFor(self, cfg, source, ast_node, prev_node),
+            .@"defer" => try ErrorFlow.processDefer(self, cfg, source, ast_node, prev_node),
+            .@"errdefer" => try ErrorFlow.processErrdefer(self, cfg, source, ast_node, prev_node),
+            .@"try" => try ErrorFlow.processTry(self, cfg, source, ast_node, prev_node),
+            .@"catch" => try ErrorFlow.processCatch(self, cfg, source, ast_node, prev_node),
+            .@"switch", .switch_comma => try SwitchFlow.processSwitch(self, cfg, source, ast_node, prev_node),
+            .unreachable_literal => try Statements.processUnreachable(self, cfg, source, ast_node, prev_node),
+            else => try Statements.processGenericExpr(self, cfg, source, ast_node, prev_node),
         };
     }
 

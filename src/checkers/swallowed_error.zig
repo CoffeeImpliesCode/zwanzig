@@ -5,6 +5,7 @@ const CheckerError = checker_mod.CheckerError;
 const Diagnostic = checker_mod.Diagnostic;
 const Source = @import("../source.zig").Source;
 const ids = @import("../ids.zig");
+const ast_walk = @import("../ast_walk.zig");
 const cfg_mod = @import("../cfg.zig");
 const Cfg = cfg_mod.Cfg;
 const CfgNodeId = ids.CfgNodeId;
@@ -58,7 +59,11 @@ pub const SwallowedErrorChecker = struct {
 
         const tree = src.ast() catch return;
         const data = tree.nodes.items(.data);
-
+        const node_tags = tree.nodes.items(.tag);
+        const parent_map = try allocator.alloc(u32, node_tags.len);
+        defer allocator.free(parent_map);
+        @memset(parent_map, 0);
+        ast_walk.fillParentMap(tree, ids.astIndex(fn_node), parent_map);
         // Run the analysis engine with a worklist limit to avoid pathological cases
         var engine = AnalysisEngine.initWithSource(allocator, cfg_handle.cfg, src);
         defer engine.deinit();
@@ -104,8 +109,19 @@ pub const SwallowedErrorChecker = struct {
             if (cfg_node.ir_node.tag == .catch_expr) {
                 const catch_ast = cfg_node.ir_node.ast_node orelse continue;
                 const handler_ast = ids.astId(@intFromEnum(data[catch_ast].node_and_node[1]));
+                if (!isBlockHandler(tree, handler_ast)) continue;
+                const payload_token = catchPayloadToken(tree, ids.astId(catch_ast));
                 const engine_ptr: ?*const AnalysisEngine = if (engine_ok) &engine else null;
-                if (try isErrorSwallowed(cfg_handle.cfg, cfg_node.index, handler_ast, tree, engine_ptr, allocator)) {
+                if (try isErrorSwallowed(
+                    cfg_handle.cfg,
+                    cfg_node.index,
+                    handler_ast,
+                    payload_token,
+                    tree,
+                    parent_map,
+                    engine_ptr,
+                    allocator,
+                )) {
                     // Get source range from IR node
                     if (cfg_node.ir_node.source_range) |range| {
                         const diag = Diagnostic.init(
@@ -134,7 +150,9 @@ pub const SwallowedErrorChecker = struct {
         cfg: *const Cfg,
         catch_node_idx: CfgNodeId,
         handler_ast: AstNodeId,
+        payload_token: ?u32,
         tree: *const std.zig.Ast,
+        parent_map: []const u32,
         engine: ?*const AnalysisEngine,
         allocator: std.mem.Allocator,
     ) CheckerError!bool {
@@ -162,13 +180,17 @@ pub const SwallowedErrorChecker = struct {
             return false;
         }
 
+        if (payload_token) |token| {
+            if (handlerStoresCaughtError(tree, handler_ast, token)) return false;
+        }
+
         // Trace through the handler to see if it:
         // 1. Returns an error (good)
         // 2. Contains a call (potentially logging)
-        // 3. Just falls through (swallowed error)
-        const scan = scanHandlerTokens(tree, handler_ast);
+        const scan = scanHandlerTokens(tree, handler_ast, parent_map);
         var has_return = scan.has_return;
         var has_call = scan.has_call;
+        const has_input_progress = scan.has_input_progress and scan.has_control_transfer;
         var current_nodes: std.ArrayList(CfgNodeId) = .empty;
         defer current_nodes.deinit(allocator);
         var visited = std.AutoHashMap(CfgNodeId, void).init(allocator);
@@ -240,14 +262,14 @@ pub const SwallowedErrorChecker = struct {
         // - Handler reaches merge without return
         // - Handler doesn't have a call (potential logging)
         // - Analysis shows error path reaches normal completion
-        if (engine != null and !has_return and !has_call and reaches_merge_from_error) {
+        if (engine != null and !has_return and !has_call and !has_input_progress and reaches_merge_from_error) {
             return true;
         }
 
         // Also flag as swallowed if there's no return and no call even without engine check
         // This catches cases where the CFG structure shows a non-empty handler that
         // doesn't do anything useful
-        if (!has_return and !has_call and handler_entry != merge_node) {
+        if (!has_return and !has_call and !has_input_progress and handler_entry != merge_node) {
             // Verify the handler actually has statements by checking it's not just going to merge
             var nodes_in_handler: u32 = 0;
             var iter = visited.iterator();
@@ -263,30 +285,207 @@ pub const SwallowedErrorChecker = struct {
         return false;
     }
 
+    const ErrorStoreFinder = struct {
+        payload_name: []const u8,
+        found: bool = false,
+        stop: bool = false,
+
+        pub fn visit(
+            self: *ErrorStoreFinder,
+            tree: *const std.zig.Ast,
+            node: u32,
+            tag: std.zig.Ast.Node.Tag,
+        ) !void {
+            if (tag != .assign) return;
+
+            const assignment = tree.nodes.items(.data)[node].node_and_node;
+            const lhs = @intFromEnum(assignment[0]);
+            const rhs = @intFromEnum(assignment[1]);
+            if (isDiscardIdentifier(tree, lhs)) return;
+            if (!isPayloadIdentifier(tree, rhs, self.payload_name)) return;
+
+            self.found = true;
+            self.stop = true;
+        }
+    };
+
+    fn isBlockHandler(tree: *const std.zig.Ast, handler_ast: AstNodeId) bool {
+        const handler = ids.astIndex(handler_ast);
+        const tags = tree.nodes.items(.tag);
+        if (handler == 0 or handler >= tags.len) return false;
+
+        return switch (tags[handler]) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => true,
+            else => false,
+        };
+    }
+
+    fn catchPayloadToken(tree: *const std.zig.Ast, catch_ast: AstNodeId) ?u32 {
+        const catch_node = ids.astIndex(catch_ast);
+        const main_tokens = tree.nodes.items(.main_token);
+        if (catch_node == 0 or catch_node >= main_tokens.len) return null;
+
+        const token_tags = tree.tokens.items(.tag);
+        const catch_token = main_tokens[catch_node];
+        if (catch_token + 2 >= token_tags.len) return null;
+        if (token_tags[catch_token] != .keyword_catch) return null;
+        if (token_tags[catch_token + 1] != .pipe) return null;
+
+        var payload_token = catch_token + 2;
+        if (token_tags[payload_token] == .asterisk) {
+            payload_token += 1;
+        }
+        if (payload_token >= token_tags.len or token_tags[payload_token] != .identifier) return null;
+        if (payload_token + 1 >= token_tags.len) return null;
+        if (token_tags[payload_token + 1] != .pipe) return null;
+        if (std.mem.eql(u8, tree.tokenSlice(payload_token), "_")) return null;
+        return payload_token;
+    }
+
+    fn handlerStoresCaughtError(
+        tree: *const std.zig.Ast,
+        handler_ast: AstNodeId,
+        payload_token: u32,
+    ) bool {
+        const token_tags = tree.tokens.items(.tag);
+        if (payload_token >= token_tags.len or token_tags[payload_token] != .identifier) {
+            return false;
+        }
+
+        var finder = ErrorStoreFinder{
+            .payload_name = tree.tokenSlice(payload_token),
+        };
+        ast_walk.walk(ErrorStoreFinder, tree, ids.astIndex(handler_ast), &finder) catch return false;
+        return finder.found;
+    }
+
+    fn isPayloadIdentifier(
+        tree: *const std.zig.Ast,
+        node: u32,
+        payload_name: []const u8,
+    ) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len or tags[node] != .identifier) return false;
+
+        const token = tree.nodes.items(.main_token)[node];
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(token), payload_name);
+    }
+
+    fn isDiscardIdentifier(tree: *const std.zig.Ast, node: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len or tags[node] != .identifier) return false;
+
+        const token = tree.nodes.items(.main_token)[node];
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(token), "_");
+    }
+
+    const ConditionIdentifierFinder = struct {
+        name: []const u8,
+        found: bool = false,
+        stop: bool = false,
+
+        pub fn visit(
+            self: *@This(),
+            tree: *const std.zig.Ast,
+            node: u32,
+            tag: std.zig.Ast.Node.Tag,
+        ) !void {
+            if (tag != .identifier or node >= tree.nodes.items(.main_token).len) return;
+            const token = tree.nodes.items(.main_token)[node];
+            if (token >= tree.tokens.items(.tag).len) return;
+            if (std.mem.eql(u8, tree.tokenSlice(token), self.name)) {
+                self.found = true;
+                self.stop = true;
+            }
+        }
+    };
+
+    fn whileConditionReferencesIdentifier(
+        tree: *const std.zig.Ast,
+        while_node: u32,
+        name: []const u8,
+    ) bool {
+        const full = tree.fullWhile(@enumFromInt(while_node)) orelse return false;
+        var finder = ConditionIdentifierFinder{ .name = name };
+        ast_walk.walk(ConditionIdentifierFinder, tree, @intFromEnum(full.ast.cond_expr), &finder) catch return false;
+        return finder.found;
+    }
+
+    fn findEnclosingWhile(
+        tree: *const std.zig.Ast,
+        parent_map: []const u32,
+        handler_ast: AstNodeId,
+    ) ?u32 {
+        const tags = tree.nodes.items(.tag);
+        var node = ids.astIndex(handler_ast);
+        while (node < parent_map.len) {
+            const parent = parent_map[node];
+            if (parent == 0 or parent >= tags.len) return null;
+            switch (tags[parent]) {
+                .@"while", .while_simple, .while_cont => return parent,
+                else => node = parent,
+            }
+        }
+        return null;
+    }
+
     const TokenScan = struct {
         has_return: bool,
         has_call: bool,
+        has_control_transfer: bool,
+        has_input_progress: bool,
     };
 
-    fn scanHandlerTokens(tree: *const std.zig.Ast, handler_ast: AstNodeId) TokenScan {
+    fn scanHandlerTokens(
+        tree: *const std.zig.Ast,
+        handler_ast: AstNodeId,
+        parent_map: []const u32,
+    ) TokenScan {
         if (ids.astIndex(handler_ast) == 0) {
-            return .{ .has_return = false, .has_call = false };
+            return .{
+                .has_return = false,
+                .has_call = false,
+                .has_control_transfer = false,
+                .has_input_progress = false,
+            };
         }
         const token_tags = tree.tokens.items(.tag);
         const ast_index = ids.astIndex(handler_ast);
         const first = tree.firstToken(@enumFromInt(ast_index));
         const last = tree.lastToken(@enumFromInt(ast_index));
         if (first >= token_tags.len) {
-            return .{ .has_return = false, .has_call = false };
+            return .{
+                .has_return = false,
+                .has_call = false,
+                .has_control_transfer = false,
+                .has_input_progress = false,
+            };
         }
         var has_return = false;
         var has_call = false;
+        var has_control_transfer = false;
+        var has_input_progress = false;
+        const enclosing_while = findEnclosingWhile(tree, parent_map, handler_ast);
         var i = first;
         const end = if (last < token_tags.len) last else token_tags.len - 1;
         while (i <= end) : (i += 1) {
             const tag = token_tags[i];
             if (tag == .keyword_return) {
                 has_return = true;
+            }
+            if (tag == .keyword_break or tag == .keyword_continue) {
+                has_control_transfer = true;
+            }
+            if (!has_input_progress and tag == .plus_equal and i > first and token_tags[i - 1] == .identifier) {
+                if (enclosing_while) |while_node| {
+                    if (whileConditionReferencesIdentifier(tree, while_node, tree.tokenSlice(i - 1))) {
+                        has_input_progress = true;
+                    }
+                }
             }
             if (!has_call and (tag == .identifier or tag == .builtin)) {
                 var j = i + 1;
@@ -300,7 +499,12 @@ pub const SwallowedErrorChecker = struct {
                 }
             }
         }
-        return .{ .has_return = has_return, .has_call = has_call };
+        return .{
+            .has_return = has_return,
+            .has_call = has_call,
+            .has_control_transfer = has_control_transfer,
+            .has_input_progress = has_input_progress,
+        };
     }
 };
 
@@ -451,6 +655,85 @@ test "swallowed_error - no diagnostic for empty catch" {
     try testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "swallowed_error - no diagnostic for catch mapped to error" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const code: [:0]const u8 =
+        \\fn operation() error{Failed}!void {
+        \\    return error.Failed;
+        \\}
+        \\fn mappedOperation() error{Mapped}!void {
+        \\    return operation() catch error.Mapped;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    defer for (diagnostics.items) |diag| allocator.free(@constCast(diag.message));
+
+    const context = checker_mod.CheckerContext{ .build_metadata = null };
+    try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, context);
+
+    try testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "swallowed_error - no diagnostic for catch mapped to null" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const code: [:0]const u8 =
+        \\fn operation() error{Failed}!i32 {
+        \\    return error.Failed;
+        \\}
+        \\fn optionalOperation() ?i32 {
+        \\    return operation() catch null;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    defer for (diagnostics.items) |diag| allocator.free(@constCast(diag.message));
+
+    const context = checker_mod.CheckerContext{ .build_metadata = null };
+    try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, context);
+
+    try testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "swallowed_error - no diagnostic for catch that captures error state" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const code: [:0]const u8 =
+        \\fn operation() error{Failed}!void {
+        \\    return error.Failed;
+        \\}
+        \\fn rememberOperationError() ?anyerror {
+        \\    var operation_error: ?anyerror = null;
+        \\    operation() catch |err| {
+        \\        operation_error = err;
+        \\    };
+        \\    return operation_error;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    defer for (diagnostics.items) |diag| allocator.free(@constCast(diag.message));
+
+    const context = checker_mod.CheckerContext{ .build_metadata = null };
+    try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, context);
+
+    try testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
 test "swallowed_error - detects swallowed error with assignment only" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -481,4 +764,44 @@ test "swallowed_error - detects swallowed error with assignment only" {
 
     try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
+}
+
+test "skript regression: malformed input recovery is not a swallowed error" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn decode() error{Malformed}!void {
+        \\    return error.Malformed;
+        \\}
+        \\fn recoverMalformedInput(bytes: []const u8) usize {
+        \\    var index: usize = 0;
+        \\    while (index < bytes.len) {
+        \\        decode() catch {
+        \\            index += 1;
+        \\            continue;
+        \\        };
+        \\    }
+        \\    return index;
+        \\}
+        \\fn unsafeControl() void {
+        \\    var ignored = false;
+        \\    decode() catch {
+        \\        ignored = true;
+        \\    };
+        \\    _ = ignored;
+        \\}
+    ;
+    var source = Source.init(allocator, "skript-regression.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+        .build_metadata = null,
+    });
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
 }

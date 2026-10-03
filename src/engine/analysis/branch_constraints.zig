@@ -6,7 +6,7 @@ const Cfg = @import("../../cfg.zig").Cfg;
 const CfgNode = @import("../../cfg.zig").CfgNode;
 const Constraint = @import("../constraints.zig").Constraint;
 
-pub fn mixin(comptime _Engine: type) type {
+pub fn Mixin(comptime _Engine: type) type {
     return struct {
         pub fn getAssertionScope(self: *_Engine, current_cfg: *const Cfg) ?*assertions.AssertionScope {
             const fn_node = current_cfg.fn_ast_node orelse return null;
@@ -32,7 +32,7 @@ pub fn mixin(comptime _Engine: type) type {
             const ir_node = cfg_node.ir_node;
             if (ir_node.operand_node) |cond_node| {
                 // First check if the condition is a literal boolean
-                if (_Engine.literals.evaluateLiteral(self, cond_node)) |literal_val| {
+                if (_Engine.Literals.evaluateLiteral(self, cond_node)) |literal_val| {
                     if (literal_val.toBool()) |bool_val| {
                         // Use literalBool for compile-time known conditions to enable
                         // proper branch pruning (e.g., if (false) should be pruned)
@@ -46,7 +46,7 @@ pub fn mixin(comptime _Engine: type) type {
                 }
 
                 const var_key = if (self.source != null)
-                    (_Engine.var_resolution.resolveVarIdFromExpr(self, cond_node, current_cfg) orelse ids.varId(cond_node))
+                    (_Engine.VarResolution.resolveVarIdFromExpr(self, cond_node, current_cfg) orelse ids.varId(cond_node))
                 else
                     ids.varId(cond_node);
                 if (ir_node.operand2_node) |cmp_info| {
@@ -111,14 +111,14 @@ pub fn mixin(comptime _Engine: type) type {
             const rhs = datas[cond_node].node_and_node[1];
 
             // Check if either operand is `null`
-            const lhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(lhs));
-            const rhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(rhs));
+            const lhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(lhs));
+            const rhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(rhs));
 
             if (!lhs_is_null and !rhs_is_null) return null;
 
             // The other operand is the variable being compared
             const var_node = if (lhs_is_null) @intFromEnum(rhs) else @intFromEnum(lhs);
-            const var_key = _Engine.var_resolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse ids.varId(var_node);
+            const var_key = _Engine.VarResolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse ids.varId(var_node);
 
             // For == null: is_null=true (true branch means var is null)
             // For != null: is_null=false (true branch means var is non-null)
@@ -240,12 +240,12 @@ pub fn mixin(comptime _Engine: type) type {
                         const lhs = datas[cond_node].node_and_node[0];
                         const rhs = datas[cond_node].node_and_node[1];
 
-                        const lhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(lhs));
-                        const rhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(rhs));
+                        const lhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(lhs));
+                        const rhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(rhs));
 
                         if (lhs_is_null or rhs_is_null) {
                             const var_node = if (lhs_is_null) @intFromEnum(rhs) else @intFromEnum(lhs);
-                            const var_key = _Engine.var_resolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
+                            const var_key = _Engine.VarResolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
                             // After expect(x != null), x is proven non-null (is_null=false)
                             return Constraint.nullCheck(var_key, false);
                         }
@@ -255,12 +255,12 @@ pub fn mixin(comptime _Engine: type) type {
                         const lhs = datas[cond_node].node_and_node[0];
                         const rhs = datas[cond_node].node_and_node[1];
 
-                        const lhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(lhs));
-                        const rhs_is_null = _Engine.literals.isNullLiteral(self, @intFromEnum(rhs));
+                        const lhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(lhs));
+                        const rhs_is_null = _Engine.Literals.isNullLiteral(self, @intFromEnum(rhs));
 
                         if (lhs_is_null or rhs_is_null) {
                             const var_node = if (lhs_is_null) @intFromEnum(rhs) else @intFromEnum(lhs);
-                            const var_key = _Engine.var_resolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
+                            const var_key = _Engine.VarResolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
                             // After expect(x == null), x is proven null (is_null=true)
                             return Constraint.nullCheck(var_key, true);
                         }
@@ -273,21 +273,21 @@ pub fn mixin(comptime _Engine: type) type {
                     const lhs_node = @intFromEnum(args[0]);
                     const rhs_node = @intFromEnum(args[1]);
 
-                    const lhs_is_null = _Engine.literals.isNullLiteral(self, lhs_node);
-                    const rhs_is_null = _Engine.literals.isNullLiteral(self, rhs_node);
+                    const lhs_is_null = _Engine.Literals.isNullLiteral(self, lhs_node);
+                    const rhs_is_null = _Engine.Literals.isNullLiteral(self, rhs_node);
 
                     if (lhs_is_null or rhs_is_null) {
                         const var_node = if (lhs_is_null) rhs_node else lhs_node;
-                        const var_key = _Engine.var_resolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
+                        const var_key = _Engine.VarResolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
                         return Constraint.nullCheck(var_key, true);
                     }
 
-                    const lhs_is_non_null = _Engine.literals.isNonNullLiteral(self, lhs_node);
-                    const rhs_is_non_null = _Engine.literals.isNonNullLiteral(self, rhs_node);
+                    const lhs_is_non_null = _Engine.Literals.isNonNullLiteral(self, lhs_node);
+                    const rhs_is_non_null = _Engine.Literals.isNonNullLiteral(self, rhs_node);
 
                     if (lhs_is_non_null or rhs_is_non_null) {
                         const var_node = if (lhs_is_non_null) rhs_node else lhs_node;
-                        const var_key = _Engine.var_resolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
+                        const var_key = _Engine.VarResolution.resolveVarIdFromExpr(self, var_node, current_cfg) orelse return null;
                         return Constraint.nullCheck(var_key, false);
                     }
 
