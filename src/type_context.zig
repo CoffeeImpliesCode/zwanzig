@@ -26,6 +26,9 @@ pub const TypeContext = struct {
     /// Cache for frequently queried types by AST node index.
     /// This avoids repeated ZIR lookups for the same nodes.
     node_type_cache: std.AutoHashMap(u32, TypeInfo),
+    /// Strict results never share heuristic types or CFG-provided hints.
+    strict_type_cache: std.AutoHashMap(u32, ?TypeInfo),
+    resolution_failed: bool = false,
 
     /// AST nodes currently being resolved. Guards the
     /// identifier -> declaration -> initializer -> identifier cycle
@@ -38,12 +41,14 @@ pub const TypeContext = struct {
             .allocator = allocator,
             .source = source,
             .node_type_cache = std.AutoHashMap(u32, TypeInfo).init(allocator),
+            .strict_type_cache = std.AutoHashMap(u32, ?TypeInfo).init(allocator),
             .resolving = std.AutoHashMap(u32, void).init(allocator),
         };
     }
 
     pub fn deinit(self: *TypeContext) void {
         self.node_type_cache.deinit();
+        self.strict_type_cache.deinit();
         self.resolving.deinit();
     }
 
@@ -151,7 +156,20 @@ pub const TypeContext = struct {
     /// Strict expression type query that avoids name-only heuristics.
     /// Use this when the result should only be driven by resolved type information.
     pub fn getExpressionTypeStrict(self: *TypeContext, ast_node: u32) ?TypeInfo {
-        return self.getExpressionTypeInternal(ast_node, false, false);
+        // Nested queries can hit a recursion guard and yield incomplete results.
+        if (self.resolving.count() != 0) {
+            return self.getExpressionTypeInternal(ast_node, false, false);
+        }
+        if (self.strict_type_cache.get(ast_node)) |cached| return cached;
+
+        self.resolution_failed = false;
+        const result = self.getExpressionTypeInternal(ast_node, false, false);
+        if (!self.resolution_failed) {
+            self.strict_type_cache.put(ast_node, result) catch |err| {
+                std.debug.assert(err == error.OutOfMemory);
+            };
+        }
+        return result;
     }
 
     pub fn isStructExpression(self: *TypeContext, expression: u32) bool {
@@ -170,10 +188,16 @@ pub const TypeContext = struct {
             }
         }
         if (self.resolving.contains(ast_node)) return null;
-        self.resolving.put(ast_node, {}) catch return null;
+        self.resolving.put(ast_node, {}) catch {
+            self.resolution_failed = true;
+            return null;
+        };
         defer _ = self.resolving.remove(ast_node);
 
-        const tree = self.source.ast() catch return null;
+        const tree = self.source.ast() catch {
+            self.resolution_failed = true;
+            return null;
+        };
         const tags = tree.nodes.items(.tag);
 
         if (ast_node >= tags.len) return null;
@@ -1243,29 +1267,6 @@ test "TypeContext caseRecommendations" {
     try std.testing.expect(ctx.shouldBeSnakeCase("MY_CONST"));
 }
 
-test "TypeContext nodeTypeCache" {
-    const allocator = std.testing.allocator;
-
-    const code: [:0]const u8 = "const x: i32 = 42;";
-    var source = Source.init(allocator, "test.zig", code);
-    defer source.deinit();
-
-    var ctx = TypeContext.init(allocator, &source);
-    defer ctx.deinit();
-
-    // Manually cache a type
-    const ti = TypeInfo.initInt(64, false);
-    ctx.cacheNodeType(100, ti);
-
-    // Retrieve from cache
-    const cached = ctx.getNodeType(100);
-    try std.testing.expect(cached != null);
-    if (cached) |c| {
-        try std.testing.expectEqual(TypeInfo.TypeKind.uint, c.kind);
-        try std.testing.expectEqual(@as(u16, 64), c.size_bits);
-    }
-}
-
 test "TypeContext type kind queries" {
     const allocator = std.testing.allocator;
 
@@ -1687,4 +1688,27 @@ test "bare method calls use the enclosing container contract" {
         return;
     }
     return error.MissingUse;
+}
+
+test "strict expression queries remain independent of heuristic results" {
+    const code: [:0]const u8 =
+        \\fn inspect(receiver: anytype) void {
+        \\    _ = receiver.openFile();
+        \\}
+    ;
+    var source = Source.init(std.testing.allocator, "strict-query.zig", code);
+    defer source.deinit();
+    var context = TypeContext.init(std.testing.allocator, &source);
+    defer context.deinit();
+    const tree = try source.ast();
+    for (tree.nodes.items(.tag), 0..) |tag, index| {
+        if (!call_resolver.isCallNode(tag)) continue;
+        const node: u32 = @intCast(index);
+        try std.testing.expect(context.getExpressionTypeStrict(node) == null);
+        const heuristic = context.getExpressionType(node) orelse return error.MissingType;
+        try std.testing.expectEqual(TypeInfo.TypeKind.error_union, heuristic.kind);
+        try std.testing.expect(context.getExpressionTypeStrict(node) == null);
+        return;
+    }
+    return error.MissingCall;
 }

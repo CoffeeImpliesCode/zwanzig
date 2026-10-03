@@ -1040,6 +1040,13 @@ Expression type queries handle:
 - **Error values**: Returns error union type
 - **Identifiers**: Looks up declared type (including local error variables)
 
+`getExpressionTypeStrict()` excludes name-only heuristics and CFG type hints.
+It caches completed top-level queries, including unresolved results, for the
+lifetime of the per-file `TypeContext`. Nested queries bypass this cache because
+recursion guards can produce incomplete results. Allocation failures in the
+resolution guard or source parsing do not populate it. The strict cache is
+separate from the heuristic cache and is released by `deinit()`.
+
 ### Source type API
 
 The `Source` struct (`src/source.zig`) provides access to type information via lazy-loaded ZirBridge:
