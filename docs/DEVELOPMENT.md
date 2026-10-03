@@ -22,24 +22,57 @@ Use `zig build` directly when you need a Debug executable.
 
 ## Performance measurement
 
-Build with the same frontend and optimization mode for each comparison. Scan
-only source directories, use one worker, and run benchmarks sequentially:
+The benchmark runner measures whatever source trees you name, and this checkout
+is the only workload when you name none. Each extra workload is a `NAME=PATH`
+pair. It requires Python 3, Linux `perf`, and GNU `time`. Runs are sequential,
+use one worker and nice level 15, and leave analysis limits unchanged.
+
+Freeze the inputs and retain the baseline executable before editing:
 
 ```bash
 zig build -Doptimize=ReleaseSafe -j1
-mkdir -p .tmp
-perf stat -e cycles:u,instructions:u,branches:u,branch-misses:u -- \
-  zig-out/bin/zwanzig --threads 1 --format json path/to/project/src
-perf record -e cycles:u -F 99 --call-graph fp -o .tmp/analysis.perf -- \
-  zig-out/bin/zwanzig --threads 1 path/to/project/src
-perf report --stdio --children --call-graph none -i .tmp/analysis.perf
+python3 scripts/benchmark.py snapshot .tmp/bench-inputs other=/path/to/project
+cp zig-out/bin/zwanzig .tmp/bench-before
+python3 scripts/benchmark.py run .tmp/bench-inputs .tmp/bench-before .tmp/bench-baseline
 ```
 
-Use an unchanged source snapshot and compare JSON diagnostics before and after
-the change. Exit status 1 means diagnostics were found, not that analysis failed.
-Check both elapsed time and hardware counters; system load can change timings.
-Use inclusive samples to trace the critical call chain and self samples to
-locate work within it. Do not add inclusive percentages from nested functions.
+The snapshot includes Zig sources and root build/configuration files. Its manifest
+records SHA-256 hashes. Zwanzig's own workload stays frozen while its implementation
+changes. Existing snapshot and result directories are never overwritten. The runner
+also rejects changes to the checkout configuration used for both executions.
+Snapshots, manifests and result directories are measurement artifacts: keep them
+out of version control, and publish only results whose workloads may be public.
+
+Build the candidate with the same frontend and optimization mode, then compare:
+
+```bash
+zig build -Doptimize=ReleaseSafe -j1
+python3 scripts/benchmark.py run .tmp/bench-inputs zig-out/bin/zwanzig .tmp/bench-candidate
+python3 scripts/benchmark.py compare .tmp/bench-baseline .tmp/bench-candidate
+```
+
+Results include user and elapsed time, peak RSS, hardware counters, executable hash,
+JSON diagnostics, and analysis-limit warnings. Comparison requires matching inputs,
+diagnostic multisets, exit status, and limit-warning multisets. Exit status 1 means
+diagnostics were found, not that analysis failed.
+
+Profile long runs separately so sampling overhead does not affect the timing comparison:
+
+```bash
+python3 scripts/benchmark.py run .tmp/bench-inputs .tmp/bench-before .tmp/bench-profile \
+  --profile --workloads other
+perf report --stdio --no-children --max-stack 8 --call-graph none \
+  -i .tmp/bench-profile/other/perf.data
+```
+
+Profiles use frame-pointer call chains. Self samples locate expensive functions;
+inclusive samples (`--children`) trace their callers. Bound the displayed stack
+depth when symbolization is slow. Do not add inclusive percentages from nested
+functions. Repeat timings when needed; system load and CPU frequency can affect
+a single measurement.
+
+The comparison procedure and its caveats are in the
+[performance measurements](internal/ADJUSTMENT_PLAN.md#performance-measurements).
 
 ## Formatting
 

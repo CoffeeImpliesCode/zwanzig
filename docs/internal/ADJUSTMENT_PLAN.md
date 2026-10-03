@@ -12,7 +12,28 @@ Full `just test` and `just lint` runs, including analyzer self-checks, passed fo
 
 ### Performance measurements
 
-The measured runs that motivated the indexing and reuse work used frozen input snapshots, one analysis worker, nice level 15 and unchanged default analysis limits, and compared diagnostic multisets, exit status and analysis-limit warnings before and after each change. Those workloads, their timings and their hashes are private evidence and are not published here.
+The measured runs that motivated the indexing, reuse and import-resolution work
+used frozen input snapshots, one analysis worker, nice level 15 and unchanged
+default analysis limits, and compared diagnostic multisets, exit status and
+analysis-limit warnings before and after each change. `scripts/benchmark.py`
+implements that procedure; see
+[DEVELOPMENT.md](../DEVELOPMENT.md#performance-measurement).
+
+The workloads themselves, their source-file counts, their timings, their
+diagnostic details and their input and binary hashes are private evidence and are
+not published here. Nothing below is reproducible from this repository, so the
+conclusions are stated qualitatively and no numbers are claimed.
+
+- Profiling identified repeated enclosing-function scans and AST token-range
+  walks as the dominant costs. Guards now reuse lexical candidates and cached
+  ranges.
+- Source-owned declaration parent maps replace per-engine copies.
+- Indexed import lookup removes repeated file scans and path normalization while
+  preserving the earliest exact, relative, or package match.
+- Peak memory stayed close to the baseline; the one workload whose peak rose
+  still stayed inside the engine-owned cache admission budget. Shared source
+  metadata sits outside that budget.
+- Analysis limits and runtime safety checks are unchanged by all of this work.
 
 ## Step 1: Extract branch constraints
 
@@ -74,7 +95,7 @@ The original plan proposed scanning every CFG node without exploded states. That
 - Within a file, compatible configured function analyses use exclusive mutable leases from `AnalysisCache`. Plain or unstable owned CFGs remain uncached.
 - The per-file `TypeContext` outlives its `AnalysisCache`.
 - Cache admission occurs after checker lazy queries. Retention is bounded to 64 entries and 16 MiB of live engine-owned allocation payload.
-- The payload bound is not an RSS limit. Separately owned artifact allocations are outside it. Statistics count actual analysis runs.
+- The payload bound is not an RSS limit. Separately owned artifacts and shared source syntax metadata are outside it. Statistics count actual analysis runs.
 
 ### Remaining scope
 Full persisted ZIR, typed IR, and summaries remain future work. In-memory function-analysis reuse does not provide cross-run persistence for these artifacts. No performance improvement is claimed without measurements.

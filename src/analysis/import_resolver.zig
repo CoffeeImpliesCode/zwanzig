@@ -14,16 +14,22 @@ pub const File = struct {
 /// Owns normalized keys and borrows the immutable file slice and exact paths.
 pub const PathIndex = struct {
     files: []const File,
-    exact: std.StringHashMapUnmanaged(usize) = .empty,
+    exact: std.StringHashMapUnmanaged(ExactPath) = .empty,
     normalized: std.StringHashMapUnmanaged(usize) = .empty,
+    package_stems: std.StringHashMapUnmanaged(usize) = .empty,
+
+    const ExactPath = struct {
+        original: usize,
+        equivalent: ?usize,
+    };
 
     pub fn init(allocator: std.mem.Allocator, files: []const File) !PathIndex {
         var index = PathIndex{ .files = files };
         errdefer index.deinit(allocator);
         for (files, 0..) |file, file_index| {
-            const first_equivalent = normalized: {
+            const first_equivalent: ?usize = normalized: {
                 var buffer: [std.fs.max_path_bytes]u8 = undefined;
-                const path = normalizePath(&buffer, file.path) catch break :normalized file_index;
+                const path = normalizePath(&buffer, file.path) catch break :normalized null;
                 if (index.normalized.get(path)) |existing| break :normalized existing;
                 const owned = try allocator.dupe(u8, path);
                 errdefer allocator.free(owned);
@@ -31,7 +37,15 @@ pub const PathIndex = struct {
                 break :normalized file_index;
             };
             const exact = try index.exact.getOrPut(allocator, file.path);
-            if (!exact.found_existing) exact.value_ptr.* = first_equivalent;
+            if (!exact.found_existing) exact.value_ptr.* = .{
+                .original = file_index,
+                .equivalent = first_equivalent,
+            };
+            const basename = std.fs.path.basename(file.path);
+            if (std.mem.endsWith(u8, basename, ".zig")) {
+                const stem = try index.package_stems.getOrPut(allocator, basename[0 .. basename.len - ".zig".len]);
+                if (!stem.found_existing) stem.value_ptr.* = file_index;
+            }
         }
         return index;
     }
@@ -41,16 +55,47 @@ pub const PathIndex = struct {
         while (keys.next()) |key| allocator.free(key.*);
         self.normalized.deinit(allocator);
         self.exact.deinit(allocator);
+        self.package_stems.deinit(allocator);
     }
 
     pub fn find(self: *const PathIndex, path: []const u8) ?usize {
-        // Exact spellings already point to the first normalized equivalent.
-        if (self.exact.get(path)) |file_index| return file_index;
+        if (self.exact.get(path)) |entry| return entry.equivalent orelse entry.original;
+        return self.findNormalized(path);
+    }
+
+    fn findNormalized(self: *const PathIndex, path: []const u8) ?usize {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const normalized = normalizePath(&buffer, path) catch return null;
         return self.normalized.get(normalized);
     }
+
+    /// Match the scan's first file, not a preference for relative over package imports.
+    pub fn findImport(self: *const PathIndex, importer_path: []const u8, import_path: []const u8) ?usize {
+        var first: ?usize = if (self.exact.get(import_path)) |entry| entry.original else null;
+        const importer_dir = std.fs.path.dirname(importer_path) orelse "";
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const relative: ?[]const u8 = if (importer_dir.len == 0)
+            import_path
+        else
+            std.fmt.bufPrint(&buffer, "{s}/{s}", .{ importer_dir, import_path }) catch null;
+        if (relative) |path| {
+            const equivalent = if (self.exact.get(path)) |entry|
+                entry.equivalent
+            else
+                self.findNormalized(path);
+            first = firstMatch(first, equivalent);
+        }
+        if (std.mem.indexOfScalar(u8, import_path, '/') == null and !std.mem.endsWith(u8, import_path, ".zig")) {
+            first = firstMatch(first, self.package_stems.get(import_path));
+        }
+        return first;
+    }
 };
+
+fn firstMatch(left: ?usize, right: ?usize) ?usize {
+    if (left) |a| return if (right) |b| @min(a, b) else a;
+    return right;
+}
 
 pub fn findFileIndexByPath(files: []const File, path: []const u8) ?usize {
     if (files.len != 0) {
@@ -339,6 +384,13 @@ pub fn importMayResolveToPath(importer_path: []const u8, import_path: []const u8
 }
 
 pub fn resolveImportToFileIndex(files: []const File, importer_path: []const u8, import_path: []const u8) ?usize {
+    if (files.len != 0) {
+        if (files[0].path_index) |index| {
+            if (index.files.ptr == files.ptr and index.files.len == files.len) {
+                return index.findImport(importer_path, import_path);
+            }
+        }
+    }
     for (files, 0..) |file, file_index| {
         if (importMayResolveToPath(importer_path, import_path, file.path)) return file_index;
     }
@@ -824,6 +876,8 @@ test "path index releases duplicate and partial normalized keys" {
             defer index.deinit(failing_allocator);
             try std.testing.expectEqual(@as(?usize, 0), index.find("./src/value.zig"));
             try std.testing.expectEqual(@as(?usize, 2), index.find("src/other.zig/child/.."));
+            try std.testing.expectEqual(@as(?usize, 0), index.findImport("src/main.zig", "value"));
+            try std.testing.expectEqual(@as(?usize, 2), index.findImport("src/main.zig", "other.zig"));
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{@as([]const File, &files)});
@@ -839,4 +893,37 @@ test "import path comparisons preserve normalization and package precedence" {
     try std.testing.expect(pathsEquivalent("C:value.zig", "./C:value.zig"));
     try std.testing.expect(!pathsEquivalent("src/value.zig", "other/value.zig"));
     try std.testing.expect(importMayResolveToPath("src/main.zig", "module", "lib/module.zig"));
+}
+
+test "indexed imports preserve exact spelling and package first-match precedence" {
+    const allocator = std.testing.allocator;
+    var tree = try std.zig.Ast.parse(allocator, "", .zig);
+    defer tree.deinit(allocator);
+    const deep_path = ("dir/" ** 128) ++ "deep.zig";
+    var files = [_]File{
+        .{ .path = "lib/module.zig", .tree = &tree },
+        .{ .path = "src/value.zig", .tree = &tree },
+        .{ .path = "src/./value.zig", .tree = &tree },
+        .{ .path = "src/module", .tree = &tree },
+        .{ .path = deep_path, .tree = &tree },
+    };
+    const plain = files;
+    var index = try PathIndex.init(allocator, &files);
+    defer index.deinit(allocator);
+    for (&files) |*file| file.path_index = &index;
+    const cases = [_]struct { importer: []const u8, path: []const u8, expected: ?usize }{
+        .{ .importer = "src/main.zig", .path = "module", .expected = 0 },
+        .{ .importer = "other/main.zig", .path = "src/./value.zig", .expected = 2 },
+        .{ .importer = "src/main.zig", .path = "value.zig/child/..", .expected = 1 },
+        .{ .importer = "other/main.zig", .path = "src/module", .expected = 3 },
+        .{ .importer = "main.zig", .path = deep_path, .expected = 4 },
+        .{ .importer = deep_path, .path = "deep.zig", .expected = null },
+        .{ .importer = "src/main.zig", .path = "deep", .expected = 4 },
+        .{ .importer = "src/main.zig", .path = "missing", .expected = null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, resolveImportToFileIndex(&plain, case.importer, case.path));
+        try std.testing.expectEqual(case.expected, resolveImportToFileIndex(&files, case.importer, case.path));
+    }
+    try std.testing.expectEqual(@as(?usize, 1), resolveImportToFileIndex(files[1..], "other/main.zig", "src/./value.zig"));
 }

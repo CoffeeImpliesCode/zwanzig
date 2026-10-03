@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enabled checks now control type preflight and project preparation. Compatible checkers reuse per-file analysis, while `empty-catch-engine` runs only structural checks unless state visualizations are requested. Analysis statistics count actual engine runs.
 - `just build`, `just run`, and `just lint` now use ReleaseSafe to avoid Debug analysis overhead while retaining safety checks. Self-lint uses one worker.
 - Reduced repeated type resolution and import-path normalization during path-sensitive analysis, without lowering analysis limits or disabling runtime safety checks.
+- Reduced optional-unwrap guard and engine setup costs by sharing syntax indexes and parent maps. Import lookup now uses the project index while preserving first-match behavior.
+
+### Added
+
+- A reproducible benchmark runner freezes the source trees you name, defaults to Zwanzig's own sources, and compares diagnostic multisets, exit status and analysis-limit warnings exactly between two runs.
 
 ## [0.15.1]
 

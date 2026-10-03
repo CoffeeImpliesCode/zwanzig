@@ -6,15 +6,17 @@ const import_resolver = @import("../../analysis/import_resolver.zig");
 const ids = @import("../../ids.zig");
 const TypeContext = @import("../../type_context.zig").TypeContext;
 const assertions = @import("../../assertions.zig");
+pub const QueryContext = @import("bindings.zig").QueryContext;
 
 pub fn isGuardedByAssertion(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     target: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
     scope: *const assertions.AssertionScope,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     var block = unwrap_node;
@@ -32,10 +34,10 @@ pub fn isGuardedByAssertion(
     const before = tree.nodeMainToken(@enumFromInt(unwrap_node));
     var fact = false;
     for (statements[0..count]) |statement| {
-        if (tree.firstToken(@enumFromInt(statement)) >= before) break;
-        if (statementMayMutateStorageBefore(tree, statement, target, tags, datas, block, unwrap_node, type_context))
+        if (query.firstToken(statement) >= before) break;
+        if (statementMayMutateStorageBefore(query, statement, target, tags, datas, block, unwrap_node, type_context))
             fact = false;
-        if (tree.lastToken(@enumFromInt(statement)) >= before) continue;
+        if (query.lastToken(statement) >= before) continue;
         const is_try = tags[statement] == .@"try";
         const call_node = if (is_try) @intFromEnum(datas[statement].node) else statement;
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
@@ -45,20 +47,21 @@ pub fn isGuardedByAssertion(
             if (is_try) assertions.resolveAssertionName(tree, call.ast.fn_expr, scope) orelse continue else continue;
         if (assertions.constraintKindForName(name) != .boolean) continue;
         const condition = @intFromEnum(call.ast.params[0]);
-        if (conditionImpliesNotNull(tree, condition, target) and
-            !statementMayMutateStorage(tree, condition, target, tags, datas, block, type_context))
+        if (conditionImpliesNotNull(query, condition, target) and
+            !statementMayMutateStorage(query, condition, target, tags, datas, block, type_context))
             fact = true;
     }
     return fact;
 }
 
 pub fn isGuardedByLazyInit(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -86,7 +89,7 @@ pub fn isGuardedByLazyInit(
 
     // Scan the block for lazy init pattern
     return scanBlockForLazyInit(
-        tree,
+        query,
         block,
         unwrap_node,
         unwrapped_var,
@@ -99,7 +102,7 @@ pub fn isGuardedByLazyInit(
 }
 
 fn scanBlockForLazyInit(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     block: u32,
     unwrap_node: u32,
     unwrapped_var: u32,
@@ -109,6 +112,7 @@ fn scanBlockForLazyInit(
     main_tokens: []const u32,
     token_starts: []const u32,
 ) bool {
+    const tree = query.tree;
     if (block >= tags.len) return false;
 
     // Get position of the unwrap node.
@@ -134,10 +138,10 @@ fn scanBlockForLazyInit(
                 continue;
             };
             const cond = @intFromEnum(full.ast.cond_expr);
-            if (checksNull(tree, cond, unwrapped_var)) {
+            if (checksNull(query, cond, unwrapped_var)) {
                 const then_expr = @intFromEnum(full.ast.then_expr);
                 if (branchProvesNonNull(
-                    tree,
+                    query,
                     then_expr,
                     unwrapped_var,
                     type_context,
@@ -147,7 +151,7 @@ fn scanBlockForLazyInit(
                 )) {
                     if (full.ast.else_expr.unwrap()) |else_node| {
                         if (statementMayMutateStorage(
-                            tree,
+                            query,
                             @intFromEnum(else_node),
                             unwrapped_var,
                             tags,
@@ -164,7 +168,7 @@ fn scanBlockForLazyInit(
                 }
             }
         }
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
             fact = false;
         }
     }
@@ -173,7 +177,7 @@ fn scanBlockForLazyInit(
 }
 
 fn branchProvesNonNull(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node: u32,
     var_node: u32,
     type_context: ?*TypeContext,
@@ -181,6 +185,7 @@ fn branchProvesNonNull(
     datas: []const std.zig.Ast.Node.Data,
     block: u32,
 ) bool {
+    const tree = query.tree;
     if (node >= tags.len) return false;
 
     switch (tags[node]) {
@@ -188,7 +193,7 @@ fn branchProvesNonNull(
             const pair = datas[node].node_and_node;
             const lhs = @intFromEnum(pair[0]);
             const rhs = @intFromEnum(pair[1]);
-            return sameVariable(tree, lhs, var_node) and
+            return sameVariable(query, lhs, var_node) and
                 isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas);
         },
         .block, .block_semicolon => {
@@ -205,13 +210,13 @@ fn branchProvesNonNull(
                     const pair = datas[statement].node_and_node;
                     const lhs = @intFromEnum(pair[0]);
                     const rhs = @intFromEnum(pair[1]);
-                    if (sameVariable(tree, lhs, var_node)) {
+                    if (sameVariable(query, lhs, var_node)) {
                         fact = isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas);
                         continue;
                     }
                 }
 
-                if (statementMayMutateStorage(tree, statement, var_node, tags, datas, block, type_context)) {
+                if (statementMayMutateStorage(query, statement, var_node, tags, datas, block, type_context)) {
                     fact = false;
                 }
             }
@@ -223,7 +228,7 @@ fn branchProvesNonNull(
             var fact = false;
             if (opt_nodes[0].unwrap()) |statement| {
                 fact = branchProvesNonNull(
-                    tree,
+                    query,
                     @intFromEnum(statement),
                     var_node,
                     type_context,
@@ -238,12 +243,12 @@ fn branchProvesNonNull(
                     const pair = datas[statement_node].node_and_node;
                     const lhs = @intFromEnum(pair[0]);
                     const rhs = @intFromEnum(pair[1]);
-                    if (sameVariable(tree, lhs, var_node)) {
+                    if (sameVariable(query, lhs, var_node)) {
                         fact = isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas);
-                    } else if (statementMayMutateStorage(tree, statement_node, var_node, tags, datas, block, type_context)) {
+                    } else if (statementMayMutateStorage(query, statement_node, var_node, tags, datas, block, type_context)) {
                         fact = false;
                     }
-                } else if (statementMayMutateStorage(tree, statement_node, var_node, tags, datas, block, type_context)) {
+                } else if (statementMayMutateStorage(query, statement_node, var_node, tags, datas, block, type_context)) {
                     fact = false;
                 }
             }
@@ -254,12 +259,13 @@ fn branchProvesNonNull(
 }
 
 pub fn isGuardedByEarlyExit(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -287,7 +293,7 @@ pub fn isGuardedByEarlyExit(
 
     // Scan the block for early exit pattern.
     return scanBlockForEarlyExit(
-        tree,
+        query,
         block,
         unwrap_node,
         unwrapped_var,
@@ -300,12 +306,13 @@ pub fn isGuardedByEarlyExit(
 }
 
 pub fn isGuardedBySwitchNullCase(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -332,7 +339,7 @@ pub fn isGuardedBySwitchNullCase(
     const block = block_node orelse return false;
 
     return scanBlockForSwitchNullCase(
-        tree,
+        query,
         block,
         unwrap_node,
         unwrapped_var,
@@ -345,7 +352,7 @@ pub fn isGuardedBySwitchNullCase(
 }
 
 fn scanBlockForEarlyExit(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     block: u32,
     unwrap_node: u32,
     unwrapped_var: u32,
@@ -355,6 +362,7 @@ fn scanBlockForEarlyExit(
     main_tokens: []const u32,
     token_starts: []const u32,
 ) bool {
+    const tree = query.tree;
     if (block >= tags.len) return false;
 
     // Get the position of the unwrap node.
@@ -374,7 +382,7 @@ fn scanBlockForEarlyExit(
 
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) continue;
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
             fact = false;
             continue;
         }
@@ -384,7 +392,7 @@ fn scanBlockForEarlyExit(
         const cond = @intFromEnum(full.ast.cond_expr);
         const then_expr = @intFromEnum(full.ast.then_expr);
         if (isEarlyExitExpr(tree, then_expr, tags, datas) and
-            conditionImpliesNullnessOnFalse(tree, cond, unwrapped_var, false))
+            conditionImpliesNullnessOnFalse(query, cond, unwrapped_var, false))
         {
             fact = true;
         }
@@ -394,7 +402,7 @@ fn scanBlockForEarlyExit(
 }
 
 fn scanBlockForSwitchNullCase(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     block: u32,
     unwrap_node: u32,
     unwrapped_var: u32,
@@ -404,6 +412,7 @@ fn scanBlockForSwitchNullCase(
     main_tokens: []const u32,
     token_starts: []const u32,
 ) bool {
+    const tree = query.tree;
     if (block >= tags.len) return false;
 
     if (unwrap_node >= main_tokens.len) return false;
@@ -419,7 +428,7 @@ fn scanBlockForSwitchNullCase(
 
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) continue;
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
             fact = false;
             continue;
         }
@@ -428,7 +437,7 @@ fn scanBlockForSwitchNullCase(
 
         const full_switch = tree.switchFull(@enumFromInt(stmt));
         const cond = @intFromEnum(full_switch.ast.condition);
-        if (!sameVariable(tree, cond, unwrapped_var)) continue;
+        if (!sameVariable(query, cond, unwrapped_var)) continue;
 
         if (switchHasNullCaseEarlyExit(tree, stmt, tags, datas)) {
             fact = true;
@@ -499,12 +508,13 @@ fn isEarlyExitExpr(
 }
 
 pub fn isGuardedByPriorAssignment(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -518,7 +528,7 @@ pub fn isGuardedByPriorAssignment(
         // A failed proof in a nested block must not be replaced by an outer
         // assignment when that block already wrote or escaped the target.
         if (boundary != unwrap_node and statementMayMutateStorageBefore(
-            tree,
+            query,
             boundary,
             unwrapped_var,
             tags,
@@ -528,7 +538,7 @@ pub fn isGuardedByPriorAssignment(
             type_context,
         )) return false;
         if (scanBlockForPriorAssignment(
-            tree,
+            query,
             block,
             boundary,
             unwrapped_var,
@@ -546,12 +556,13 @@ pub fn isGuardedByPriorAssignment(
 }
 
 pub fn isGuardedByPriorUnwrap(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -585,11 +596,11 @@ pub fn isGuardedByPriorUnwrap(
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) break;
 
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
             fact = false;
             continue;
         }
-        if (statementHasPriorUnwrap(tree, stmt, unwrap_node, unwrapped_var, unwrap_pos, tags, datas)) {
+        if (statementHasPriorUnwrap(query, stmt, unwrap_node, unwrapped_var, unwrap_pos, tags, datas)) {
             fact = true;
         }
     }
@@ -597,7 +608,7 @@ pub fn isGuardedByPriorUnwrap(
 }
 
 fn scanBlockForPriorAssignment(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     block: u32,
     unwrap_node: u32,
     unwrapped_var: u32,
@@ -607,6 +618,7 @@ fn scanBlockForPriorAssignment(
     main_tokens: []const u32,
     token_starts: []const u32,
 ) bool {
+    const tree = query.tree;
     if (block >= tags.len or unwrap_node >= main_tokens.len) return false;
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
@@ -619,22 +631,22 @@ fn scanBlockForPriorAssignment(
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) break;
 
-        if (tags[stmt] == .assign and tree.lastToken(@enumFromInt(stmt)) < main_tokens[unwrap_node]) {
+        if (tags[stmt] == .assign and query.lastToken(stmt) < main_tokens[unwrap_node]) {
             const pair = datas[stmt].node_and_node;
             const lhs = @intFromEnum(pair[0]);
             const rhs = @intFromEnum(pair[1]);
-            if (sameVariable(tree, lhs, unwrapped_var)) {
+            if (sameVariable(query, lhs, unwrapped_var)) {
                 fact = isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas);
                 continue;
             }
-            if (storageFieldsAreDisjoint(tree, lhs, unwrapped_var, type_context)) {
-                if (statementMayMutateStorageBefore(tree, rhs, unwrapped_var, tags, datas, block, unwrap_node, type_context))
+            if (storageFieldsAreDisjoint(query, lhs, unwrapped_var, type_context)) {
+                if (statementMayMutateStorageBefore(query, rhs, unwrapped_var, tags, datas, block, unwrap_node, type_context))
                     fact = false;
                 continue;
             }
         }
 
-        if (statementMayMutateStorageBefore(tree, stmt, unwrapped_var, tags, datas, block, unwrap_node, type_context)) {
+        if (statementMayMutateStorageBefore(query, stmt, unwrapped_var, tags, datas, block, unwrap_node, type_context)) {
             fact = false;
         }
     }
@@ -711,7 +723,7 @@ fn isOrelseWithEarlyExit(
 }
 
 fn statementHasPriorUnwrap(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     statement: u32,
     target_unwrap: u32,
     unwrapped_var: u32,
@@ -719,10 +731,11 @@ fn statementHasPriorUnwrap(
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
 ) bool {
+    const tree = query.tree;
     const main_tokens = tree.nodes.items(.main_token);
     const token_starts = tree.tokens.items(.start);
     return hasUnconditionalPriorUnwrap(
-        tree,
+        query,
         statement,
         target_unwrap,
         unwrapped_var,
@@ -736,7 +749,7 @@ fn statementHasPriorUnwrap(
 }
 
 fn hasUnconditionalPriorUnwrap(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node: u32,
     target_unwrap: u32,
     unwrapped_var: u32,
@@ -747,6 +760,7 @@ fn hasUnconditionalPriorUnwrap(
     token_starts: []const u32,
     depth: u32,
 ) bool {
+    const tree = query.tree;
     if (node == 0 or node == target_unwrap or depth >= 64) return false;
     if (node >= tags.len or node >= main_tokens.len) return false;
     if (main_tokens[node] >= token_starts.len or token_starts[main_tokens[node]] >= limit_pos) return false;
@@ -754,9 +768,9 @@ fn hasUnconditionalPriorUnwrap(
     switch (tags[node]) {
         .unwrap_optional => {
             const operand = @intFromEnum(datas[node].node_and_token[0]);
-            if (sameVariable(tree, operand, unwrapped_var)) return true;
+            if (sameVariable(query, operand, unwrapped_var)) return true;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 operand,
                 target_unwrap,
                 unwrapped_var,
@@ -770,7 +784,7 @@ fn hasUnconditionalPriorUnwrap(
         },
         .grouped_expression, .field_access => {
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(datas[node].node_and_token[0]),
                 target_unwrap,
                 unwrapped_var,
@@ -784,7 +798,7 @@ fn hasUnconditionalPriorUnwrap(
         },
         .address_of, .deref, .@"try", .bool_not, .negation, .bit_not, .negation_wrap => {
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(datas[node].node),
                 target_unwrap,
                 unwrapped_var,
@@ -798,7 +812,7 @@ fn hasUnconditionalPriorUnwrap(
         },
         .@"orelse", .@"catch", .bool_and, .bool_or => {
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(datas[node].node_and_node[0]),
                 target_unwrap,
                 unwrapped_var,
@@ -813,7 +827,7 @@ fn hasUnconditionalPriorUnwrap(
         .@"if", .if_simple => {
             const full = tree.fullIf(@enumFromInt(node)) orelse return false;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(full.ast.cond_expr),
                 target_unwrap,
                 unwrapped_var,
@@ -828,7 +842,7 @@ fn hasUnconditionalPriorUnwrap(
         .@"while", .while_simple, .while_cont => {
             const full = tree.fullWhile(@enumFromInt(node)) orelse return false;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(full.ast.cond_expr),
                 target_unwrap,
                 unwrapped_var,
@@ -844,7 +858,7 @@ fn hasUnconditionalPriorUnwrap(
             const full = tree.fullFor(@enumFromInt(node)) orelse return false;
             for (full.ast.inputs) |input| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(input),
                     target_unwrap,
                     unwrapped_var,
@@ -861,7 +875,7 @@ fn hasUnconditionalPriorUnwrap(
         .@"switch", .switch_comma => {
             const full = tree.switchFull(@enumFromInt(node));
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(full.ast.condition),
                 target_unwrap,
                 unwrapped_var,
@@ -877,7 +891,7 @@ fn hasUnconditionalPriorUnwrap(
             const full = tree.fullVarDecl(@enumFromInt(node)) orelse return false;
             const init = full.ast.init_node.unwrap() orelse return false;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(init),
                 target_unwrap,
                 unwrapped_var,
@@ -892,7 +906,7 @@ fn hasUnconditionalPriorUnwrap(
         .assign => {
             const pair = datas[node].node_and_node;
             if (hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(pair[0]),
                 target_unwrap,
                 unwrapped_var,
@@ -904,7 +918,7 @@ fn hasUnconditionalPriorUnwrap(
                 depth + 1,
             )) return true;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(pair[1]),
                 target_unwrap,
                 unwrapped_var,
@@ -919,7 +933,7 @@ fn hasUnconditionalPriorUnwrap(
         .assign_destructure => {
             const full = tree.assignDestructure(@enumFromInt(node));
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(full.ast.value_expr),
                 target_unwrap,
                 unwrapped_var,
@@ -935,7 +949,7 @@ fn hasUnconditionalPriorUnwrap(
             var call_buf: [1]std.zig.Ast.Node.Index = undefined;
             const full = tree.fullCall(&call_buf, @enumFromInt(node)) orelse return false;
             if (hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(full.ast.fn_expr),
                 target_unwrap,
                 unwrapped_var,
@@ -948,7 +962,7 @@ fn hasUnconditionalPriorUnwrap(
             )) return true;
             for (full.ast.params) |param| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(param),
                     target_unwrap,
                     unwrapped_var,
@@ -967,7 +981,7 @@ fn hasUnconditionalPriorUnwrap(
             const params = tree.builtinCallParams(&builtin_buf, @enumFromInt(node)) orelse return false;
             for (params) |param| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(param),
                     target_unwrap,
                     unwrapped_var,
@@ -994,7 +1008,7 @@ fn hasUnconditionalPriorUnwrap(
             const array_init = tree.fullArrayInit(&array_buf, @enumFromInt(node)) orelse return false;
             for (array_init.ast.elements) |element| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(element),
                     target_unwrap,
                     unwrapped_var,
@@ -1021,7 +1035,7 @@ fn hasUnconditionalPriorUnwrap(
             const struct_init = tree.fullStructInit(&struct_buf, @enumFromInt(node)) orelse return false;
             for (struct_init.ast.fields) |field| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(field),
                     target_unwrap,
                     unwrapped_var,
@@ -1038,7 +1052,7 @@ fn hasUnconditionalPriorUnwrap(
         .slice, .slice_open, .slice_sentinel => {
             const slice = tree.fullSlice(@enumFromInt(node)) orelse return false;
             if (hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(slice.ast.sliced),
                 target_unwrap,
                 unwrapped_var,
@@ -1050,7 +1064,7 @@ fn hasUnconditionalPriorUnwrap(
                 depth + 1,
             )) return true;
             if (hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(slice.ast.start),
                 target_unwrap,
                 unwrapped_var,
@@ -1063,7 +1077,7 @@ fn hasUnconditionalPriorUnwrap(
             )) return true;
             if (slice.ast.end.unwrap()) |end_node| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(end_node),
                     target_unwrap,
                     unwrapped_var,
@@ -1080,7 +1094,7 @@ fn hasUnconditionalPriorUnwrap(
         .array_access => {
             const pair = datas[node].node_and_node;
             if (hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(pair[0]),
                 target_unwrap,
                 unwrapped_var,
@@ -1092,7 +1106,7 @@ fn hasUnconditionalPriorUnwrap(
                 depth + 1,
             )) return true;
             return hasUnconditionalPriorUnwrap(
-                tree,
+                query,
                 @intFromEnum(pair[1]),
                 target_unwrap,
                 unwrapped_var,
@@ -1110,7 +1124,7 @@ fn hasUnconditionalPriorUnwrap(
             const end = @intFromEnum(extra.end);
             for (start..end) |index| {
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     tree.extra_data[index],
                     target_unwrap,
                     unwrapped_var,
@@ -1128,7 +1142,7 @@ fn hasUnconditionalPriorUnwrap(
             if (isStrictBinaryTag(tags[node])) {
                 const pair = datas[node].node_and_node;
                 if (hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(pair[0]),
                     target_unwrap,
                     unwrapped_var,
@@ -1140,7 +1154,7 @@ fn hasUnconditionalPriorUnwrap(
                     depth + 1,
                 )) return true;
                 return hasUnconditionalPriorUnwrap(
-                    tree,
+                    query,
                     @intFromEnum(pair[1]),
                     target_unwrap,
                     unwrapped_var,
@@ -1191,7 +1205,7 @@ fn isStrictBinaryTag(tag: std.zig.Ast.Node.Tag) bool {
 }
 
 fn statementMayMutateStorage(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     statement: u32,
     target: u32,
     tags: []const std.zig.Ast.Node.Tag,
@@ -1199,11 +1213,11 @@ fn statementMayMutateStorage(
     block: u32,
     type_context: ?*TypeContext,
 ) bool {
-    return statementMayMutateStorageBefore(tree, statement, target, tags, datas, block, null, type_context);
+    return statementMayMutateStorageBefore(query, statement, target, tags, datas, block, null, type_context);
 }
 
 fn statementMayMutateStorageBefore(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     statement: u32,
     target: u32,
     tags: []const std.zig.Ast.Node.Tag,
@@ -1212,8 +1226,9 @@ fn statementMayMutateStorageBefore(
     before_node: ?u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const Visitor = struct {
-        tree: *const std.zig.Ast,
+        query: *const QueryContext,
         target: u32,
         tags: []const std.zig.Ast.Node.Tag,
         datas: []const std.zig.Ast.Node.Data,
@@ -1228,18 +1243,17 @@ fn statementMayMutateStorageBefore(
 
         pub fn visit(self: *Self, _: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
             if (self.before_token) |before| {
-                const ast_node: std.zig.Ast.Node.Index = @enumFromInt(node);
-                if (self.tree.firstToken(ast_node) >= before) return;
-                if (self.tree.lastToken(ast_node) >= before and
+                if (self.query.firstToken(node) >= before) return;
+                if (self.query.lastToken(node) >= before and
                     (node != self.root_node or !isPreTargetContainerTag(tag)))
                     return;
             }
             if (isAssignmentTag(tag)) {
                 if (tag == .assign_destructure) {
-                    const full = self.tree.assignDestructure(@enumFromInt(node));
+                    const full = self.query.tree.assignDestructure(@enumFromInt(node));
                     for (full.ast.variables) |variable| {
                         if (storageWriteMayAffect(
-                            self.tree,
+                            self.query,
                             @intFromEnum(variable),
                             self.target,
                             self.block,
@@ -1252,7 +1266,7 @@ fn statementMayMutateStorageBefore(
                     }
                 } else {
                     const lhs = @intFromEnum(self.datas[node].node_and_node[0]);
-                    if (storageWriteMayAffect(self.tree, lhs, self.target, self.block, self.type_context)) {
+                    if (storageWriteMayAffect(self.query, lhs, self.target, self.block, self.type_context)) {
                         self.found = true;
                         self.stop = true;
                         return;
@@ -1261,13 +1275,13 @@ fn statementMayMutateStorageBefore(
             }
             switch (tag) {
                 .call, .call_comma, .call_one, .call_one_comma => {
-                    if (callMayMutateStorage(self.tree, node, self.target, self.tags, self.datas, self.type_context)) {
+                    if (callMayMutateStorage(self.query, node, self.target, self.tags, self.datas, self.type_context)) {
                         self.found = true;
                         self.stop = true;
                     }
                 },
                 .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
-                    if (builtinCallMayMutateStorage(self.tree, node, self.target, self.tags, self.datas, self.type_context)) {
+                    if (builtinCallMayMutateStorage(self.query, node, self.target, self.tags, self.datas, self.type_context)) {
                         self.found = true;
                         self.stop = true;
                     }
@@ -1278,7 +1292,7 @@ fn statementMayMutateStorageBefore(
     };
 
     var visitor = Visitor{
-        .tree = tree,
+        .query = query,
         .target = target,
         .tags = tags,
         .datas = datas,
@@ -1340,7 +1354,8 @@ fn isPreTargetContainerTag(tag: std.zig.Ast.Node.Tag) bool {
     };
 }
 
-fn storageFieldsAreDisjoint(tree: *const std.zig.Ast, lhs: u32, target: u32, type_context: ?*TypeContext) bool {
+fn storageFieldsAreDisjoint(query: *const QueryContext, lhs: u32, target: u32, type_context: ?*TypeContext) bool {
+    const tree = query.tree;
     const ctx = type_context orelse return false;
     if (tree.nodeTag(@enumFromInt(lhs)) != .field_access or
         tree.nodeTag(@enumFromInt(target)) != .field_access)
@@ -1348,23 +1363,25 @@ fn storageFieldsAreDisjoint(tree: *const std.zig.Ast, lhs: u32, target: u32, typ
     const left = tree.nodeData(@enumFromInt(lhs)).node_and_token;
     const right = tree.nodeData(@enumFromInt(target)).node_and_token;
     if (std.mem.eql(u8, tree.tokenSlice(left[1]), tree.tokenSlice(right[1]))) return false;
-    return sameVariable(tree, @intFromEnum(left[0]), @intFromEnum(right[0])) and
+    return sameVariable(query, @intFromEnum(left[0]), @intFromEnum(right[0])) and
         ctx.isStructExpression(@intFromEnum(left[0]));
 }
 
-fn storageWriteMayAffect(tree: *const std.zig.Ast, lhs: u32, target: u32, block: u32, type_context: ?*TypeContext) bool {
+fn storageWriteMayAffect(query: *const QueryContext, lhs: u32, target: u32, block: u32, type_context: ?*TypeContext) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     if (lhs >= tags.len) return true;
-    if (storageFieldsAreDisjoint(tree, lhs, target, type_context)) return false;
-    if (storageRootMatches(tree, lhs, target)) return true;
+    if (storageFieldsAreDisjoint(query, lhs, target, type_context)) return false;
+    if (storageRootMatches(query, lhs, target)) return true;
     return switch (tags[lhs]) {
-        .deref, .address_of, .field_access, .array_access => !localSlotHasNoAliases(tree, target, block, type_context),
+        .deref, .address_of, .field_access, .array_access => !localSlotHasNoAliases(query, target, block, type_context),
         .identifier => false,
         else => true,
     };
 }
 
-fn localSlotHasNoAliases(tree: *const std.zig.Ast, target: u32, block: u32, type_context: ?*TypeContext) bool {
+fn localSlotHasNoAliases(query: *const QueryContext, target: u32, block: u32, type_context: ?*TypeContext) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     if (target >= tags.len or block >= tags.len) return false;
     var root = target;
@@ -1377,29 +1394,44 @@ fn localSlotHasNoAliases(tree: *const std.zig.Ast, target: u32, block: u32, type
         root = base;
     }
     if (tags[root] != .identifier) return false;
-    const binding = resolveIdentifierBinding(tree, root) orelse return false;
+    const binding = query.resolveIdentifierBinding(root) orelse return false;
     if (binding == 0) return false;
     const declaration_tag = tree.tokenTag(binding - 1);
     if (declaration_tag != .keyword_var and declaration_tag != .keyword_const) return false;
-    const function = enclosingFunctionForToken(tree, binding) orelse return false;
+    const function = query.lexical.enclosingFunction(binding) orelse return false;
     const reference = tree.nodeMainToken(@enumFromInt(target));
-    if (enclosingFunctionForToken(tree, reference) != function) return false;
-    if (enclosingFunctionForToken(tree, tree.firstToken(@enumFromInt(block))) != function) return false;
-    const function_start = tree.firstToken(@enumFromInt(function));
+    if (query.lexical.enclosingFunction(reference) != function) return false;
+    if (query.lexical.enclosingFunction(query.firstToken(block)) != function) return false;
+    const function_start = query.firstToken(function);
 
     for (tags, 0..) |tag, index| {
+        switch (tag) {
+            .@"asm",
+            .asm_simple,
+            .address_of,
+            .call,
+            .call_comma,
+            .call_one,
+            .call_one_comma,
+            .builtin_call,
+            .builtin_call_comma,
+            .builtin_call_two,
+            .builtin_call_two_comma,
+            => {},
+            else => continue,
+        }
         const node: std.zig.Ast.Node.Index = @enumFromInt(index);
-        const start = tree.firstToken(node);
+        const start = query.firstToken(@intCast(index));
         if (start < function_start or start >= reference) continue;
         if (tag == .@"asm" or tag == .asm_simple) return false;
         if (start <= binding) continue;
-        if (tag == .address_of and storageRootMatches(tree, @intFromEnum(tree.nodeData(node).node), target)) return false;
+        if (tag == .address_of and storageRootMatches(query, @intFromEnum(tree.nodeData(node).node), target)) return false;
         if (call_resolver.isCallNode(tag)) {
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node) orelse return false;
             const callee = call.ast.fn_expr;
             if (tree.nodeTag(callee) == .field_access and
-                storageRootMatches(tree, @intFromEnum(tree.nodeData(callee).node_and_token[0]), target))
+                storageRootMatches(query, @intFromEnum(tree.nodeData(callee).node_and_token[0]), target))
                 return false;
         }
         switch (tag) {
@@ -1407,7 +1439,7 @@ fn localSlotHasNoAliases(tree: *const std.zig.Ast, target: u32, block: u32, type
                 var buffer: [2]std.zig.Ast.Node.Index = undefined;
                 const params = tree.builtinCallParams(&buffer, node) orelse return false;
                 for (params) |param| {
-                    if (storageRootMatches(tree, @intFromEnum(param), target)) return false;
+                    if (storageRootMatches(query, @intFromEnum(param), target)) return false;
                 }
             },
             else => {},
@@ -1417,13 +1449,14 @@ fn localSlotHasNoAliases(tree: *const std.zig.Ast, target: u32, block: u32, type
 }
 
 fn callMayMutateStorage(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     call_node: u32,
     target: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     var call_buf: [1]std.zig.Ast.Node.Index = undefined;
     const full = tree.fullCall(&call_buf, @enumFromInt(call_node)) orelse return true;
     const callee = @intFromEnum(full.ast.fn_expr);
@@ -1432,35 +1465,37 @@ fn callMayMutateStorage(
     if (tags[callee] == .field_access) {
         const receiver = @intFromEnum(datas[callee].node_and_token[0]);
         if (receiver >= tags.len) return true;
-        if (tags[receiver] != .unwrap_optional and storageRootMatches(tree, receiver, target)) {
+        if (tags[receiver] != .unwrap_optional and storageRootMatches(query, receiver, target)) {
             return true;
         }
     }
 
     for (full.ast.params) |param| {
-        if (argumentMayMutateStorage(tree, @intFromEnum(param), target, tags, datas, type_context)) return true;
+        if (argumentMayMutateStorage(query, @intFromEnum(param), target, tags, datas, type_context)) return true;
     }
-    return targetMayBeGlobal(tree, target);
+    return targetMayBeGlobal(query, target);
 }
 
 fn builtinCallMayMutateStorage(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     call_node: u32,
     target: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     var builtin_buf: [2]std.zig.Ast.Node.Index = undefined;
     const params = tree.builtinCallParams(&builtin_buf, @enumFromInt(call_node)) orelse return true;
     for (params) |param| {
-        if (argumentMayMutateStorage(tree, @intFromEnum(param), target, tags, datas, type_context)) return true;
+        if (argumentMayMutateStorage(query, @intFromEnum(param), target, tags, datas, type_context)) return true;
     }
-    return targetMayBeGlobal(tree, target);
+    return targetMayBeGlobal(query, target);
 }
 
 // Unknown calls may mutate globals. This is invalidation only, not a name-based proof.
-fn targetMayBeGlobal(tree: *const std.zig.Ast, target: u32) bool {
+fn targetMayBeGlobal(query: *const QueryContext, target: u32) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -1477,33 +1512,22 @@ fn targetMayBeGlobal(tree: *const std.zig.Ast, target: u32) bool {
     }
     if (root >= tags.len or tags[root] != .identifier or root >= main_tokens.len) return false;
     const root_name = tree.tokenSlice(main_tokens[root]);
-    for (tree.rootDecls()) |decl| {
-        const decl_node = @intFromEnum(decl);
-        if (decl_node >= tags.len) continue;
-        switch (tags[decl_node]) {
-            .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
-                const full = tree.fullVarDecl(@enumFromInt(decl_node)) orelse continue;
-                const name_token = full.ast.mut_token + 1;
-                if (name_token < tree.tokens.items(.tag).len and
-                    std.mem.eql(u8, tree.tokenSlice(name_token), root_name))
-                {
-                    return true;
-                }
-            },
-            else => {},
-        }
+    for (query.lexical.namedCandidates(import_resolver.normalizeIdentifier(root_name))) |candidate| {
+        if (candidate.kind != .variable or !candidate.is_root) continue;
+        if (std.mem.eql(u8, tree.tokenSlice(candidate.name_token), root_name)) return true;
     }
     return false;
 }
 
 fn argumentMayMutateStorage(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node: u32,
     target: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     if (node >= tags.len) return true;
     var argument = node;
     while (argument < tags.len) {
@@ -1512,18 +1536,18 @@ fn argumentMayMutateStorage(
                 argument = @intFromEnum(datas[argument].node_and_token[0]);
             },
             .identifier => {
-                if (!storageRootMatches(tree, argument, target)) return false;
+                if (!storageRootMatches(query, argument, target)) return false;
                 return argumentExpressionMayEscape(type_context, argument);
             },
             .address_of => {
                 const pointee = @intFromEnum(datas[argument].node);
-                if (storageFieldsAreDisjoint(tree, pointee, target, type_context)) return false;
-                return storageRootMatches(tree, argument, target);
+                if (storageFieldsAreDisjoint(query, pointee, target, type_context)) return false;
+                return storageRootMatches(query, argument, target);
             },
-            .deref => return storageRootMatches(tree, argument, target),
+            .deref => return storageRootMatches(query, argument, target),
             .array_access => {
                 const base = @intFromEnum(datas[argument].node_and_node[0]);
-                if (storageRootMatches(tree, base, target)) return true;
+                if (storageRootMatches(query, base, target)) return true;
                 argument = base;
             },
             .call, .call_comma, .call_one, .call_one_comma => {
@@ -1532,10 +1556,10 @@ fn argumentMayMutateStorage(
                 const callee = @intFromEnum(full.ast.fn_expr);
                 if (callee < tags.len and tags[callee] == .field_access) {
                     const receiver = @intFromEnum(datas[callee].node_and_token[0]);
-                    if (storageRootMatches(tree, receiver, target)) return true;
+                    if (storageRootMatches(query, receiver, target)) return true;
                 }
                 for (full.ast.params) |param| {
-                    if (argumentMayMutateStorage(tree, @intFromEnum(param), target, tags, datas, type_context)) return true;
+                    if (argumentMayMutateStorage(query, @intFromEnum(param), target, tags, datas, type_context)) return true;
                 }
                 return false;
             },
@@ -1561,7 +1585,8 @@ fn argumentExpressionMayEscape(type_context: ?*TypeContext, node: u32) bool {
     return true;
 }
 
-fn storageRootMatches(tree: *const std.zig.Ast, node: u32, target: u32) bool {
+fn storageRootMatches(query: *const QueryContext, node: u32, target: u32) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -1605,311 +1630,26 @@ fn storageRootMatches(tree: *const std.zig.Ast, node: u32, target: u32) bool {
         }
         if (tags[left] != .identifier or tags[right] != .identifier) return false;
         if (left >= main_tokens.len or right >= main_tokens.len) return false;
-        return sameIdentifierBinding(tree, left, right);
+        return sameIdentifierBinding(query, left, right);
     }
     return false;
 }
 
-const BindingScope = struct {
-    first_token: u32,
-    last_token: u32,
-
-    fn contains(self: BindingScope, token: u32) bool {
-        return token >= self.first_token and token <= self.last_token;
-    }
-
-    fn span(self: BindingScope) u32 {
-        return self.last_token - self.first_token;
-    }
-};
-
-const BindingCandidate = struct {
-    name_token: u32,
-    scope: BindingScope,
-    function_node: ?u32,
-};
-
-fn sameIdentifierBinding(tree: *const std.zig.Ast, left: u32, right: u32) bool {
-    const left_binding = resolveIdentifierBinding(tree, left) orelse return false;
-    const right_binding = resolveIdentifierBinding(tree, right) orelse return false;
+fn sameIdentifierBinding(query: *const QueryContext, left: u32, right: u32) bool {
+    const left_binding = query.resolveIdentifierBinding(left) orelse return false;
+    const right_binding = query.resolveIdentifierBinding(right) orelse return false;
     return left_binding == right_binding;
 }
 
-fn resolveIdentifierBinding(tree: *const std.zig.Ast, node: u32) ?u32 {
-    const tags = tree.nodes.items(.tag);
-    const main_tokens = tree.nodes.items(.main_token);
-    if (node >= tags.len or tags[node] != .identifier or node >= main_tokens.len) return null;
-
-    const reference_token = main_tokens[node];
-    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(reference_token));
-    const reference_function = enclosingFunctionForToken(tree, reference_token);
-    var best: ?BindingCandidate = null;
-
-    for (tags, 0..) |tag, node_index| {
-        if (!import_resolver.isVarDeclTag(tag)) continue;
-        const full = tree.fullVarDecl(@enumFromInt(node_index)) orelse continue;
-        const name_token = full.ast.mut_token + 1;
-        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) continue;
-        if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), name)) continue;
-        const is_root = isRootDeclaration(tree, node_index);
-        if (!is_root and name_token > reference_token) continue;
-
-        const function_node = if (is_root) null else enclosingFunctionForToken(tree, name_token);
-        if (function_node != null and reference_function != function_node) continue;
-        const scope = if (is_root)
-            rootBindingScope(tree)
-        else
-            smallestBindingScope(tree, name_token) orelse continue;
-        considerBindingCandidate(
-            .{ .name_token = name_token, .scope = scope, .function_node = function_node },
-            reference_token,
-            reference_function,
-            &best,
-        );
-    }
-
-    considerFunctionParameterBindings(tree, name, reference_token, reference_function, &best);
-    considerPayloadBindings(tree, name, reference_token, reference_function, &best);
-    return if (best) |candidate| candidate.name_token else null;
-}
-
-fn considerBindingCandidate(
-    candidate: BindingCandidate,
-    reference_token: u32,
-    reference_function: ?u32,
-    best: *?BindingCandidate,
-) void {
-    if (!candidate.scope.contains(reference_token)) return;
-    if (candidate.function_node != null and candidate.function_node != reference_function) return;
-    if (best.*) |previous| {
-        if (candidate.scope.span() > previous.scope.span()) return;
-        if (candidate.scope.span() == previous.scope.span() and candidate.name_token <= previous.name_token) return;
-    }
-    best.* = candidate;
-}
-
-fn considerFunctionParameterBindings(
-    tree: *const std.zig.Ast,
-    name: []const u8,
-    reference_token: u32,
-    reference_function: ?u32,
-    best: *?BindingCandidate,
-) void {
-    const tags = tree.nodes.items(.tag);
-    const datas = tree.nodes.items(.data);
-    var buffer: [1]std.zig.Ast.Node.Index = undefined;
-
-    for (tags, 0..) |tag, node_index| {
-        const proto_node = switch (tag) {
-            .fn_decl => @intFromEnum(datas[node_index].node_and_node[0]),
-            .fn_proto, .fn_proto_simple, .fn_proto_one, .fn_proto_multi => @as(u32, @intCast(node_index)),
-            else => continue,
-        };
-        if (proto_node >= tags.len) continue;
-        const function_node = enclosingFunctionForToken(tree, tree.firstToken(@enumFromInt(proto_node)));
-        if (function_node != reference_function) continue;
-        const scope = bindingNodeScope(tree, if (function_node) |fn_node| fn_node else proto_node) orelse continue;
-
-        const params: []const std.zig.Ast.Node.Index = switch (tags[proto_node]) {
-            .fn_proto => tree.fnProto(@enumFromInt(proto_node)).ast.params,
-            .fn_proto_simple => tree.fnProtoSimple(&buffer, @enumFromInt(proto_node)).ast.params,
-            .fn_proto_one => tree.fnProtoOne(&buffer, @enumFromInt(proto_node)).ast.params,
-            .fn_proto_multi => tree.fnProtoMulti(@enumFromInt(proto_node)).ast.params,
-            else => continue,
-        };
-        for (params) |param| {
-            const parameter_node = @intFromEnum(param);
-            const name_token = parameterBindingNameToken(tree, parameter_node) orelse continue;
-            if (name_token > reference_token) continue;
-            if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), name)) continue;
-            considerBindingCandidate(
-                .{ .name_token = name_token, .scope = scope, .function_node = function_node },
-                reference_token,
-                reference_function,
-                best,
-            );
-        }
-    }
-}
-
-const PayloadBindingSearch = struct {
-    tree: *const std.zig.Ast,
-    name: []const u8,
-    reference_token: u32,
-    reference_function: ?u32,
-    best: *?BindingCandidate,
-
-    fn optional(self: PayloadBindingSearch, payload_token: ?u32, body: u32) void {
-        var token = payload_token orelse return;
-        const token_tags = self.tree.tokens.items(.tag);
-        if (token < token_tags.len and token_tags[token] == .asterisk) token += 1;
-        if (token >= token_tags.len or token_tags[token] != .identifier) return;
-        if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(self.tree.tokenSlice(token)), self.name)) return;
-        const scope = bindingNodeScope(self.tree, body) orelse return;
-        const function_node = enclosingFunctionForToken(self.tree, token);
-        considerBindingCandidate(
-            .{ .name_token = token, .scope = scope, .function_node = function_node },
-            self.reference_token,
-            self.reference_function,
-            self.best,
-        );
-    }
-
-    fn conditional(self: PayloadBindingSearch, full: anytype) void {
-        self.optional(full.payload_token, @intFromEnum(full.ast.then_expr));
-        if (full.ast.else_expr.unwrap()) |else_node| {
-            self.optional(full.error_token, @intFromEnum(else_node));
-        }
-    }
-
-    fn forPayloads(self: PayloadBindingSearch, payload_token: u32, body: u32) void {
-        const token_tags = self.tree.tokens.items(.tag);
-        if (payload_token >= token_tags.len) return;
-        var token = payload_token;
-        if (token_tags[token] == .pipe) token += 1;
-        if (token == 0 or token >= token_tags.len or token_tags[token - 1] != .pipe) return;
-        if (token_tags[token] != .identifier and token_tags[token] != .asterisk) return;
-        while (token < token_tags.len) : (token += 1) {
-            if (token_tags[token] == .pipe) break;
-            if (token_tags[token] == .asterisk) {
-                token += 1;
-                if (token >= token_tags.len) return;
-            }
-            if (token_tags[token] == .identifier) self.optional(token, body);
-        }
-    }
-};
-
-fn considerPayloadBindings(
-    tree: *const std.zig.Ast,
-    name: []const u8,
-    reference_token: u32,
-    reference_function: ?u32,
-    best: *?BindingCandidate,
-) void {
-    const tags = tree.nodes.items(.tag);
-    const datas = tree.nodes.items(.data);
-    const search = PayloadBindingSearch{
-        .tree = tree,
-        .name = name,
-        .reference_token = reference_token,
-        .reference_function = reference_function,
-        .best = best,
-    };
-    for (tags, 0..) |tag, node_index| {
-        const node = @as(u32, @intCast(node_index));
-        switch (tag) {
-            .@"if", .if_simple => {
-                const full = tree.fullIf(@enumFromInt(node)) orelse continue;
-                search.conditional(full);
-            },
-            .@"while", .while_simple, .while_cont => {
-                const full = tree.fullWhile(@enumFromInt(node)) orelse continue;
-                search.conditional(full);
-            },
-            .@"for", .for_simple => {
-                const full = tree.fullFor(@enumFromInt(node)) orelse continue;
-                search.forPayloads(full.payload_token, @intFromEnum(full.ast.then_expr));
-            },
-            .@"switch", .switch_comma => {
-                const full = tree.switchFull(@enumFromInt(node));
-                for (full.ast.cases) |case_node| {
-                    const full_case = tree.fullSwitchCase(case_node) orelse continue;
-                    search.optional(full_case.payload_token, @intFromEnum(full_case.ast.target_expr));
-                }
-            },
-            .@"catch" => {
-                const pair = datas[node].node_and_node;
-                const catch_token = tree.nodes.items(.main_token)[node];
-                const token_tags = tree.tokens.items(.tag);
-                if (catch_token + 2 >= token_tags.len or token_tags[catch_token + 1] != .pipe) continue;
-                search.optional(catch_token + 2, @intFromEnum(pair[1]));
-            },
-            .@"errdefer" => {
-                const payload_token = datas[node].opt_token_and_node[0].unwrap() orelse continue;
-                search.optional(payload_token, @intFromEnum(datas[node].opt_token_and_node[1]));
-            },
-            else => {},
-        }
-    }
-}
-
-fn parameterBindingNameToken(tree: *const std.zig.Ast, node: u32) ?u32 {
-    const tags = tree.nodes.items(.tag);
-    const main_tokens = tree.nodes.items(.main_token);
-    if (node >= tags.len or node >= main_tokens.len) return null;
-    if (import_resolver.isVarDeclTag(tags[node])) {
-        const full = tree.fullVarDecl(@enumFromInt(node)) orelse return null;
-        const name_token = full.ast.mut_token + 1;
-        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) return null;
-        return name_token;
-    }
-    return @intCast(import_resolver.paramNameTokenBeforeType(tree, node) orelse return null);
-}
-
-fn bindingNodeScope(tree: *const std.zig.Ast, node: u32) ?BindingScope {
-    if (node == 0 or node >= tree.nodes.len or tree.tokens.len == 0) return null;
-    return .{
-        .first_token = @intCast(tree.firstToken(@enumFromInt(node))),
-        .last_token = @intCast(tree.lastToken(@enumFromInt(node))),
-    };
-}
-
-fn rootBindingScope(tree: *const std.zig.Ast) BindingScope {
-    return .{
-        .first_token = 0,
-        .last_token = if (tree.tokens.len == 0) 0 else @intCast(tree.tokens.len - 1),
-    };
-}
-
-fn smallestBindingScope(tree: *const std.zig.Ast, token: u32) ?BindingScope {
-    const tags = tree.nodes.items(.tag);
-    var best: ?BindingScope = null;
-    for (tags, 0..) |tag, node_index| {
-        if (!isBindingScopeTag(tag)) continue;
-        const scope = bindingNodeScope(tree, @intCast(node_index)) orelse continue;
-        if (!scope.contains(token)) continue;
-        if (best == null or scope.span() < best.?.span()) best = scope;
-    }
-    return best;
-}
-
-fn isBindingScopeTag(tag: std.zig.Ast.Node.Tag) bool {
-    return switch (tag) {
-        .block, .block_semicolon, .block_two, .block_two_semicolon => true,
-        else => call_resolver.isContainerTag(tag),
-    };
-}
-
-fn isRootDeclaration(tree: *const std.zig.Ast, node: usize) bool {
-    for (tree.rootDecls()) |decl| {
-        if (@intFromEnum(decl) == node) return true;
-    }
-    return false;
-}
-
-fn enclosingFunctionForToken(tree: *const std.zig.Ast, token: u32) ?u32 {
-    const tags = tree.nodes.items(.tag);
-    var best: ?u32 = null;
-    var best_span: u32 = std.math.maxInt(u32);
-    for (tags, 0..) |tag, node_index| {
-        if (tag != .fn_decl) continue;
-        const scope = bindingNodeScope(tree, @intCast(node_index)) orelse continue;
-        if (!scope.contains(token) or scope.span() >= best_span) continue;
-        best = @intCast(node_index);
-        best_span = scope.span();
-    }
-    return best;
-}
-
 pub fn isGuardedByMethodCallWithCatch(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     fn_node: ids.AstNodeId,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -1925,7 +1665,7 @@ pub fn isGuardedByMethodCallWithCatch(
     const field_name = tree.tokenSlice(field_token);
 
     // Match the receiver by lexical declaration, not by the spelling `self`.
-    if (!isSelfReceiver(tree, obj, ids.astIndex(fn_node))) return false;
+    if (!isSelfReceiver(query, obj, ids.astIndex(fn_node))) return false;
 
     // Find the containing block
     var node = unwrap_node;
@@ -1949,7 +1689,7 @@ pub fn isGuardedByMethodCallWithCatch(
 
     // Scan for method calls with catch before the unwrap.
     return scanBlockForMethodCallWithCatch(
-        tree,
+        query,
         block,
         unwrap_node,
         unwrapped_var,
@@ -1964,7 +1704,7 @@ pub fn isGuardedByMethodCallWithCatch(
 }
 
 fn scanBlockForMethodCallWithCatch(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     block: u32,
     unwrap_node: u32,
     unwrapped_var: u32,
@@ -1976,6 +1716,7 @@ fn scanBlockForMethodCallWithCatch(
     token_starts: []const u32,
     fn_node: ids.AstNodeId,
 ) bool {
+    const tree = query.tree;
     if (block >= tags.len) return false;
 
     // Get position of the unwrap node.
@@ -1999,16 +1740,16 @@ fn scanBlockForMethodCallWithCatch(
             const handler = @intFromEnum(datas[stmt].node_and_node[1]);
 
             if (isEarlyExitExpr(tree, handler, tags, datas) and
-                isMethodCallOnSelf(tree, operand, tags, datas, ids.astIndex(fn_node)))
+                isMethodCallOnSelf(query, operand, tags, datas, ids.astIndex(fn_node)))
             {
-                if (methodAssignsToField(tree, operand, field_name, fn_node, type_context)) {
+                if (methodAssignsToField(query, operand, field_name, fn_node, type_context)) {
                     fact = true;
                     continue;
                 }
             }
         }
 
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
             fact = false;
         }
     }
@@ -2017,12 +1758,13 @@ fn scanBlockForMethodCallWithCatch(
 }
 
 fn isMethodCallOnSelf(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     call_node: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
     fn_node: u32,
 ) bool {
+    const tree = query.tree;
     if (call_node >= tags.len or !call_utils.isCallNode(tags[call_node])) return false;
 
     var call_buf: [1]std.zig.Ast.Node.Index = undefined;
@@ -2031,13 +1773,14 @@ fn isMethodCallOnSelf(
     if (callee >= tags.len or tags[callee] != .field_access) return false;
 
     const receiver = @intFromEnum(datas[callee].node_and_token[0]);
-    return isSelfReceiver(tree, receiver, fn_node);
+    return isSelfReceiver(query, receiver, fn_node);
 }
 
-fn isSelfReceiver(tree: *const std.zig.Ast, receiver: u32, fn_node: u32) bool {
+fn isSelfReceiver(query: *const QueryContext, receiver: u32, fn_node: u32) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     if (receiver >= tags.len or tags[receiver] != .identifier) return false;
-    const files = [_]import_resolver.File{.{ .path = "", .tree = tree }};
+    const files = [_]import_resolver.File{.{ .path = "", .tree = tree, .lexical_index = query.lexical }};
     const resolver = call_utils.ProjectTypeResolver{ .files = &files, .file_index = 0 };
     const receiver_decl = resolver.resolveDeclarationNode(receiver) orelse return false;
     const self_param = firstParameterNode(tree, fn_node) orelse return false;
@@ -2054,12 +1797,13 @@ fn firstParameterNode(tree: *const std.zig.Ast, fn_node: u32) ?u32 {
 }
 
 fn methodAssignsToField(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     call_node: u32,
     field_name: []const u8,
     fn_node: ids.AstNodeId,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     if (call_node >= tags.len or !call_utils.isCallNode(tags[call_node])) return false;
@@ -2072,18 +1816,19 @@ fn methodAssignsToField(
     const receiver = @intFromEnum(access[0]);
     const method_name = tree.tokenSlice(access[1]);
 
-    const files = [_]import_resolver.File{.{ .path = "", .tree = tree }};
+    const files = [_]import_resolver.File{.{ .path = "", .tree = tree, .lexical_index = query.lexical }};
     const resolver = call_utils.ProjectTypeResolver{ .files = &files, .file_index = 0 };
     const receiver_type = resolver.resolveExprType(receiver) orelse return false;
 
     // Resolve the receiver type before matching a method.  A method name is
     // not a callable identity: same-spelled methods on another type cannot
     // establish this field's invariant.
-    for (0..tags.len) |i| {
-        if (tags[i] != .fn_decl) continue;
+    for (query.lexical.namedCandidates(import_resolver.normalizeIdentifier(method_name))) |candidate| {
+        if (candidate.kind != .function) continue;
+        const i = query.lexical.enclosingFunction(candidate.name_token) orelse continue;
         if (i == ids.astIndex(fn_node)) continue;
 
-        const fn_proto_idx = @intFromEnum(datas[i].node_and_node[0]);
+        const fn_proto_idx = candidate.node;
         if (fn_proto_idx >= tags.len) continue;
         var proto_buf: [1]std.zig.Ast.Node.Index = undefined;
         const proto = switch (tags[fn_proto_idx]) {
@@ -2106,7 +1851,7 @@ fn methodAssignsToField(
         const candidate_type = resolver.resolveTypeNode(@intFromEnum(first_type_node)) orelse continue;
         if (!call_resolver.resolvedTypesEqual(receiver_type, candidate_type)) continue;
 
-        if (bodyAssignsToSelfField(tree, @intCast(i), field_name, type_context, tags, datas)) {
+        if (bodyAssignsToSelfField(query, @intCast(i), field_name, type_context, tags, datas)) {
             return true;
         }
     }
@@ -2115,13 +1860,14 @@ fn methodAssignsToField(
 }
 
 fn bodyAssignsToSelfField(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     fn_decl: u32,
     field_name: []const u8,
     type_context: ?*TypeContext,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
 ) bool {
+    const tree = query.tree;
     // Find the body node
     if (fn_decl >= tags.len) return false;
     const fn_data = datas[fn_decl].node_and_node;
@@ -2143,7 +1889,7 @@ fn bodyAssignsToSelfField(
             const pair = datas[node].node_and_node;
             const lhs = @intFromEnum(pair[0]);
             const rhs = @intFromEnum(pair[1]);
-            if (isSelfFieldAccess(tree, lhs, field_name, fn_decl, tags, datas) and
+            if (isSelfFieldAccess(query, lhs, field_name, fn_decl, tags, datas) and
                 isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas))
             {
                 return true;
@@ -2200,28 +1946,30 @@ fn bodyAssignsToSelfField(
 }
 
 fn isSelfFieldAccess(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node: u32,
     field_name: []const u8,
     fn_decl: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
 ) bool {
+    const tree = query.tree;
     if (node >= tags.len or tags[node] != .field_access) return false;
 
     const obj = @intFromEnum(datas[node].node_and_token[0]);
     const field_token = datas[node].node_and_token[1];
-    if (!isSelfReceiver(tree, obj, fn_decl)) return false;
+    if (!isSelfReceiver(query, obj, fn_decl)) return false;
     return std.mem.eql(u8, tree.tokenSlice(field_token), field_name);
 }
 
 pub fn isGuardedByLabeledBlockInvariant(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
@@ -2249,18 +1997,18 @@ pub fn isGuardedByLabeledBlockInvariant(
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= if_pos) break;
 
-        if (isGuardFlagAssignment(tree, stmt, cond_name, unwrapped_var, tags, datas, main_tokens)) {
+        if (isGuardFlagAssignment(query, stmt, cond_name, unwrapped_var, tags, datas, main_tokens)) {
             fact = true;
             continue;
         }
-        if (statementMayMutateStorage(tree, stmt, unwrapped_var, tags, datas, block_node, type_context)) {
+        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block_node, type_context)) {
             fact = false;
         }
     }
 
     if (!fact) return false;
     const then_expr = @intFromEnum(full_if.ast.then_expr);
-    return !statementMayMutateStorage(tree, then_expr, unwrapped_var, tags, datas, block_node, type_context);
+    return !statementMayMutateStorage(query, then_expr, unwrapped_var, tags, datas, block_node, type_context);
 }
 
 fn findEnclosingIfForUnwrap(
@@ -2315,7 +2063,7 @@ fn findContainingBlock(
 }
 
 fn isGuardFlagAssignment(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     stmt: u32,
     flag_name: []const u8,
     unwrapped_var: u32,
@@ -2323,6 +2071,7 @@ fn isGuardFlagAssignment(
     datas: []const std.zig.Ast.Node.Data,
     main_tokens: []const u32,
 ) bool {
+    const tree = query.tree;
     if (stmt >= tags.len) return false;
 
     switch (tags[stmt]) {
@@ -2337,7 +2086,7 @@ fn isGuardFlagAssignment(
 
             const init_node = @intFromEnum(full.ast.init_node);
             if (init_node == 0 or init_node >= tags.len) return false;
-            return isLabeledBlockGuardExpr(tree, init_node, unwrapped_var, tags, datas);
+            return isLabeledBlockGuardExpr(query, init_node, unwrapped_var, tags, datas);
         },
         .assign => {
             const lhs = @intFromEnum(datas[stmt].node_and_node[0]);
@@ -2346,14 +2095,14 @@ fn isGuardFlagAssignment(
             if (tags[lhs] != .identifier) return false;
             const lhs_name = tree.tokenSlice(main_tokens[lhs]);
             if (!std.mem.eql(u8, lhs_name, flag_name)) return false;
-            return isLabeledBlockGuardExpr(tree, rhs, unwrapped_var, tags, datas);
+            return isLabeledBlockGuardExpr(query, rhs, unwrapped_var, tags, datas);
         },
         else => return false,
     }
 }
 
 fn isLabeledBlockGuardExpr(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node: u32,
     unwrapped_var: u32,
     tags: []const std.zig.Ast.Node.Tag,
@@ -2362,19 +2111,21 @@ fn isLabeledBlockGuardExpr(
     if (node >= tags.len) return false;
 
     return switch (tags[node]) {
-        .block, .block_semicolon, .block_two, .block_two_semicolon => subtreeHasNullGuardBreak(tree, node, unwrapped_var, tags, datas),
+        .block, .block_semicolon, .block_two, .block_two_semicolon => subtreeHasNullGuardBreak(query, node, unwrapped_var, tags, datas),
         else => false,
     };
 }
 
 fn subtreeHasNullGuardBreak(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     root: u32,
     unwrapped_var: u32,
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
 ) bool {
+    const tree = query.tree;
     const Visitor = struct {
+        query: *const QueryContext,
         stop: bool = false,
         unwrapped_var: u32,
         tags: []const std.zig.Ast.Node.Tag,
@@ -2390,7 +2141,7 @@ fn subtreeHasNullGuardBreak(
                     const pair = self.datas[node].node_and_node;
                     const lhs = @intFromEnum(pair[0]);
                     const rhs = @intFromEnum(pair[1]);
-                    if (sameVariable(inner_tree, lhs, self.unwrapped_var) and
+                    if (sameVariable(self.query, lhs, self.unwrapped_var) and
                         isBreakWithFalseAndLabel(inner_tree, rhs, self.tags, self.datas))
                     {
                         self.stop = true;
@@ -2400,7 +2151,7 @@ fn subtreeHasNullGuardBreak(
                 .@"if", .if_simple => {
                     const full_if = inner_tree.fullIf(@enumFromInt(node)) orelse return;
                     const cond = @intFromEnum(full_if.ast.cond_expr);
-                    if (checksNull(inner_tree, cond, self.unwrapped_var)) {
+                    if (checksNull(self.query, cond, self.unwrapped_var)) {
                         const then_expr = @intFromEnum(full_if.ast.then_expr);
                         if (subtreeHasBreakFalseLabel(inner_tree, then_expr, self.tags, self.datas)) {
                             self.stop = true;
@@ -2413,7 +2164,7 @@ fn subtreeHasNullGuardBreak(
         }
     };
 
-    var visitor = Visitor{ .unwrapped_var = unwrapped_var, .tags = tags, .datas = datas };
+    var visitor = Visitor{ .query = query, .unwrapped_var = unwrapped_var, .tags = tags, .datas = datas };
     ast_walk.walk(Visitor, tree, root, &visitor) catch return false;
     return visitor.stop;
 }
@@ -2469,12 +2220,13 @@ fn isBreakWithFalseAndLabel(
 }
 
 pub fn isGuardedByShortCircuit(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     unwrap_node: u32,
     unwrapped_var: u32,
     parent_map: []const u32,
     type_context: ?*TypeContext,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const block = findContainingBlock(tree, unwrap_node, parent_map, tags) orelse 0;
@@ -2486,29 +2238,29 @@ pub fn isGuardedByShortCircuit(
         if (parent == 0 or parent >= tags.len) break;
         const tag = tags[parent];
         if (tag == .bool_and or tag == .bool_or or tag == .@"if" or tag == .if_simple) {
-            if (statementMayMutateStorageBefore(tree, node, unwrapped_var, tags, datas, block, unwrap_node, type_context))
+            if (statementMayMutateStorageBefore(query, node, unwrapped_var, tags, datas, block, unwrap_node, type_context))
                 blocked_by_mutation = true;
         }
         if (tag == .bool_and or tag == .bool_or) {
             const left = @intFromEnum(datas[parent].node_and_node[0]);
             const right = @intFromEnum(datas[parent].node_and_node[1]);
             if (node == right) {
-                if (statementMayMutateStorage(tree, left, unwrapped_var, tags, datas, block, type_context))
+                if (statementMayMutateStorage(query, left, unwrapped_var, tags, datas, block, type_context))
                     blocked_by_mutation = true;
                 if (!blocked_by_mutation) {
-                    if (tag == .bool_and and conditionImpliesNotNull(tree, left, unwrapped_var)) return true;
-                    if (tag == .bool_or and checksNull(tree, left, unwrapped_var)) return true;
+                    if (tag == .bool_and and conditionImpliesNotNull(query, left, unwrapped_var)) return true;
+                    if (tag == .bool_or and checksNull(query, left, unwrapped_var)) return true;
                 }
             }
         }
         if (tag == .@"if" or tag == .if_simple) {
             const full = tree.fullIf(@enumFromInt(parent)) orelse break;
             const cond = @intFromEnum(full.ast.cond_expr);
-            const cond_mutates = statementMayMutateStorage(tree, cond, unwrapped_var, tags, datas, block, type_context);
+            const cond_mutates = statementMayMutateStorage(query, cond, unwrapped_var, tags, datas, block, type_context);
             if (!blocked_by_mutation and !cond_mutates) {
-                if (node == @intFromEnum(full.ast.then_expr) and conditionImpliesNotNull(tree, cond, unwrapped_var)) return true;
+                if (node == @intFromEnum(full.ast.then_expr) and conditionImpliesNotNull(query, cond, unwrapped_var)) return true;
                 if (full.ast.else_expr.unwrap()) |else_node| {
-                    if (node == @intFromEnum(else_node) and conditionImpliesNullnessOnFalse(tree, cond, unwrapped_var, false)) return true;
+                    if (node == @intFromEnum(else_node) and conditionImpliesNullnessOnFalse(query, cond, unwrapped_var, false)) return true;
                 }
             }
         }
@@ -2541,20 +2293,21 @@ fn isInSubtree(tree: *const std.zig.Ast, root_node: u32, target_node: u32) bool 
     return visitor.stop;
 }
 
-fn checksNull(tree: *const std.zig.Ast, cond_node: u32, var_node: u32) bool {
-    return checkNullComparison(tree, cond_node, var_node, true);
+fn checksNull(query: *const QueryContext, cond_node: u32, var_node: u32) bool {
+    return checkNullComparison(query, cond_node, var_node, true);
 }
 
-fn conditionImpliesNotNull(tree: *const std.zig.Ast, cond_node: u32, var_node: u32) bool {
-    return conditionImpliesNullness(tree, cond_node, var_node, false);
+fn conditionImpliesNotNull(query: *const QueryContext, cond_node: u32, var_node: u32) bool {
+    return conditionImpliesNullness(query, cond_node, var_node, false);
 }
 
 fn conditionImpliesNullnessOnFalse(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     cond_node: u32,
     var_node: u32,
     want_null: bool,
 ) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
 
@@ -2564,29 +2317,30 @@ fn conditionImpliesNullnessOnFalse(
         .bool_and => blk: {
             const lhs = @intFromEnum(datas[cond_node].node_and_node[0]);
             const rhs = @intFromEnum(datas[cond_node].node_and_node[1]);
-            break :blk conditionImpliesNullnessOnFalse(tree, lhs, var_node, want_null) and
-                conditionImpliesNullnessOnFalse(tree, rhs, var_node, want_null);
+            break :blk conditionImpliesNullnessOnFalse(query, lhs, var_node, want_null) and
+                conditionImpliesNullnessOnFalse(query, rhs, var_node, want_null);
         },
         .bool_or => blk: {
             const lhs = @intFromEnum(datas[cond_node].node_and_node[0]);
             const rhs = @intFromEnum(datas[cond_node].node_and_node[1]);
-            break :blk conditionImpliesNullnessOnFalse(tree, lhs, var_node, want_null) or
-                conditionImpliesNullnessOnFalse(tree, rhs, var_node, want_null);
+            break :blk conditionImpliesNullnessOnFalse(query, lhs, var_node, want_null) or
+                conditionImpliesNullnessOnFalse(query, rhs, var_node, want_null);
         },
         .grouped_expression => blk: {
             const inner = @intFromEnum(datas[cond_node].node_and_token[0]);
-            break :blk conditionImpliesNullnessOnFalse(tree, inner, var_node, want_null);
+            break :blk conditionImpliesNullnessOnFalse(query, inner, var_node, want_null);
         },
         .bool_not => {
             const inner = @intFromEnum(datas[cond_node].node);
-            return conditionImpliesNullness(tree, inner, var_node, want_null);
+            return conditionImpliesNullness(query, inner, var_node, want_null);
         },
-        .equal_equal, .bang_equal => checkNullComparison(tree, cond_node, var_node, !want_null),
+        .equal_equal, .bang_equal => checkNullComparison(query, cond_node, var_node, !want_null),
         else => false,
     };
 }
 
-fn conditionImpliesNullness(tree: *const std.zig.Ast, cond_node: u32, var_node: u32, want_null: bool) bool {
+fn conditionImpliesNullness(query: *const QueryContext, cond_node: u32, var_node: u32, want_null: bool) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
 
@@ -2596,29 +2350,30 @@ fn conditionImpliesNullness(tree: *const std.zig.Ast, cond_node: u32, var_node: 
         .bool_and => blk: {
             const lhs = @intFromEnum(datas[cond_node].node_and_node[0]);
             const rhs = @intFromEnum(datas[cond_node].node_and_node[1]);
-            break :blk conditionImpliesNullness(tree, lhs, var_node, want_null) or
-                conditionImpliesNullness(tree, rhs, var_node, want_null);
+            break :blk conditionImpliesNullness(query, lhs, var_node, want_null) or
+                conditionImpliesNullness(query, rhs, var_node, want_null);
         },
         .bool_or => blk: {
             const lhs = @intFromEnum(datas[cond_node].node_and_node[0]);
             const rhs = @intFromEnum(datas[cond_node].node_and_node[1]);
-            break :blk conditionImpliesNullness(tree, lhs, var_node, want_null) and
-                conditionImpliesNullness(tree, rhs, var_node, want_null);
+            break :blk conditionImpliesNullness(query, lhs, var_node, want_null) and
+                conditionImpliesNullness(query, rhs, var_node, want_null);
         },
         .grouped_expression => blk: {
             const inner = @intFromEnum(datas[cond_node].node_and_token[0]);
-            break :blk conditionImpliesNullness(tree, inner, var_node, want_null);
+            break :blk conditionImpliesNullness(query, inner, var_node, want_null);
         },
         .bool_not => {
             const inner = @intFromEnum(datas[cond_node].node);
-            return conditionImpliesNullnessOnFalse(tree, inner, var_node, want_null);
+            return conditionImpliesNullnessOnFalse(query, inner, var_node, want_null);
         },
-        .equal_equal, .bang_equal => checkNullComparison(tree, cond_node, var_node, want_null),
+        .equal_equal, .bang_equal => checkNullComparison(query, cond_node, var_node, want_null),
         else => false,
     };
 }
 
-fn checkNullComparison(tree: *const std.zig.Ast, cond_node: u32, var_node: u32, is_null_check: bool) bool {
+fn checkNullComparison(query: *const QueryContext, cond_node: u32, var_node: u32, is_null_check: bool) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
 
@@ -2634,10 +2389,10 @@ fn checkNullComparison(tree: *const std.zig.Ast, cond_node: u32, var_node: u32, 
     const lhs_is_null = isNullIdentifier(tree, lhs);
     const rhs_is_null = isNullIdentifier(tree, rhs);
 
-    if (lhs_is_null and sameVariable(tree, rhs, var_node)) {
+    if (lhs_is_null and sameVariable(query, rhs, var_node)) {
         return is_null_check == (cond_tag == .equal_equal);
     }
-    if (rhs_is_null and sameVariable(tree, lhs, var_node)) {
+    if (rhs_is_null and sameVariable(query, lhs, var_node)) {
         return is_null_check == (cond_tag == .equal_equal);
     }
 
@@ -2656,17 +2411,18 @@ fn isNullIdentifier(tree: *const std.zig.Ast, node: u32) bool {
     return std.mem.eql(u8, name, "null");
 }
 
-fn sameVariable(tree: *const std.zig.Ast, node1: u32, node2: u32) bool {
+fn sameVariable(query: *const QueryContext, node1: u32, node2: u32) bool {
+    const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const main_tokens = tree.nodes.items(.main_token);
 
     if (node1 >= tags.len or node2 >= tags.len) return false;
-    return sameVariableRecursive(tree, node1, node2, tags, datas, main_tokens, 0);
+    return sameVariableRecursive(query, node1, node2, tags, datas, main_tokens, 0);
 }
 
 fn sameVariableRecursive(
-    tree: *const std.zig.Ast,
+    query: *const QueryContext,
     node1: u32,
     node2: u32,
     tags: []const std.zig.Ast.Node.Tag,
@@ -2674,11 +2430,12 @@ fn sameVariableRecursive(
     main_tokens: []const u32,
     depth: u32,
 ) bool {
+    const tree = query.tree;
     if (node1 >= tags.len or node2 >= tags.len or depth >= 32) return false;
 
     if (tags[node1] == .grouped_expression) {
         return sameVariableRecursive(
-            tree,
+            query,
             @intFromEnum(datas[node1].node_and_token[0]),
             node2,
             tags,
@@ -2689,7 +2446,7 @@ fn sameVariableRecursive(
     }
     if (tags[node2] == .grouped_expression) {
         return sameVariableRecursive(
-            tree,
+            query,
             node1,
             @intFromEnum(datas[node2].node_and_token[0]),
             tags,
@@ -2700,7 +2457,7 @@ fn sameVariableRecursive(
     }
     if (tags[node1] == .unwrap_optional) {
         return sameVariableRecursive(
-            tree,
+            query,
             @intFromEnum(datas[node1].node_and_token[0]),
             node2,
             tags,
@@ -2711,7 +2468,7 @@ fn sameVariableRecursive(
     }
     if (tags[node2] == .unwrap_optional) {
         return sameVariableRecursive(
-            tree,
+            query,
             node1,
             @intFromEnum(datas[node2].node_and_token[0]),
             tags,
@@ -2722,7 +2479,7 @@ fn sameVariableRecursive(
     }
     if (tags[node1] == .deref or tags[node1] == .address_of) {
         return sameVariableRecursive(
-            tree,
+            query,
             @intFromEnum(datas[node1].node),
             node2,
             tags,
@@ -2733,7 +2490,7 @@ fn sameVariableRecursive(
     }
     if (tags[node2] == .deref or tags[node2] == .address_of) {
         return sameVariableRecursive(
-            tree,
+            query,
             node1,
             @intFromEnum(datas[node2].node),
             tags,
@@ -2745,7 +2502,7 @@ fn sameVariableRecursive(
 
     if (tags[node1] == .identifier and tags[node2] == .identifier) {
         if (node1 >= main_tokens.len or node2 >= main_tokens.len) return false;
-        return sameIdentifierBinding(tree, node1, node2);
+        return sameIdentifierBinding(query, node1, node2);
     }
 
     if (tags[node1] == .field_access and tags[node2] == .field_access) {
@@ -2754,7 +2511,7 @@ fn sameVariableRecursive(
         if (!std.mem.eql(u8, tree.tokenSlice(field1), tree.tokenSlice(field2))) return false;
         const base1 = @intFromEnum(datas[node1].node_and_token[0]);
         const base2 = @intFromEnum(datas[node2].node_and_token[0]);
-        return sameVariableRecursive(tree, base1, base2, tags, datas, main_tokens, depth + 1);
+        return sameVariableRecursive(query, base1, base2, tags, datas, main_tokens, depth + 1);
     }
 
     return false;

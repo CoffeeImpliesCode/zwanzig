@@ -1,6 +1,8 @@
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
 const zir_bridge_mod = @import("zir_bridge.zig");
+const LexicalIndex = @import("analysis/lexical_index.zig").LexicalIndex;
+const ast_walk = @import("ast_walk.zig");
 const log = std.log.scoped(.source);
 
 pub const Location = diagnostic.Location;
@@ -16,10 +18,13 @@ pub const Source = struct {
     file_path: []const u8,
     content: [:0]const u8,
     borrowed_ast: ?*const std.zig.Ast = null,
+    borrowed_lexical_index: ?*const LexicalIndex = null,
 
     cached_ast: ?std.zig.Ast = null,
     cached_location_mapper: ?LocationMapper = null,
     cached_zir_bridge: ?ZirBridge = null,
+    cached_lexical_index: ?LexicalIndex = null,
+    cached_engine_parent_map: ?[]u32 = null,
     zir_load_attempted: bool = false,
     zir_load_error: ?ZirBridgeError = null,
 
@@ -56,6 +61,12 @@ pub const Source = struct {
     }
 
     pub fn deinit(self: *Source) void {
+        if (self.cached_lexical_index) |*index| {
+            index.deinit(self.allocator);
+        }
+        if (self.cached_engine_parent_map) |parents| {
+            self.allocator.free(parents);
+        }
         if (self.cached_ast) |*ast_ptr| {
             ast_ptr.deinit(self.allocator);
         }
@@ -87,6 +98,25 @@ pub const Source = struct {
             self.cached_ast = parsed;
         }
         return &self.cached_ast.?;
+    }
+    /// Immutable syntax facts shared by this source's checkers and engines.
+    /// The returned index borrows source bytes and must not outlive this source.
+    pub fn lexicalIndex(self: *Source) std.mem.Allocator.Error!*const LexicalIndex {
+        if (self.borrowed_lexical_index) |index| return index;
+        if (self.cached_lexical_index == null) {
+            self.cached_lexical_index = try LexicalIndex.init(self.allocator, try self.ast());
+        }
+        return &self.cached_lexical_index.?;
+    }
+
+    /// Parent links within executable declarations, shared across engine runs.
+    /// Unlike lexical parents, this includes container members but not detached
+    /// function signature subtrees. Keep the declaration seed order stable.
+    pub fn engineParentMap(self: *Source) std.mem.Allocator.Error![]const u32 {
+        if (self.cached_engine_parent_map) |parents| return parents;
+        const parents = try ast_walk.buildDeclarationParentMap(self.allocator, try self.ast());
+        self.cached_engine_parent_map = parents;
+        return parents;
     }
 
     pub fn locationMapper(self: *Source) !*const LocationMapper {
@@ -560,4 +590,23 @@ test "Source type info with parse errors returns null" {
     // Should not crash, just return null
     try testing.expect(!source.hasTypeInfo());
     try testing.expect(source.findDeclType("x") == null);
+}
+
+test "Source teardown preserves borrowed lexical queries" {
+    const allocator = std.testing.allocator;
+    var tree = try std.zig.Ast.parse(allocator, "fn root() void {}", .zig);
+    defer tree.deinit(allocator);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const shared = borrowed: {
+        var source = Source.initParsed(failing.allocator(), "borrowed.zig", &tree);
+        source.borrowed_lexical_index = &index;
+        defer source.deinit();
+        break :borrowed try source.lexicalIndex();
+    };
+    const function = shared.findFunction("root", 0) orelse return error.MissingFunction;
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, @enumFromInt(function)) orelse return error.MissingPrototype;
+    try std.testing.expectEqualStrings("root", tree.tokenSlice(proto.name_token.?));
 }

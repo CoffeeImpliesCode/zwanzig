@@ -38,15 +38,17 @@ The `Source` abstraction (`src/source.zig`) provides cached access to Zig syntax
 
 **Behavior:**
 - Lazy API: `ast()` and `tokens()` parse on first access unless the source borrows a project AST
-- Caching: All checks for a file reuse the same syntax
+- Caching: All checks for a file reuse the same syntax, lexical index, and declaration parent map
 - Validation: Parser errors remain in the AST. Callers must reject malformed syntax before semantic traversal
-- Memory management: `deinit()` frees local caches, not borrowed project syntax or source bytes
+- Memory management: `deinit()` frees local caches, not borrowed project syntax, lexical indexes, or source bytes
 
 **API:**
 - `init(allocator, file_path, content)`: Creates a source over caller-owned source bytes
 - `initParsed(allocator, file_path, parsed_ast)`: Borrows a project-owned AST and its source bytes
 - `ast()`: Returns the cached AST, parsing if necessary
 - `tokens()`: Returns the cached token list, parsing if necessary
+- `lexicalIndex()`: Borrows the attached project index or builds a local index on first access
+- `engineParentMap()`: Builds and caches parent links within executable declarations
 - `getContent()`: Returns the raw source text
 - `getFilePath()`: Returns the file path
 - `locationMapper()`: Returns the cached location mapper for byte-to-line/column conversion
@@ -54,6 +56,11 @@ The `Source` abstraction (`src/source.zig`) provides cached access to Zig syntax
 - `byteRangeToSourceRange(start, end)`: Converts a byte range to a `SourceRange`
 - `tokenLocation(token_index)`: Gets the location of a token by its index
 - `deinit()`: Releases cached resources
+
+The analyzer attaches the project index through `borrowed_lexical_index` before
+checks start. It must describe the same AST and outlive the `Source`. Standalone
+sources own their lazily built indexes. Engines borrow source parent maps; they
+own a separate fallback only for standalone or foreign-AST queries.
 
 **Usage Pattern:**
 ```zig
@@ -164,7 +171,7 @@ const graph = analysis.engine.getGraph();
 
 Do not copy the analysis handle or retain engine pointers after its `deinit()`. Graph results are read-only, but lazy engine queries can grow internal caches during a lease. The cache admits an engine only after the checker releases it, so the retained size includes those queries.
 
-The per-file cache retains at most 64 entries and 16 MiB of live engine-owned allocation payload. It uses first-fit admission without eviction. Active leases and separately owned CFG artifacts are outside that retention budget. Allocator overhead and retained physical pages are also outside it. This is not an RSS limit or a constant-memory guarantee.
+The per-file cache retains at most 64 entries and 16 MiB of live engine-owned allocation payload. It uses first-fit admission without eviction. Active leases, separately owned CFG artifacts, and source-owned syntax metadata are outside that retention budget. Allocator overhead and retained physical pages are also outside it. This is not an RSS limit or a constant-memory guarantee.
 
 Destroy all leases before `AnalysisCache`, then destroy the borrowed CFG artifacts, `TypeContext`, and `Source`. The analyzer keeps one `TypeContext` alive for the entire per-file cache lifetime. Configuration and other borrowed inputs must remain unchanged while cached results exist. Statistics record actual engine runs, not cache hits.
 
@@ -276,8 +283,9 @@ AST-only selections still receive syntax diagnostics. They do not require ZIR ge
 
 `ProjectSources` owns an immutable snapshot of selected sources and discovered build context. Each entry owns its source bytes, AST, and lexical index. Workers borrow that syntax while keeping type and engine caches local.
 
-- `LexicalIndex` records declaration candidates, token scopes, parent links, and enclosing functions. It indexes syntax rather than complete semantic answers.
-- `PathIndex` reuses normalized project-path lookup for import resolution.
+- `LexicalIndex` records declaration candidates, token ranges, scopes, parent links, and enclosing functions. Optional-unwrap guards use these facts to resolve bindings and method candidates without repeated whole-file scans. Payload queries reconnect container members through token scopes, so nested methods retain enclosing top-level captures.
+- The source's declaration parent map preserves engine ancestry: it includes container members but excludes detached function-signature subtrees. It is not interchangeable with lexical parent links or function-root checker maps.
+- `PathIndex` indexes exact paths, normalized paths, and package stems. Import lookup preserves the first matching file across exact, relative, and package-name matches. Subset and foreign file slices use the unindexed fallback.
 - `ProjectReferenceIndex` computes namespace and alias targets for project `unused-decl` analysis. Its dependency worklist preserves reachable targets through valid alias cycles.
 
 Malformed ASTs contribute no semantic facts. They can remain addressable by path without exposing parser-recovery nodes to resolvers. Project lookup can resolve types and references across available files, but does not execute cross-file calls.
