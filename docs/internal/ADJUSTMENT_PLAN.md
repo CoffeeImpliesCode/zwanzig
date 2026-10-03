@@ -4,7 +4,7 @@ This plan originally covered missing branch constraints, error-path summaries, u
 
 ## Verification status
 
-Both frontend CLIs passed smoke checks for guarded integer divides, contradictory guards, conservative floating-point and wide-integer guards, hard call-context limits, and constant warnings under limits. Cold and warm disk-cache runs produced identical diagnostics. Compatible checkers reused one engine run, and one-worker and two-worker runs produced identical diagnostics. Contextual constant references retained the expected unused homonym report.
+For the revision these steps were written against, both frontend CLIs passed smoke checks for guarded integer divides, contradictory guards, conservative floating-point and wide-integer guards, hard call-context limits, and constant warnings under limits. Cold and warm disk-cache runs produced identical diagnostics. Compatible checkers reused one engine run, and one-worker and two-worker runs produced identical diagnostics. Contextual constant references retained the expected unused homonym report.
 
 Use `nix develop` for Zig 0.16.0 and `nix develop .#zig015` for Zig 0.15.2. Only Zig 0.15.2 defines canonical formatting.
 

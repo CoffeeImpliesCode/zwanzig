@@ -166,7 +166,9 @@ Engine-backed checkers:
 
 Syntax errors produce `parse-error` diagnostics. Zwanzig skips checks for malformed files and continues with valid sibling files. Enabled native checkers control type preflight. If the embedded frontend rejects a file during that preflight, Zwanzig emits `frontend-error`. Required typed checks skip the file, while optional checks use AST fallback. AST-only selections avoid ZIR preflight.
 
-`--threads` includes the calling thread on both frontends. Engine state caps include all call contexts at each program point. If analysis cannot continue within a cap, Zwanzig warns and stops that function analysis. Independent constant-condition and structural checks can still report diagnostics.
+`--threads` includes the calling thread on both frontends. Engine state caps include all call contexts at each program point. If analysis cannot continue within a cap, Zwanzig stops that function analysis and reports `analysis-limit-exceeded` for it. Independent constant-condition and structural checks can still report diagnostics.
+
+An unknown option is an error rather than an ignored argument, and a selection that resolves to no `.zig` files exits 1 instead of reporting a clean run. Exit status 1 means diagnostics were reported or the run could not be trusted as a complete analysis; see [docs/USAGE.md](docs/USAGE.md) for the full table.
 
 ## Limitations
 

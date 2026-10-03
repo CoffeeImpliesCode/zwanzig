@@ -52,9 +52,10 @@ python3 scripts/benchmark.py compare .tmp/bench-baseline .tmp/bench-candidate
 ```
 
 Results include user and elapsed time, peak RSS, hardware counters, executable hash,
-JSON diagnostics, and analysis-limit warnings. Comparison requires matching inputs,
-diagnostic multisets, exit status, and limit-warning multisets. Exit status 1 means
-diagnostics were found, not that analysis failed.
+and JSON diagnostics, which now include `analysis-limit-exceeded` entries.
+Comparison requires matching inputs, diagnostic multisets, and exit status.
+Exit status 1 means diagnostics were reported or the run could not be trusted
+as a complete analysis.
 
 Profile long runs separately so sampling overhead does not affect the timing comparison:
 
