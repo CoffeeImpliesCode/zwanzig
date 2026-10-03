@@ -13,16 +13,20 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-PROJECTS = Path.home() / "projects"
-WORKLOADS = {
-    "nogui": PROJECTS / "nogui",
-    "skript": PROJECTS / "skript",
-    "ocean": PROJECTS / "ocean",
-    "zwanzig": REPO,
-    "zmath": PROJECTS / "zmath",
-    "mon": PROJECTS / "mon",
-}
+SELF = "zwanzig"
+CONFIG_FILES = ("build.zig", "build.zig.zon", ".zwanzig.json")
 EVENTS = "task-clock:u,cycles:u,instructions:u,branches:u,branch-misses:u,page-faults:u"
+
+
+def workloads(entries):
+    """Resolve NAME=PATH arguments onto this checkout, which is always a workload."""
+    resolved = {SELF: REPO}
+    for entry in entries:
+        name, separator, raw = entry.partition("=")
+        if not separator or not name or name in resolved:
+            raise ValueError(f"Workload must be a unique NAME=PATH pair: {entry}")
+        resolved[name] = Path(raw).expanduser().resolve()
+    return resolved
 
 
 def digest(path):
@@ -33,15 +37,15 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def snapshot(destination):
+def snapshot(destination, resolved):
     destination.mkdir(parents=True, exist_ok=False)
-    workloads = {}
-    for name, original in WORKLOADS.items():
+    recorded = {}
+    for name, original in resolved.items():
         source = original / "src"
         paths = sorted(source.rglob("*.zig"))
         if not paths:
             raise ValueError(f"No Zig sources in {source}")
-        for filename in ("build.zig", "build.zig.zon", ".zwanzig.json"):
+        for filename in CONFIG_FILES:
             path = original / filename
             if path.is_file():
                 paths.append(path)
@@ -55,18 +59,18 @@ def snapshot(destination):
             if digest(target) != before or digest(path) != before:
                 raise RuntimeError(f"Input changed during snapshot: {path}")
             hashes[str(relative)] = before
-        workloads[name] = {"original": str(original), "hashes": hashes}
+        recorded[name] = {"original": str(original), "hashes": hashes}
         print(f"{name}: {sum(p.endswith('.zig') and p.startswith('src/') for p in hashes)} source files", flush=True)
     save_json(destination / "manifest.json", {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "host": platform.uname()._asdict(),
-        "workloads": workloads,
+        "workloads": recorded,
     })
 
 
 def verify_inputs(root, hashes):
     actual = {str(path.relative_to(root)) for path in (root / "src").rglob("*.zig")}
-    actual.update(name for name in ("build.zig", "build.zig.zon", ".zwanzig.json") if (root / name).is_file())
+    actual.update(name for name in CONFIG_FILES if (root / name).is_file())
     if set(hashes) != actual:
         raise RuntimeError(f"Snapshot membership changed in {root}")
     for relative, expected in hashes.items():
@@ -75,8 +79,12 @@ def verify_inputs(root, hashes):
 
 
 def verify_config(manifest):
+    """Refuse to measure once this checkout's own configuration has changed."""
+    entry = manifest["workloads"].get(SELF)
+    if entry is None:
+        return
     config = REPO / ".zwanzig.json"
-    expected = manifest["workloads"]["zwanzig"]["hashes"].get(".zwanzig.json")
+    expected = entry["hashes"].get(".zwanzig.json")
     actual = digest(config) if config.is_file() else None
     if actual != expected:
         raise RuntimeError("Working-directory configuration changed since the snapshot")
@@ -131,7 +139,10 @@ def run(args):
     manifest_path = inputs / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     verify_config(manifest)
-    workloads = args.workloads or list(manifest["workloads"])
+    selected = args.workloads or list(manifest["workloads"])
+    unknown = [name for name in selected if name not in manifest["workloads"]]
+    if unknown:
+        raise ValueError(f"Workloads absent from the snapshot manifest: {', '.join(unknown)}")
     binary_hash = digest(binary)
     output.mkdir(parents=True, exist_ok=False)
     version = subprocess.run([str(binary), "--version"], check=True, capture_output=True, text=True).stdout.strip()
@@ -141,7 +152,7 @@ def run(args):
         "inputs": str(inputs), "manifest_sha256": digest(manifest_path),
         "profiled": args.profile, "threads": 1, "nice": 15, "results": [],
     }
-    for name in workloads:
+    for name in selected:
         results["results"].append(measure(inputs, binary, output, name, manifest["workloads"][name], args.profile))
         verify_config(manifest)
         if digest(binary) != binary_hash:
@@ -183,20 +194,23 @@ def compare(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    capture = commands.add_parser("snapshot", help="freeze all six source workloads")
+    capture = commands.add_parser("snapshot", help="freeze workload source trees")
     capture.add_argument("destination", type=Path)
+    capture.add_argument("workloads", nargs="*", metavar="NAME=PATH",
+                         help="extra workloads to freeze alongside this checkout")
     execute = commands.add_parser("run", help="measure frozen workloads sequentially")
     execute.add_argument("inputs", type=Path)
     execute.add_argument("binary", type=Path)
     execute.add_argument("output", type=Path)
-    execute.add_argument("--workloads", nargs="+", choices=WORKLOADS)
+    execute.add_argument("--workloads", nargs="+", metavar="NAME",
+                         help="default: every workload in the snapshot manifest")
     execute.add_argument("--profile", action="store_true", help="sample call stacks instead of collecting counters")
     comparison = commands.add_parser("compare", help="compare timings with exact diagnostic and limit-warning checks")
     comparison.add_argument("before", type=Path)
     comparison.add_argument("after", type=Path)
     args = parser.parse_args()
     if args.command == "snapshot":
-        snapshot(args.destination.resolve())
+        snapshot(args.destination.resolve(), workloads(args.workloads))
     elif args.command == "compare":
         compare(args)
     else:

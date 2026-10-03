@@ -29,11 +29,11 @@ pub fn isGuardedByAssertion(
             else => {},
         }
     } else return false;
-    var statements: [ast_walk.max_block_statements]u32 = undefined;
-    const count = ast_walk.getBlockStatements(tree, block, &statements) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     const before = tree.nodeMainToken(@enumFromInt(unwrap_node));
     var fact = false;
-    for (statements[0..count]) |statement| {
+    for (statements) |statement| {
         if (query.firstToken(statement) >= before) break;
         if (statementMayMutateStorageBefore(query, statement, target, tags, datas, block, unwrap_node, type_context))
             fact = false;
@@ -120,12 +120,12 @@ fn scanBlockForLazyInit(
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
     // Get statements from the block.
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     var fact = false;
 
     // A lazy initialization proof remains valid only until a later storage write.
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
 
         const stmt_pos = token_starts[main_tokens[stmt]];
@@ -176,6 +176,28 @@ fn scanBlockForLazyInit(
     return fact;
 }
 
+/// A `defer` reached as a direct statement of a branch body is registered by
+/// the branch's own scope, so its body runs when that scope exits: after every
+/// statement of the branch and before the statement holding the guarded
+/// unwrap. A write such a deferred body may make therefore outlives the
+/// assignment that would otherwise prove the branch target non-null, and no
+/// later statement of the branch can revive the fact it destroys. An
+/// `errdefer` body runs only when its scope exits with an error, which cannot
+/// reach the following statement, so it keeps the ordinary treatment where a
+/// later assignment may still re-establish the fact.
+fn branchSchedulesPendingDefer(
+    query: *const QueryContext,
+    statement: u32,
+    var_node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+    block: u32,
+    type_context: ?*TypeContext,
+) bool {
+    if (statement >= tags.len or tags[statement] != .@"defer") return false;
+    return statementMayMutateStorageAfterScopeExit(query, statement, var_node, tags, datas, block, type_context);
+}
+
 fn branchProvesNonNull(
     query: *const QueryContext,
     node: u32,
@@ -205,6 +227,15 @@ fn branchProvesNonNull(
             for (start..end) |index| {
                 const statement = tree.extra_data[index];
                 if (statement >= tags.len) continue;
+                if (branchSchedulesPendingDefer(
+                    query,
+                    statement,
+                    var_node,
+                    tags,
+                    datas,
+                    block,
+                    type_context,
+                )) return false;
 
                 if (tags[statement] == .assign) {
                     const pair = datas[statement].node_and_node;
@@ -227,9 +258,19 @@ fn branchProvesNonNull(
             const opt_nodes = datas[node].opt_node_and_opt_node;
             var fact = false;
             if (opt_nodes[0].unwrap()) |statement| {
+                const statement_node = @intFromEnum(statement);
+                if (branchSchedulesPendingDefer(
+                    query,
+                    statement_node,
+                    var_node,
+                    tags,
+                    datas,
+                    block,
+                    type_context,
+                )) return false;
                 fact = branchProvesNonNull(
                     query,
-                    @intFromEnum(statement),
+                    statement_node,
                     var_node,
                     type_context,
                     tags,
@@ -239,6 +280,15 @@ fn branchProvesNonNull(
             }
             if (opt_nodes[1].unwrap()) |statement| {
                 const statement_node = @intFromEnum(statement);
+                if (branchSchedulesPendingDefer(
+                    query,
+                    statement_node,
+                    var_node,
+                    tags,
+                    datas,
+                    block,
+                    type_context,
+                )) return false;
                 if (tags[statement_node] == .assign) {
                     const pair = datas[statement_node].node_and_node;
                     const lhs = @intFromEnum(pair[0]);
@@ -370,14 +420,14 @@ fn scanBlockForEarlyExit(
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
     // Get statements from the block.
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     var fact = false;
 
     // A condition whose true branch exits leaves the false-branch facts in
     // force.  Use the full boolean expression, not only a direct comparison:
     // `if (x == null or other_is_invalid) return; x.?` is safe.
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
 
         const stmt_pos = token_starts[main_tokens[stmt]];
@@ -418,11 +468,11 @@ fn scanBlockForSwitchNullCase(
     if (unwrap_node >= main_tokens.len) return false;
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     var fact = false;
 
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len) continue;
         if (stmt >= main_tokens.len) continue;
 
@@ -490,9 +540,9 @@ fn isEarlyExitExpr(
     switch (tags[node]) {
         .@"continue", .@"break", .@"return" => return true,
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
-            var statements: [ast_walk.max_block_statements]u32 = undefined;
-            const statement_count = ast_walk.getBlockStatements(tree, node, &statements) orelse return false;
-            for (statements[0..statement_count]) |statement| {
+            var inline_statements: [2]u32 = undefined;
+            const statements = ast_walk.getBlockStatements(tree, node, &inline_statements) orelse return false;
+            for (statements) |statement| {
                 if (isEarlyExitExpr(tree, statement, tags, datas)) return true;
             }
             return false;
@@ -587,16 +637,20 @@ pub fn isGuardedByPriorUnwrap(
     if (unwrap_node >= main_tokens.len) return false;
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     var fact = false;
 
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) break;
 
-        if (statementMayMutateStorage(query, stmt, unwrapped_var, tags, datas, block, type_context)) {
+        // `stmt` can be the very statement that holds the unwrap: only its main
+        // token has to precede the unwrap's. A call, a write, or an operand
+        // that reaches past the unwrap is evaluated after it, so this keeps
+        // exactly the effects that really happen first.
+        if (statementMayMutateStorageBefore(query, stmt, unwrapped_var, tags, datas, block, unwrap_node, type_context)) {
             fact = false;
             continue;
         }
@@ -622,11 +676,11 @@ fn scanBlockForPriorAssignment(
     if (block >= tags.len or unwrap_node >= main_tokens.len) return false;
     const unwrap_pos = token_starts[main_tokens[unwrap_node]];
 
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
     var fact = false;
 
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
         const stmt_pos = token_starts[main_tokens[stmt]];
         if (stmt_pos >= unwrap_pos) break;
@@ -1204,6 +1258,40 @@ fn isStrictBinaryTag(tag: std.zig.Ast.Node.Tag) bool {
     };
 }
 
+/// A `defer`/`errdefer` reached as a direct statement of `block` only runs when
+/// that block's own scope exits. The unwrap this scan guards lives in a later
+/// statement of the same block, so the scope cannot have exited yet: the
+/// unwinding that would run the body can only begin after the statement holding
+/// the unwrap has returned. A defer reached through any other node belongs to
+/// an inner scope whose exit may already have happened on the path to the
+/// unwrap, so it keeps invalidating the fact.
+fn deferredBodyHasNotRun(
+    tree: *const std.zig.Ast,
+    statement: u32,
+    block: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+) bool {
+    if (statement >= tags.len or block >= tags.len) return false;
+    if (tags[statement] != .@"defer" and tags[statement] != .@"errdefer") return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
+    for (statements) |candidate| {
+        if (candidate == statement) return true;
+    }
+    return false;
+}
+
+/// When a `defer`/`errdefer` reached while scanning a statement can still be
+/// pending at the guarded statement.
+const DeferredTiming = enum {
+    /// The scan walks statements of the scope that holds the guarded statement,
+    /// so a body registered there cannot have run yet.
+    scope_open,
+    /// The scan walks statements of a scope that already exited before the
+    /// guarded statement, so every body it registered has run by then.
+    scope_exited,
+};
+
 fn statementMayMutateStorage(
     query: *const QueryContext,
     statement: u32,
@@ -1213,7 +1301,22 @@ fn statementMayMutateStorage(
     block: u32,
     type_context: ?*TypeContext,
 ) bool {
-    return statementMayMutateStorageBefore(query, statement, target, tags, datas, block, null, type_context);
+    return storageWriteReachable(query, statement, target, tags, datas, block, null, .scope_open, type_context);
+}
+
+/// Mutation analysis for a statement of a scope that already exited before the
+/// guarded statement, so a `defer` registered by one of its direct statements
+/// runs before the guarded statement instead of after it.
+fn statementMayMutateStorageAfterScopeExit(
+    query: *const QueryContext,
+    statement: u32,
+    target: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+    block: u32,
+    type_context: ?*TypeContext,
+) bool {
+    return storageWriteReachable(query, statement, target, tags, datas, block, null, .scope_exited, type_context);
 }
 
 fn statementMayMutateStorageBefore(
@@ -1226,7 +1329,22 @@ fn statementMayMutateStorageBefore(
     before_node: ?u32,
     type_context: ?*TypeContext,
 ) bool {
+    return storageWriteReachable(query, statement, target, tags, datas, block, before_node, .scope_open, type_context);
+}
+
+fn storageWriteReachable(
+    query: *const QueryContext,
+    statement: u32,
+    target: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+    block: u32,
+    before_node: ?u32,
+    deferred_timing: DeferredTiming,
+    type_context: ?*TypeContext,
+) bool {
     const tree = query.tree;
+    if (deferred_timing == .scope_open and deferredBodyHasNotRun(tree, statement, block, tags)) return false;
     const Visitor = struct {
         query: *const QueryContext,
         target: u32,
@@ -1371,11 +1489,13 @@ fn storageWriteMayAffect(query: *const QueryContext, lhs: u32, target: u32, bloc
     const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     if (lhs >= tags.len) return true;
+    // Rebinding a pointer alias changes its local slot, not the object it
+    // previously designated. The target changes only when its own root moves.
+    if (tags[lhs] == .identifier) return storageRootMatches(query, lhs, target);
     if (storageFieldsAreDisjoint(query, lhs, target, type_context)) return false;
-    if (storageRootMatches(query, lhs, target)) return true;
+    if (storageRootsMayAlias(query, lhs, target, type_context)) return true;
     return switch (tags[lhs]) {
         .deref, .address_of, .field_access, .array_access => !localSlotHasNoAliases(query, target, block, type_context),
-        .identifier => false,
         else => true,
     };
 }
@@ -1425,13 +1545,13 @@ fn localSlotHasNoAliases(query: *const QueryContext, target: u32, block: u32, ty
         if (start < function_start or start >= reference) continue;
         if (tag == .@"asm" or tag == .asm_simple) return false;
         if (start <= binding) continue;
-        if (tag == .address_of and storageRootMatches(query, @intFromEnum(tree.nodeData(node).node), target)) return false;
+        if (tag == .address_of and storageRootsMayAlias(query, @intFromEnum(tree.nodeData(node).node), target, type_context)) return false;
         if (call_resolver.isCallNode(tag)) {
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, node) orelse return false;
             const callee = call.ast.fn_expr;
             if (tree.nodeTag(callee) == .field_access and
-                storageRootMatches(query, @intFromEnum(tree.nodeData(callee).node_and_token[0]), target))
+                storageRootsMayAlias(query, @intFromEnum(tree.nodeData(callee).node_and_token[0]), target, type_context))
                 return false;
         }
         switch (tag) {
@@ -1439,7 +1559,7 @@ fn localSlotHasNoAliases(query: *const QueryContext, target: u32, block: u32, ty
                 var buffer: [2]std.zig.Ast.Node.Index = undefined;
                 const params = tree.builtinCallParams(&buffer, node) orelse return false;
                 for (params) |param| {
-                    if (storageRootMatches(query, @intFromEnum(param), target)) return false;
+                    if (storageRootsMayAlias(query, @intFromEnum(param), target, type_context)) return false;
                 }
             },
             else => {},
@@ -1465,7 +1585,7 @@ fn callMayMutateStorage(
     if (tags[callee] == .field_access) {
         const receiver = @intFromEnum(datas[callee].node_and_token[0]);
         if (receiver >= tags.len) return true;
-        if (tags[receiver] != .unwrap_optional and storageRootMatches(query, receiver, target)) {
+        if (tags[receiver] != .unwrap_optional and storageRootsMayAlias(query, receiver, target, type_context)) {
             return true;
         }
     }
@@ -1536,18 +1656,18 @@ fn argumentMayMutateStorage(
                 argument = @intFromEnum(datas[argument].node_and_token[0]);
             },
             .identifier => {
-                if (!storageRootMatches(query, argument, target)) return false;
+                if (!storageRootsMayAlias(query, argument, target, type_context)) return false;
                 return argumentExpressionMayEscape(type_context, argument);
             },
             .address_of => {
                 const pointee = @intFromEnum(datas[argument].node);
                 if (storageFieldsAreDisjoint(query, pointee, target, type_context)) return false;
-                return storageRootMatches(query, argument, target);
+                return storageRootsMayAlias(query, argument, target, type_context);
             },
-            .deref => return storageRootMatches(query, argument, target),
+            .deref => return storageRootsMayAlias(query, argument, target, type_context),
             .array_access => {
                 const base = @intFromEnum(datas[argument].node_and_node[0]);
-                if (storageRootMatches(query, base, target)) return true;
+                if (storageRootsMayAlias(query, base, target, type_context)) return true;
                 argument = base;
             },
             .call, .call_comma, .call_one, .call_one_comma => {
@@ -1556,7 +1676,7 @@ fn argumentMayMutateStorage(
                 const callee = @intFromEnum(full.ast.fn_expr);
                 if (callee < tags.len and tags[callee] == .field_access) {
                     const receiver = @intFromEnum(datas[callee].node_and_token[0]);
-                    if (storageRootMatches(query, receiver, target)) return true;
+                    if (storageRootsMayAlias(query, receiver, target, type_context)) return true;
                 }
                 for (full.ast.params) |param| {
                     if (argumentMayMutateStorage(query, @intFromEnum(param), target, tags, datas, type_context)) return true;
@@ -1639,6 +1759,224 @@ fn sameIdentifierBinding(query: *const QueryContext, left: u32, right: u32) bool
     const left_binding = query.resolveIdentifierBinding(left) orelse return false;
     const right_binding = query.resolveIdentifierBinding(right) orelse return false;
     return left_binding == right_binding;
+}
+
+/// `storageRootMatches` plus the locals that reach the target root through a
+/// pointer view: a pointer copy such as `const alias = holder;`, however many
+/// hops or rebindings deep, still designates the same object, so a different
+/// name never proves non-aliasing.
+fn storageRootsMayAlias(
+    query: *const QueryContext,
+    node: u32,
+    target: u32,
+    type_context: ?*TypeContext,
+) bool {
+    if (storageRootMatches(query, node, target)) return true;
+    const left = storageRootIdentifier(query, node) orelse return false;
+    const right = storageRootIdentifier(query, target) orelse return false;
+    if (left == right) return true;
+    const target_binding = query.resolveIdentifierBinding(right) orelse return false;
+    // Only initialisation that already reached the mutation under test can
+    // have made the left binding designate the target object there. A
+    // rebinding written between the mutation and the target site shapes the
+    // target's own receiver, not the value the mutation read.
+    return bindingDerivedFrom(query, left, target_binding, query.firstToken(node), type_context);
+}
+
+fn storageRootIdentifier(query: *const QueryContext, node: u32) ?u32 {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    var current = node;
+    var depth: u32 = 0;
+    while (depth < 32) : (depth += 1) {
+        if (current >= tags.len) return null;
+        switch (tags[current]) {
+            .grouped_expression, .unwrap_optional, .field_access => current = @intFromEnum(datas[current].node_and_token[0]),
+            .deref, .address_of => current = @intFromEnum(datas[current].node),
+            .array_access => current = @intFromEnum(datas[current].node_and_node[0]),
+            .identifier => return current,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// A binding reaches the target object when one of the expressions that give
+/// it a value re-reads an already known alias through a pointer view. Chains
+/// are followed to a fixpoint and a rebinding counts like a declaration, so
+/// `var p = holder; const q = p; const r = q;` and `alias = holder;` still
+/// designate the same object, while a plain value copy (`const copy =
+/// holder.list;`) initialises an independent one. Only initialisation
+/// written before the use site counts. The discriminator is always the
+/// alias's own initializer, never the target's type: `&root` shares the
+/// object, a struct copy does not.
+fn bindingDerivedFrom(
+    query: *const QueryContext,
+    node: u32,
+    target_binding: u32,
+    use_token: u32,
+    type_context: ?*TypeContext,
+) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    const binding = query.resolveIdentifierBinding(node) orelse return false;
+    if (binding == target_binding) return true;
+
+    // Bindings already known to designate the target object. Chains grow it
+    // one hop at a time; more than the worklist holds is reported as aliasing
+    // because claiming independence would hide a real mutation.
+    var known: [32]u32 = undefined;
+    var known_len: usize = 1;
+    known[0] = target_binding;
+    var next: usize = 0;
+    while (next < known_len) : (next += 1) {
+        const source = known[next];
+        for (tags, 0..) |tag, index| {
+            var destination: u32 = 0;
+            var value_expr: u32 = 0;
+            switch (tag) {
+                .assign => {
+                    value_expr = @intFromEnum(datas[index].node_and_node[1]);
+                },
+                else => {
+                    if (!import_resolver.isVarDeclTag(tag)) continue;
+                    const full = tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+                    destination = full.ast.mut_token + 1;
+                    value_expr = @intFromEnum(full.ast.init_node.unwrap() orelse {
+                        // A declaration with no value at all still names the slot.
+                        if (destination == binding) return true;
+                        continue;
+                    });
+                },
+            }
+            // A declaration or rebinding written after the use site cannot
+            // have shaped the value that site reads.
+            if (query.firstToken(@intCast(index)) >= use_token) continue;
+            if (value_expr == 0 or value_expr >= tags.len) continue;
+            if (!expressionNamesBinding(query, value_expr, source)) continue;
+            if (!expressionMentionsBinding(query, value_expr, source)) continue;
+            if (!initializerCarriesPointer(query, value_expr, type_context)) continue;
+            if (destination == 0) {
+                const lhs = @intFromEnum(datas[index].node_and_node[0]);
+                if (lhs >= tags.len or tags[lhs] != .identifier) continue;
+                destination = query.resolveIdentifierBinding(lhs) orelse continue;
+            }
+            if (destination == binding) return true;
+            if (std.mem.indexOfScalar(u32, known[0..known_len], destination) == null) {
+                if (known_len == known.len) return true;
+                known[known_len] = destination;
+                known_len += 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// True when the new slot may still designate the object the target names.
+/// `&root` and `root.*` always do, and a declared by-value `std` container
+/// copy never does. A `.field_access` initializer is decided by the member's
+/// own declared type alone: expression-type resolution cannot tell a
+/// pointer-typed field from a value one, and a member whose type cannot be
+/// read stays a pointer view. An unresolved (`.unknown`) expression type is
+/// no evidence either, so it keeps the conservative reading.
+fn initializerCarriesPointer(
+    query: *const QueryContext,
+    init: u32,
+    type_context: ?*TypeContext,
+) bool {
+    const tags = query.tree.nodes.items(.tag);
+    if (init >= tags.len) return true;
+    switch (tags[init]) {
+        .address_of, .deref => return true,
+        .field_access => return !declaredByValueContainer(query, init),
+        else => {},
+    }
+    if (declaredByValueContainer(query, init)) return false;
+    const ctx = type_context orelse return true;
+    var info = ctx.getExpressionTypeStrict(init) orelse return true;
+    for (0..8) |_| {
+        switch (info.kind) {
+            .pointer, .slice => return true,
+            .optional, .error_union => {
+                info.kind = info.payload_kind orelse return true;
+                info.payload_kind = null;
+            },
+            .unknown => return true,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// True when the initializer's *declared* type is a by-value `std` container,
+/// so the new slot owns an independent copy instead of designating the
+/// original one. A bare identifier is read through the declared type of the
+/// binding it names, a `holder.field` access through the member's own
+/// declared type; both are then verified through their `@import`, never by
+/// name. A pointer or slice layer, and any type that cannot be read, keep the
+/// conservative reading.
+fn declaredByValueContainer(query: *const QueryContext, expr: u32) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    if (expr >= tags.len) return false;
+    const declared = switch (tags[expr]) {
+        .identifier => bindingTypeExprNode(query, expr) orelse return false,
+        .field_access => fieldTypeNode(query, expr) orelse return false,
+        else => return false,
+    };
+    var node = declared;
+    for (0..8) |_| {
+        if (node >= tags.len) return false;
+        switch (tags[node]) {
+            // `*T` and `[]T` keep sharing the original storage.
+            .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel => return false,
+            // `?T` and `E!T` carry the value itself.
+            .optional_type => node = @intFromEnum(datas[node].node),
+            .error_union => node = @intFromEnum(datas[node].node_and_node[1]),
+            else => break,
+        }
+    }
+    return isVerifiedStdArrayListValueTypeNode(query, tree, node, tags, datas);
+}
+
+fn expressionMentionsBinding(query: *const QueryContext, expression: u32, binding: u32) bool {
+    const tree = query.tree;
+    const Visitor = struct {
+        query: *const QueryContext,
+        binding: u32,
+        found: bool = false,
+        stop: bool = false,
+
+        const Self = @This();
+
+        pub fn visit(self: *Self, _: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
+            if (tag != .identifier) return;
+            if (self.query.resolveIdentifierBinding(node) != self.binding) return;
+            self.found = true;
+            self.stop = true;
+        }
+    };
+
+    var visitor = Visitor{ .query = query, .binding = binding };
+    ast_walk.walk(Visitor, tree, expression, &visitor) catch return true;
+    return visitor.found;
+}
+
+/// Cheap pre-filter for the exact resolution in `expressionMentionsBinding`:
+/// the binding's own name has to occur in the expression's tokens, so the
+/// unrelated declarations of a file cost one substring search each.
+fn expressionNamesBinding(query: *const QueryContext, expression: u32, name_token: u32) bool {
+    const tree = query.tree;
+    if (expression >= tree.nodes.len or name_token >= tree.tokens.len) return true;
+    const first = query.firstToken(expression);
+    const last = query.lastToken(expression);
+    if (first > last or last >= tree.tokens.len) return true;
+    const starts = tree.tokens.items(.start);
+    const bytes = tree.source[starts[first] .. starts[last] + tree.tokenSlice(last).len];
+    return std.mem.indexOf(u8, bytes, tree.tokenSlice(name_token)) != null;
 }
 
 pub fn isGuardedByMethodCallWithCatch(
@@ -1725,10 +2063,10 @@ fn scanBlockForMethodCallWithCatch(
 
     // A successful method guard remains valid only until a later storage write.
     var fact = false;
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block, &inline_statements) orelse return false;
 
-    for (stmts_buf[0..stmt_count]) |stmt| {
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
 
         const stmt_pos = token_starts[main_tokens[stmt]];
@@ -1986,12 +2324,11 @@ pub fn isGuardedByLabeledBlockInvariant(
     const block_node = findContainingBlock(tree, if_node, parent_map, tags) orelse return false;
     const if_pos = token_starts[main_tokens[if_node]];
 
-    var stmts_buf: [ast_walk.max_block_statements]u32 = undefined;
-    const stmt_count = ast_walk.getBlockStatements(tree, block_node, &stmts_buf) orelse return false;
+    var inline_statements: [2]u32 = undefined;
+    const statements = ast_walk.getBlockStatements(tree, block_node, &inline_statements) orelse return false;
 
     var fact = false;
-    for (0..stmt_count) |idx| {
-        const stmt = stmts_buf[idx];
+    for (statements) |stmt| {
         if (stmt >= tags.len or stmt >= main_tokens.len) continue;
 
         const stmt_pos = token_starts[main_tokens[stmt]];
@@ -2009,6 +2346,585 @@ pub fn isGuardedByLabeledBlockInvariant(
     if (!fact) return false;
     const then_expr = @intFromEnum(full_if.ast.then_expr);
     return !statementMayMutateStorage(query, then_expr, unwrapped_var, tags, datas, block_node, type_context);
+}
+
+/// `std.ArrayList.pop` and `std.ArrayListUnmanaged.pop` yield null exactly
+/// when the list is empty, so a loop condition that proves a positive length
+/// proves the removal's payload. The contract is bound to the *verified*
+/// generic type: a same-spelled `pop` on a project type, or a shadowed `std`,
+/// keeps its diagnostic. It also covers a single removal, on the iteration the
+/// condition admitted: a nested loop that can reach the unwrap again, or any
+/// statement evaluated before it — including one nested in the `if`, `switch`
+/// prong or `while (cond) : (payload)` payload that encloses the unwrap — may
+/// empty the list first and cancels the proof.
+pub fn isGuardedByContainerLength(
+    query: *const QueryContext,
+    unwrap_node: u32,
+    unwrapped_var: u32,
+    parent_map: []const u32,
+    type_context: ?*TypeContext,
+) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+
+    if (unwrapped_var >= tags.len) return false;
+    if (!call_resolver.isCallNode(tags[unwrapped_var])) return false;
+
+    var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, @enumFromInt(unwrapped_var)) orelse return false;
+    if (call.ast.params.len != 0) return false;
+    const callee = @intFromEnum(call.ast.fn_expr);
+    if (callee >= tags.len or tags[callee] != .field_access) return false;
+    const access = datas[callee].node_and_token;
+    if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(access[1])), "pop")) return false;
+    const receiver = @intFromEnum(access[0]);
+
+    if (!isVerifiedStdArrayListExpression(query, receiver)) return false;
+
+    const loop_node = findEnclosingWhile(unwrap_node, parent_map, tags) orelse return false;
+    const full = tree.fullWhile(@enumFromInt(loop_node)) orelse return false;
+    const condition = @intFromEnum(full.ast.cond_expr);
+    // The condition decides entry; the unwrap must live in the body or in the
+    // `while (cond) : (payload)` continue payload, never in the condition or
+    // in the `else` branch.
+    if (isInSubtree(tree, condition, unwrap_node)) return false;
+    if (full.ast.else_expr.unwrap()) |else_node| {
+        if (isInSubtree(tree, @intFromEnum(else_node), unwrap_node)) return false;
+    }
+    const body = @intFromEnum(full.ast.then_expr);
+    if (body >= tags.len) return false;
+    const continue_payload: ?u32 = if (full.ast.cont_expr.unwrap()) |cont| @intFromEnum(cont) else null;
+    const in_body = isInSubtree(tree, body, unwrap_node);
+    const in_continue = if (continue_payload) |cont| isInSubtree(tree, cont, unwrap_node) else false;
+    if (!in_body and !in_continue) return false;
+    if (!conditionProvesPositiveLength(query, tree, condition, receiver, tags, datas)) return false;
+
+    // A nested loop can reach the unwrap on a later iteration, after an earlier
+    // removal consumed the length this iteration's condition proved.
+    if (nestedLoopEncloses(unwrap_node, loop_node, parent_map, tags)) return false;
+
+    if (containerBodyMayMutate(query, body, receiver, unwrap_node, type_context)) return false;
+    if (continue_payload) |cont| {
+        if (in_continue and containerBodyMayMutate(query, cont, receiver, unwrap_node, type_context)) return false;
+    }
+    return true;
+}
+
+fn findEnclosingWhile(
+    unwrap_node: u32,
+    parent_map: []const u32,
+    tags: []const std.zig.Ast.Node.Tag,
+) ?u32 {
+    var node = unwrap_node;
+    var depth: u32 = 0;
+    while (node < parent_map.len and depth < 64) : (depth += 1) {
+        const parent = parent_map[node];
+        if (parent == 0 or parent >= tags.len) return null;
+        switch (tags[parent]) {
+            .@"while", .while_simple, .while_cont => return parent,
+            else => {},
+        }
+        node = parent;
+    }
+    return null;
+}
+
+/// A loop strictly between the guarded `while` and the unwrap can iterate again
+/// after an earlier removal, so the condition no longer bounds the list.
+fn nestedLoopEncloses(
+    unwrap_node: u32,
+    boundary: u32,
+    parent_map: []const u32,
+    tags: []const std.zig.Ast.Node.Tag,
+) bool {
+    if (unwrap_node >= parent_map.len) return false;
+    var ancestor = parent_map[unwrap_node];
+    var depth: u32 = 0;
+    while (depth < 64 and ancestor != 0 and ancestor < tags.len and ancestor != boundary) : (depth += 1) {
+        switch (tags[ancestor]) {
+            .@"for", .for_simple, .@"while", .while_simple, .while_cont => return true,
+            else => {},
+        }
+        ancestor = parent_map[ancestor];
+    }
+    return false;
+}
+
+/// Everything the loop evaluates before the unwrap must leave the container's
+/// length alone. A node that merely *spans* the unwrap — the `if`, `switch`
+/// prong or block that encloses it — is descended into so the statements
+/// preceding the unwrap inside it are still inspected. The unwrap subtree is
+/// pruned before descending: its operand is the very removal the condition
+/// proved, not a competing mutation. Everything tokenised after the unwrap is
+/// skipped as well.
+fn containerBodyMayMutate(
+    query: *const QueryContext,
+    root: u32,
+    target: u32,
+    unwrap_node: u32,
+    type_context: ?*TypeContext,
+) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    // An unwrap's first and last token are both the `.?`, so the guarded
+    // region starts at the operand the removal produces.
+    const unwrap_first = if (unwrap_node < tags.len and tags[unwrap_node] == .unwrap_optional)
+        query.firstToken(@intFromEnum(datas[unwrap_node].node_and_token[0]))
+    else
+        query.firstToken(unwrap_node);
+    const unwrap_last = query.lastToken(unwrap_node);
+
+    const Scan = struct {
+        query: *const QueryContext,
+        target: u32,
+        unwrap_node: u32,
+        unwrap_first: u32,
+        unwrap_last: u32,
+        block: u32,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        type_context: ?*TypeContext,
+        found: bool = false,
+        stop: bool = false,
+
+        const Self = @This();
+
+        pub fn visit(self: *Self, _: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
+            if (isAssignmentTag(tag)) {
+                if (tag == .assign_destructure) {
+                    const destruct = self.query.tree.assignDestructure(@enumFromInt(node));
+                    for (destruct.ast.variables) |variable| {
+                        if (storageWriteMayAffect(
+                            self.query,
+                            @intFromEnum(variable),
+                            self.target,
+                            self.block,
+                            self.type_context,
+                        )) {
+                            self.found = true;
+                            self.stop = true;
+                            return;
+                        }
+                    }
+                } else {
+                    const lhs = @intFromEnum(self.datas[node].node_and_node[0]);
+                    if (storageWriteMayAffect(self.query, lhs, self.target, self.block, self.type_context)) {
+                        self.found = true;
+                        self.stop = true;
+                        return;
+                    }
+                }
+            }
+            switch (tag) {
+                .call, .call_comma, .call_one, .call_one_comma => {
+                    if (callMayMutateStorage(self.query, node, self.target, self.tags, self.datas, self.type_context)) {
+                        self.found = true;
+                        self.stop = true;
+                    }
+                },
+                .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                    if (builtinCallMayMutateStorage(self.query, node, self.target, self.tags, self.datas, self.type_context)) {
+                        self.found = true;
+                        self.stop = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        /// Children are filtered before the walk descends, so a pruned node
+        /// leaves its whole subtree unvisited rather than merely unexamined.
+        fn step(inner_tree: *const std.zig.Ast, node: u32, self: *Self) anyerror!void {
+            if (self.stop) return;
+            if (self.pruned(node)) return;
+            return self.scan(inner_tree, node);
+        }
+
+        fn scan(self: *Self, inner_tree: *const std.zig.Ast, node: u32) !void {
+            if (self.stop) return;
+            const inner_tags = inner_tree.nodes.items(.tag);
+            if (node >= inner_tags.len) return;
+            try self.visit(inner_tree, node, inner_tags[node]);
+            if (self.stop) return;
+            ast_walk.walkChildren(Self, inner_tree, node, self, Self.step) catch unreachable;
+        }
+
+        /// The unwrap node, its operand and everything the `.?` closes over
+        /// start at or after the operand's first token and end at or before the
+        /// `.?`; a node that merely spans the unwrap starts before it.
+        fn pruned(self: *Self, node: u32) bool {
+            if (node == self.unwrap_node) return true;
+            const first = self.query.firstToken(node);
+            if (first > self.unwrap_last) return true;
+            if (first < self.unwrap_first) return false;
+            return self.query.lastToken(node) <= self.unwrap_last;
+        }
+    };
+
+    var scan = Scan{
+        .query = query,
+        .target = target,
+        .unwrap_node = unwrap_node,
+        .unwrap_first = unwrap_first,
+        .unwrap_last = unwrap_last,
+        .block = root,
+        .tags = tags,
+        .datas = datas,
+        .type_context = type_context,
+    };
+    scan.scan(tree, root) catch unreachable;
+    return scan.found;
+}
+
+/// `<receiver>.items.len != 0`, `> 0` or `>= 1`.
+fn conditionProvesPositiveLength(
+    query: *const QueryContext,
+    tree: *const std.zig.Ast,
+    cond_node: u32,
+    receiver: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    if (cond_node >= tags.len) return false;
+    switch (tags[cond_node]) {
+        .bang_equal, .greater_than, .greater_or_equal => {},
+        else => return false,
+    }
+    const length = @intFromEnum(datas[cond_node].node_and_node[0]);
+    const literal = @intFromEnum(datas[cond_node].node_and_node[1]);
+    if (literal >= tree.nodes.len) return false;
+    const literal_text = tree.tokenSlice(tree.nodeMainToken(@enumFromInt(literal)));
+    return switch (tags[cond_node]) {
+        .bang_equal => isContainerItemsLength(query, tree, length, receiver, tags, datas) and
+            std.mem.eql(u8, literal_text, "0"),
+        .greater_than => isContainerItemsLength(query, tree, length, receiver, tags, datas) and
+            std.mem.eql(u8, literal_text, "0"),
+        .greater_or_equal => isContainerItemsLength(query, tree, length, receiver, tags, datas) and
+            std.mem.eql(u8, literal_text, "1"),
+        else => false,
+    };
+}
+
+fn isContainerItemsLength(
+    query: *const QueryContext,
+    tree: *const std.zig.Ast,
+    node: u32,
+    receiver: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    if (node >= tags.len or tags[node] != .field_access) return false;
+    const access = datas[node].node_and_token;
+    if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(access[1])), "len")) return false;
+    const items = @intFromEnum(access[0]);
+    if (items >= tags.len or tags[items] != .field_access) return false;
+    const items_access = datas[items].node_and_token;
+    if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(items_access[1])), "items")) return false;
+    // The container that owns `.items` must be the popping receiver itself, so
+    // a local, a `*list` deref and a `holder.list` field all compare directly.
+    return sameStoragePath(query, tree, @intFromEnum(items_access[0]), receiver, tags, datas);
+}
+
+/// Same root binding *and* same field chain: `p.waiters` matches `p.waiters`
+/// but not `p.other` and not `self.waiters`.
+fn sameStoragePath(
+    query: *const QueryContext,
+    tree: *const std.zig.Ast,
+    left: u32,
+    right: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    var a = left;
+    var b = right;
+    var depth: u32 = 0;
+    while (depth < 16) : (depth += 1) {
+        if (a >= tags.len or b >= tags.len) return false;
+        if (tags[a] == .grouped_expression) {
+            a = @intFromEnum(datas[a].node_and_token[0]);
+            continue;
+        }
+        if (tags[b] == .grouped_expression) {
+            b = @intFromEnum(datas[b].node_and_token[0]);
+            continue;
+        }
+        if (tags[a] == .deref) {
+            a = @intFromEnum(datas[a].node);
+            continue;
+        }
+        if (tags[b] == .deref) {
+            b = @intFromEnum(datas[b].node);
+            continue;
+        }
+        if (tags[a] == .field_access and tags[b] == .field_access) {
+            const left_access = datas[a].node_and_token;
+            const right_access = datas[b].node_and_token;
+            if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(left_access[1])), import_resolver.normalizeIdentifier(tree.tokenSlice(right_access[1])))) return false;
+            a = @intFromEnum(left_access[0]);
+            b = @intFromEnum(right_access[0]);
+            continue;
+        }
+        if (tags[a] == .identifier and tags[b] == .identifier) {
+            return sameIdentifierBinding(query, a, b);
+        }
+        return false;
+    }
+    return false;
+}
+
+/// The receiver must be a local, a parameter or a field whose *declared* type
+/// is the verified `std.ArrayList`/`std.ArrayListUnmanaged` generic, so a
+/// project type with its own `pop` never reaches the removal contract.
+fn isVerifiedStdArrayListExpression(query: *const QueryContext, expr: u32) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    if (expr >= tags.len) return false;
+    switch (tags[expr]) {
+        .grouped_expression => return isVerifiedStdArrayListExpression(
+            query,
+            @intFromEnum(datas[expr].node_and_token[0]),
+        ),
+        // `list.pop()`, `list.*.pop()` and a `*std.ArrayList(T)` receiver all
+        // reach the same contract; the declared type is read from the binding.
+        .identifier, .deref => {
+            const base = if (tags[expr] == .deref) @intFromEnum(datas[expr].node) else expr;
+            if (tags[base] != .identifier) return false;
+            const declared = bindingTypeExprNode(query, base) orelse return false;
+            return isVerifiedStdArrayListTypeNode(query, tree, declared, tags, datas);
+        },
+        .field_access => {
+            const declared = fieldTypeNode(query, expr) orelse return false;
+            return isVerifiedStdArrayListTypeNode(query, tree, declared, tags, datas);
+        },
+        else => return false,
+    }
+}
+
+/// The type expression a `holder.list` access reads. The owner's container
+/// comes from the base expression's resolved type; when expression
+/// resolution cannot name one, the base binding's own declared type names it
+/// instead, so a file-scope `const Holder = struct {...}` reached through
+/// `*Holder` still resolves. Either way the member is read from that
+/// container's own declaration, never from the name at the use site.
+fn fieldTypeNode(query: *const QueryContext, access: u32) ?u32 {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    if (access >= tags.len or tags[access] != .field_access) return null;
+    const pair = datas[access].node_and_token;
+    if (pair[1] >= tree.tokens.len) return null;
+    const field_name = import_resolver.normalizeIdentifier(tree.tokenSlice(pair[1]));
+
+    // The resolver only ever sees this file, so every container and member it
+    // reports is an index into `tree`.
+    const files = [_]import_resolver.File{.{ .path = "", .tree = tree, .lexical_index = query.lexical }};
+    const resolver = call_utils.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+    const base = @intFromEnum(pair[0]);
+    if (resolver.resolveExprType(base)) |owner| {
+        if (owner.container_node != null) {
+            if (resolver.resolveFieldTypeNode(owner, field_name)) |field| return field.node_index;
+        }
+    }
+    // A root container type is a declaration, not an expression type, so the
+    // base binding's declared type is the only remaining evidence. The
+    // resolver already peels pointer, optional and error-union layers.
+    const declared = bindingTypeExprNode(query, base) orelse return null;
+    if (resolver.resolveTypeNode(declared)) |owner| {
+        if (owner.container_node != null) {
+            if (resolver.resolveFieldTypeNode(owner, field_name)) |field| return field.node_index;
+        }
+    }
+    const container = containerDeclForTypeName(tree, declared, tags, datas) orelse return null;
+    return containerMemberTypeNode(tree, container, field_name, tags);
+}
+
+/// The container a declared type names. Pointer, optional and error-union
+/// layers reach the carried value, and what is left must be a plain type name
+/// whose file-scope declaration spells a struct or a union. Struct *literals*
+/// are deliberately not accepted — a root declaration initialised with one
+/// holds a value, not a container definition — and every other spelling
+/// leaves the container unknown.
+fn containerDeclForTypeName(
+    tree: *const std.zig.Ast,
+    type_node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) ?u32 {
+    const main_tokens = tree.nodes.items(.main_token);
+    var node = type_node;
+    for (0..8) |_| {
+        if (node >= tags.len) return null;
+        switch (tags[node]) {
+            .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel => {
+                const pointer = tree.fullPtrType(@enumFromInt(node)) orelse return null;
+                node = @intFromEnum(pointer.ast.child_type);
+            },
+            .optional_type => node = @intFromEnum(datas[node].node),
+            .error_union => node = @intFromEnum(datas[node].node_and_node[1]),
+            else => break,
+        }
+    }
+    if (node >= tags.len or tags[node] != .identifier or node >= main_tokens.len) return null;
+    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(main_tokens[node]));
+    for (tree.rootDecls()) |decl| {
+        const decl_node = @intFromEnum(decl);
+        if (decl_node >= tags.len or !import_resolver.isVarDeclTag(tags[decl_node])) continue;
+        const full = tree.fullVarDecl(@enumFromInt(decl_node)) orelse continue;
+        const name_token = full.ast.mut_token + 1;
+        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) continue;
+        if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), name)) continue;
+        const initializer = @intFromEnum(full.ast.init_node.unwrap() orelse continue);
+        if (initializer >= tags.len) continue;
+        return switch (tags[initializer]) {
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            => initializer,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// The declared type one member of that container carries, whether it is
+/// spelled `name: T` or `name: T = default`. A member written as a nested
+/// `var`/`const` declaration is read the same way.
+fn containerMemberTypeNode(
+    tree: *const std.zig.Ast,
+    container: u32,
+    field_name: []const u8,
+    tags: []const std.zig.Ast.Node.Tag,
+) ?u32 {
+    if (container >= tags.len) return null;
+    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+    const decl = tree.fullContainerDecl(&buffer, @enumFromInt(container)) orelse return null;
+    for (decl.ast.members) |member| {
+        const member_node = @intFromEnum(member);
+        if (member_node >= tags.len) continue;
+        if (!memberIsNamed(tree, member_node, field_name)) continue;
+        switch (tags[member_node]) {
+            .container_field, .container_field_init, .container_field_align => {
+                const field = tree.fullContainerField(@enumFromInt(member_node)) orelse continue;
+                if (field.ast.type_expr.unwrap()) |type_node| return @intFromEnum(type_node);
+            },
+            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+                const full = tree.fullVarDecl(@enumFromInt(member_node)) orelse continue;
+                if (full.ast.type_node.unwrap()) |type_node| return @intFromEnum(type_node);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// True when a container member carries the name a field access reads, so
+/// `holder.list` picks the `list` member and never a same-spelled one
+/// elsewhere in the container.
+fn memberIsNamed(tree: *const std.zig.Ast, member: u32, field_name: []const u8) bool {
+    if (member >= tree.nodes.len) return false;
+    var name_token: u32 = undefined;
+    switch (tree.nodeTag(@enumFromInt(member))) {
+        .container_field, .container_field_init, .container_field_align => {
+            const field = tree.fullContainerField(@enumFromInt(member)) orelse return false;
+            if (field.ast.tuple_like) return false;
+            name_token = @intCast(field.ast.main_token);
+        },
+        .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+            const full = tree.fullVarDecl(@enumFromInt(member)) orelse return false;
+            name_token = @intCast(full.ast.mut_token + 1);
+        },
+        else => return false,
+    }
+    if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) return false;
+    return std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), field_name);
+}
+
+/// The type expression written for the binding an identifier resolves to: the
+/// declared type of a `var`/`const`, or the parameter's own type node.
+fn bindingTypeExprNode(query: *const QueryContext, identifier: u32) ?u32 {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    if (identifier >= tags.len or tags[identifier] != .identifier) return null;
+    const binding = query.resolveIdentifierBinding(identifier) orelse return null;
+    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(tree.nodeMainToken(@enumFromInt(identifier))));
+    for (query.lexical.namedCandidates(name)) |candidate| {
+        if (candidate.name_token != binding) continue;
+        switch (candidate.kind) {
+            .variable => {
+                const full = tree.fullVarDecl(@enumFromInt(candidate.node)) orelse return null;
+                return @intFromEnum(full.ast.type_node.unwrap() orelse return null);
+            },
+            .parameter => {
+                if (tree.fullVarDecl(@enumFromInt(candidate.node))) |full|
+                    return @intFromEnum(full.ast.type_node.unwrap() orelse return null);
+                return candidate.node;
+            },
+            .function => return null,
+        }
+    }
+    return null;
+}
+
+fn isVerifiedStdArrayListTypeNode(
+    query: *const QueryContext,
+    tree: *const std.zig.Ast,
+    type_node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    // A `*std.ArrayList(T)` declaration reaches the same contract through
+    // auto-deref, so the pointer layers do not change the verdict.
+    var node = type_node;
+    for (0..8) |_| {
+        if (node >= tags.len) return false;
+        switch (tags[node]) {
+            .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel => {
+                const pointer = tree.fullPtrType(@enumFromInt(node)) orelse return false;
+                node = @intFromEnum(pointer.ast.child_type);
+                continue;
+            },
+            else => break,
+        }
+    }
+    if (node >= tags.len) return false;
+    return isVerifiedStdArrayListValueTypeNode(query, tree, node, tags, datas);
+}
+
+/// The type node itself, with every pointer layer already peeled off: a
+/// by-value `std.ArrayList(T)`, whose instances own an independent copy of
+/// the container header instead of designating the original object.
+fn isVerifiedStdArrayListValueTypeNode(
+    query: *const QueryContext,
+    tree: *const std.zig.Ast,
+    type_node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    if (type_node >= tree.nodes.len) return false;
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, @enumFromInt(type_node)) orelse return false;
+    if (call.ast.params.len != 1) return false;
+    const callee = @intFromEnum(call.ast.fn_expr);
+    if (callee >= tags.len or tags[callee] != .field_access) return false;
+    const access = datas[callee].node_and_token;
+    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(access[1]));
+    if (!std.mem.eql(u8, name, "ArrayList") and !std.mem.eql(u8, name, "ArrayListUnmanaged")) return false;
+
+    const files = [_]import_resolver.File{.{ .path = "", .tree = tree, .lexical_index = query.lexical }};
+    const resolver = call_utils.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+    return resolver.isVerifiedImportBinding(@intFromEnum(access[0]), "std");
 }
 
 fn findEnclosingIfForUnwrap(

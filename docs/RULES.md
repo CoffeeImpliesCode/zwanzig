@@ -381,6 +381,9 @@ Enforces Zig naming conventions:
 - Direct `@import` aliases for namespaces and file structs may use lower_snake_case or PascalCase. Imported value constants must use snake_case.
 - Quoted identifiers (e.g., `@"weird-name"`) are exempt from these checks
 - Explicit `const Name: type = ...` aliases use PascalCase. When type info is available, other type aliases and function type aliases are treated as types and should use PascalCase. Heuristics also treat C-style `*_t` aliases as types (lowercase `*_t` names are allowed when mirroring external conventions like `fd_t`)
+- Type-valued builtin, factory, conditional, and switch expressions use PascalCase. Standard-library factories such as `std.StaticBitSet(256)` require a verified `std` import. A local `std` shadow does not get this exemption.
+- `@typeInfo(T)` returns a value, not a type. Its result uses snake_case.
+- Payloads from `?type` fields of a verified `@typeInfo` switch capture may use PascalCase. Examples include `Union.tag_type` and `Fn.return_type`. Ordinary value payloads still use snake_case.
 
 **Bad:**
 ```zig

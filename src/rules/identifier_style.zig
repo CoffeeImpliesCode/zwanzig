@@ -223,21 +223,28 @@ pub const IdentifierStyleRule = struct {
             }
         }
 
-        const is_known_type_factory = if (is_const)
-            if (init_idx_opt) |init_idx|
-                isKnownTypeFactoryCall(tree, tags, datas, token_tags, init_idx)
-            else
-                false
-        else
-            false;
+        // Type-valued initializers are proved from the expression itself: ZIR
+        // only sees the call/conditional node of a type expression and reports
+        // its result as an unknown value, so this evidence must be collected
+        // before the ZIR-based classification.
+        const is_type_value_expr = blk: {
+            if (!is_const) break :blk false;
+            const init_idx = init_idx_opt orelse break :blk false;
+            break :blk isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, init_idx);
+        };
 
-        const type_classification: DeclClassification = if (is_explicit_type_alias or is_known_type_factory)
+        const zir_classification = classifyDeclWithTypeInfo(src, name, node_idx);
+        // A ZIR classification that knows the declaration is a plain value is
+        // final. The expression proof is naming-based, so letting it promote a
+        // known value to a type alias would demand PascalCase for a value.
+        const zir_knows_value = zir_classification == .constant or zir_classification == .variable;
+        const type_classification: DeclClassification = if (!zir_knows_value and (is_explicit_type_alias or is_type_value_expr))
             .type_decl
         else
-            classifyDeclWithTypeInfo(src, name, node_idx);
+            zir_classification;
         switch (type_classification) {
             .type_decl => {
-                // ZIR confirms this is a type - must be PascalCase
+                // Proved to be a type value - must be PascalCase
                 if (!isPascalCase(name) and !isCTypeAliasName(name)) {
                     try emitDiagnostic(src, allocator, diagnostics, token_starts[name_token], name, "type", .pascal_case);
                 }
@@ -365,24 +372,60 @@ pub const IdentifierStyleRule = struct {
         }
     }
 
-    fn isKnownTypeFactoryCall(
+    /// Prove that an initializer expression evaluates to a type value.
+    ///
+    /// Only expression forms that cannot be mistaken for a value are accepted:
+    /// a type-producing builtin, a generic type factory call, or a conditional
+    /// or switch expression whose every branch is itself a type value.
+    fn isTypeValueInitExpr(
         tree: *const std.zig.Ast,
         tags: []const std.zig.Ast.Node.Tag,
         datas: []const std.zig.Ast.Node.Data,
+        main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
     ) bool {
         if (init_idx >= tags.len) return false;
-        switch (tags[init_idx]) {
-            .call, .call_comma, .call_one, .call_one_comma => {},
-            else => return false,
-        }
-        var buffer: [1]std.zig.Ast.Node.Index = undefined;
-        const call = tree.fullCall(&buffer, @enumFromInt(init_idx)) orelse return false;
-        return isKnownTypeFactoryCallee(tree, tags, datas, token_tags, @intFromEnum(call.ast.fn_expr));
+        return switch (tags[init_idx]) {
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
+                const builtin_name = builtinCallName(tree, tags, token_tags, init_idx) orelse break :blk false;
+                break :blk isTypeFactoryBuiltin(builtin_name);
+            },
+            .call, .call_comma, .call_one, .call_one_comma => isTypeFactoryCall(
+                tree,
+                tags,
+                datas,
+                main_tokens,
+                token_tags,
+                init_idx,
+            ),
+            .@"switch", .switch_comma => isTypeSwitchAlias(
+                tree,
+                tags,
+                datas,
+                main_tokens,
+                token_tags,
+                init_idx,
+            ),
+            .@"if", .if_simple => isTypeIfAlias(
+                tree,
+                tags,
+                datas,
+                main_tokens,
+                token_tags,
+                init_idx,
+            ),
+            else => false,
+        };
     }
 
-    fn isKnownTypeFactoryCallee(
+    /// A member of the verified `std` import whose name is PascalCase names a
+    /// standard-library type, so calling it instantiates that type.
+    ///
+    /// Zig keeps type names PascalCase and function names camelCase, so the
+    /// member name distinguishes the two, and the import binding is verified
+    /// rather than name-matched, so a local `std` shadow gets no exemption.
+    fn isVerifiedStdTypeMemberCallee(
         tree: *const std.zig.Ast,
         tags: []const std.zig.Ast.Node.Tag,
         datas: []const std.zig.Ast.Node.Data,
@@ -393,7 +436,7 @@ pub const IdentifierStyleRule = struct {
         const access = datas[node_idx].node_and_token;
         const field_token = access[1];
         if (field_token >= token_tags.len or token_tags[field_token] != .identifier) return false;
-        if (!isKnownTypeFactoryName(tree.tokenSlice(field_token))) return false;
+        if (!isPascalCase(tree.tokenSlice(field_token))) return false;
         return isStdQualifiedValue(
             tree,
             tags,
@@ -401,17 +444,6 @@ pub const IdentifierStyleRule = struct {
             token_tags,
             @intFromEnum(access[0]),
         );
-    }
-
-    fn isKnownTypeFactoryName(name: []const u8) bool {
-        return std.mem.eql(u8, name, "HashMap") or
-            std.mem.eql(u8, name, "HashMapUnmanaged") or
-            std.mem.eql(u8, name, "AutoHashMap") or
-            std.mem.eql(u8, name, "AutoHashMapUnmanaged") or
-            std.mem.eql(u8, name, "StringHashMap") or
-            std.mem.eql(u8, name, "StringHashMapUnmanaged") or
-            std.mem.eql(u8, name, "ArrayHashMap") or
-            std.mem.eql(u8, name, "ArrayHashMapUnmanaged");
     }
 
     fn isStdQualifiedValue(
@@ -631,9 +663,18 @@ pub const IdentifierStyleRule = struct {
         return tree.tokenSlice(builtin_token);
     }
 
+    /// Builtins whose result is a type value. `@FieldType` is matched on its
+    /// builtin token, so a local function of the same name cannot borrow the
+    /// type classification.
+    ///
+    /// `@typeInfo` is deliberately absent: it evaluates to a `std.builtin.Type`
+    /// union *value*, not a type. `@TypeOf(@typeInfo(T))` is a type and is
+    /// covered by `@TypeOf`; a `?type` payload reached through a
+    /// `@typeInfo(...)` switch is covered by `isTypeInfoTypeFieldAccess`.
     fn isTypeFactoryBuiltin(name: []const u8) bool {
         return std.mem.eql(u8, name, "@TypeOf") or
             std.mem.eql(u8, name, "@Type") or
+            std.mem.eql(u8, name, "@FieldType") or
             std.mem.eql(u8, name, "@This") or
             std.mem.eql(u8, name, "@OpaqueType") or
             std.mem.eql(u8, name, "@Vector") or
@@ -787,7 +828,7 @@ pub const IdentifierStyleRule = struct {
         const call_info = tree.fullCall(&buf, @enumFromInt(init_idx)) orelse return false;
         const callee_idx = @intFromEnum(call_info.ast.fn_expr);
         if (!isTypeAliasCallee(tree, tags, datas, token_tags, callee_idx)) return false;
-        const is_verified_std_factory = isKnownTypeFactoryCallee(
+        const is_verified_std_type = isVerifiedStdTypeMemberCallee(
             tree,
             tags,
             datas,
@@ -802,7 +843,7 @@ pub const IdentifierStyleRule = struct {
                 saw_type_arg = true;
                 continue;
             }
-            if (is_verified_std_factory and isStdQualifiedValue(tree, tags, datas, token_tags, arg_idx)) {
+            if (is_verified_std_type and isStdQualifiedValue(tree, tags, datas, token_tags, arg_idx)) {
                 continue;
             }
             if (isTypeFactoryLiteral(tags, datas, arg_idx)) {
@@ -811,7 +852,10 @@ pub const IdentifierStyleRule = struct {
             return false;
         }
 
-        return saw_type_arg;
+        // A type argument is the usual proof, but a standard-library type
+        // instantiated from literal arguments only (`std.StaticBitSet(256)`)
+        // is just as conclusive once the callee is proved to be a type.
+        return saw_type_arg or is_verified_std_type;
     }
 
     fn isTypeFactoryLiteral(
@@ -1085,6 +1129,13 @@ pub const IdentifierStyleRule = struct {
         return has_upper;
     }
 
+    /// What a capture binds. A capture of a `?type` field binds a type value,
+    /// which follows the PascalCase rule instead of the snake_case value rule.
+    const PayloadKind = enum {
+        value,
+        type_value,
+    };
+
     fn checkSnakeCaseToken(
         src: *Source,
         allocator: std.mem.Allocator,
@@ -1094,10 +1145,12 @@ pub const IdentifierStyleRule = struct {
         token_starts: []const u32,
         token: u32,
         kind: []const u8,
+        capture: PayloadKind,
     ) RuleError!void {
         if (token >= token_tags.len or token_tags[token] != .identifier) return;
         const name = tree.tokenSlice(token);
         if (shouldSkipName(name)) return;
+        if (capture == .type_value and isPascalCase(name)) return;
         if (!isLowerSnakeCase(name)) {
             try emitDiagnostic(src, allocator, diagnostics, token_starts[token], name, kind, .snake_case);
         }
@@ -1148,11 +1201,12 @@ pub const IdentifierStyleRule = struct {
         token_starts: []const u32,
     ) RuleError!void {
         const full_if = tree.fullIf(@enumFromInt(node_idx)) orelse return;
+        const capture = conditionCaptureKind(tree, token_tags, @intFromEnum(full_if.ast.cond_expr));
         if (full_if.payload_token) |tok| {
-            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload");
+            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload", capture);
         }
         if (full_if.error_token) |tok| {
-            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload");
+            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload", .value);
         }
     }
 
@@ -1173,11 +1227,12 @@ pub const IdentifierStyleRule = struct {
             else => return,
         };
 
+        const capture = conditionCaptureKind(tree, token_tags, @intFromEnum(full_while.ast.cond_expr));
         if (full_while.payload_token) |tok| {
-            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload");
+            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload", capture);
         }
         if (full_while.error_token) |tok| {
-            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload");
+            try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload", .value);
         }
     }
 
@@ -1213,7 +1268,7 @@ pub const IdentifierStyleRule = struct {
         for (full_switch.ast.cases) |case_node| {
             const full_case = tree.fullSwitchCase(case_node) orelse continue;
             if (full_case.payload_token) |tok| {
-                try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload");
+                try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, tok, "payload", .value);
             }
         }
     }
@@ -1231,7 +1286,7 @@ pub const IdentifierStyleRule = struct {
         const catch_token = main_tokens[node_idx];
         if (catch_token + 2 >= token_tags.len) return;
         if (token_tags[catch_token + 1] != .pipe) return;
-        try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, catch_token + 2, "payload");
+        try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, catch_token + 2, "payload", .value);
     }
 
     fn checkErrdeferPayload(
@@ -1245,7 +1300,7 @@ pub const IdentifierStyleRule = struct {
     ) RuleError!void {
         const data = tree.nodes.items(.data)[node_idx].opt_token_and_node;
         const payload_token = data[0].unwrap() orelse return;
-        try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, payload_token, "payload");
+        try checkPayloadToken(src, allocator, diagnostics, tree, token_tags, token_starts, payload_token, "payload", .value);
     }
 
     fn checkPayloadToken(
@@ -1257,13 +1312,14 @@ pub const IdentifierStyleRule = struct {
         token_starts: []const u32,
         token: u32,
         kind: []const u8,
+        capture: PayloadKind,
     ) RuleError!void {
         if (token >= token_tags.len) return;
         var idx = token;
         if (token_tags[idx] == .pipe) idx += 1;
         if (idx < token_tags.len and token_tags[idx] == .asterisk) idx += 1;
         if (idx < token_tags.len and token_tags[idx] == .identifier) {
-            try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, kind);
+            try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, kind, capture);
         }
     }
 
@@ -1286,14 +1342,104 @@ pub const IdentifierStyleRule = struct {
             if (tag == .asterisk) {
                 idx += 1;
                 if (idx < token_tags.len and token_tags[idx] == .identifier) {
-                    try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, "payload");
+                    try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, "payload", .value);
                 }
                 continue;
             }
             if (tag == .identifier) {
-                try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, "payload");
+                try checkSnakeCaseToken(src, allocator, diagnostics, tree, token_tags, token_starts, idx, "payload", .value);
             }
         }
+    }
+
+    /// Decide what an `if`/`while` capture binds from the operand expression.
+    fn conditionCaptureKind(
+        tree: *const std.zig.Ast,
+        token_tags: []const std.zig.Token.Tag,
+        cond_idx: usize,
+    ) PayloadKind {
+        if (isTypeInfoTypeFieldAccess(tree, token_tags, cond_idx)) return .type_value;
+        return .value;
+    }
+
+    /// Prove that the operand is a `?type` field of a `@typeInfo` payload.
+    ///
+    /// `std.builtin.Type` declares exactly these payload fields as `?type`
+    /// (`Struct.backing_integer`, `Union.tag_type`, `Fn.return_type`,
+    /// `Fn.Param.type`, `AnyFrame.child`), so capturing one binds a type value
+    /// rather than a value. The receiver has to be a payload captured from a
+    /// `@typeInfo(...)` switch, and both the builtin token and the std payload
+    /// names are matched, so a local `typeInfo` function or an unrelated
+    /// `tag_type` field gets no exemption.
+    fn isTypeInfoTypeFieldAccess(
+        tree: *const std.zig.Ast,
+        token_tags: []const std.zig.Token.Tag,
+        cond_idx: usize,
+    ) bool {
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        const main_tokens = tree.nodes.items(.main_token);
+        if (cond_idx >= tags.len) return false;
+
+        var node = cond_idx;
+        while (tags[node] == .unwrap_optional or tags[node] == .grouped_expression) {
+            node = @intFromEnum(datas[node].node_and_token[0]);
+            if (node >= tags.len) return false;
+        }
+        if (tags[node] != .field_access) return false;
+
+        const field_token = datas[node].node_and_token[1];
+        if (field_token >= token_tags.len or token_tags[field_token] != .identifier) return false;
+        if (!isOptionalTypeInfoFieldName(tree.tokenSlice(field_token))) return false;
+
+        const receiver_idx = @intFromEnum(datas[node].node_and_token[0]);
+        if (receiver_idx >= tags.len or tags[receiver_idx] != .identifier) return false;
+        const receiver_token = main_tokens[receiver_idx];
+        if (receiver_token >= token_tags.len or token_tags[receiver_token] != .identifier) return false;
+
+        return isTypeInfoSwitchCapture(
+            tree,
+            tags,
+            datas,
+            token_tags,
+            tree.tokenSlice(receiver_token),
+            receiver_token,
+        );
+    }
+
+    fn isOptionalTypeInfoFieldName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "tag_type") or
+            std.mem.eql(u8, name, "backing_integer") or
+            std.mem.eql(u8, name, "return_type") or
+            std.mem.eql(u8, name, "child") or
+            std.mem.eql(u8, name, "type");
+    }
+
+    /// Prove that `name` is a capture of a prong of a `switch (@typeInfo(...))`
+    /// that encloses `reference_token`.
+    fn isTypeInfoSwitchCapture(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        name: []const u8,
+        reference_token: u32,
+    ) bool {
+        for (tags, 0..) |tag, node_index| {
+            if (tag != .@"switch" and tag != .switch_comma) continue;
+            const switch_node: std.zig.Ast.Node.Index = @enumFromInt(node_index);
+            if (tree.firstToken(switch_node) > reference_token) continue;
+            if (tree.lastToken(switch_node) < reference_token) continue;
+            const full_switch = tree.switchFull(switch_node);
+            if (!isTypeInfoBaseExpr(tree, tags, datas, token_tags, @intFromEnum(full_switch.ast.condition))) continue;
+            for (full_switch.ast.cases) |case_node| {
+                const full_case = tree.fullSwitchCase(case_node) orelse continue;
+                const payload_token = full_case.payload_token orelse continue;
+                if (payload_token >= token_tags.len or token_tags[payload_token] != .identifier) continue;
+                if (std.mem.eql(u8, tree.tokenSlice(payload_token), name)) return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -1488,4 +1634,308 @@ test "skript control: shadowed std binding rejects factory exemption" {
     try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "RuntimeMap") != null);
+}
+
+test "@FieldType type alias still requires PascalCase" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const FnTableEntry = struct { closure_sites: []const u32 };
+        \\const ClosureSites = @FieldType(FnTableEntry, "closure_sites");
+        \\const closure_sites = @FieldType(FnTableEntry, "closure_sites");
+    ;
+    var source = Source.init(allocator, "type-builtin.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.items[0].range.start.line);
+}
+
+test "@typeInfo result is a value, so a snake_case name is accepted" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const type_info = @typeInfo(u8);
+        \\const fn_info = @typeInfo(fn () void).@"fn";
+    ;
+    var source = Source.init(allocator, "typeinfo-value.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "@typeInfo result is a value, so a PascalCase name is reported" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const TypeInfo = @typeInfo(u8);
+    ;
+    var source = Source.init(allocator, "typeinfo-value.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items[0].range.start.line);
+}
+
+test "@TypeOf of a @typeInfo value is a type, so a PascalCase alias is kept" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const TypeOfInfo = @TypeOf(@typeInfo(u8));
+        \\const type_of_info = @TypeOf(@typeInfo(u8));
+    ;
+    var source = Source.init(allocator, "typeof-typeinfo.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items[0].range.start.line);
+}
+
+test "standard-library type instantiated from literal arguments only keeps a PascalCase alias" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const FiniteParameters = std.StaticBitSet(256);
+        \\const finite_parameters = std.StaticBitSet(256);
+    ;
+    var source = Source.init(allocator, "std-factory.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.items[0].range.start.line);
+}
+
+test "conditional type alias requires a type value in every branch" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\const win = struct { pub const HMODULE = void; };
+        \\const NativeLibraryHandle = if (builtin.os.tag == .windows)
+        \\    win.HMODULE
+        \\else if (builtin.link_mode == .static)
+        \\    @FieldType(std.DynLib, "inner")
+        \\else
+        \\    std.DynLib;
+        \\const MixedAlias = if (builtin.os.tag == .windows) win.HMODULE else 1;
+    ;
+    var source = Source.init(allocator, "conditional-type.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 10), diagnostics.items[0].range.start.line);
+}
+
+test "control: shadowed std binding rejects a literal-only type instantiation" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn probe() void {
+        \\    const std = struct {
+        \\        pub const Bits = fn (comptime n: u8) u8;
+        \\    };
+        \\    const BitCount = std.Bits(3);
+        \\    _ = BitCount;
+        \\}
+    ;
+    var source = Source.init(allocator, "shadowed-factory.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 6), diagnostics.items[0].range.start.line);
+}
+
+test "capture of a typeInfo ?type payload binds a type value" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn trace(comptime T: type) void {
+        \\    switch (@typeInfo(T)) {
+        \\        .@"union" => |info| {
+        \\            if (info.tag_type) |Tag| {
+        \\                _ = @sizeOf(Tag);
+        \\            }
+        \\            while (info.tag_type) |Inner| {
+        \\                _ = @sizeOf(Inner);
+        \\            } else {}
+        \\            if (info.fields) |Fields| {
+        \\                _ = Fields.len;
+        \\            }
+        \\        },
+        \\        else => {},
+        \\    }
+        \\}
+    ;
+    var source = Source.init(allocator, "typeinfo-capture.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 11), diagnostics.items[0].range.start.line);
+}
+
+test "control: a local typeInfo function payload is a value capture" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Info = struct { tag_type: ?u8 = null };
+        \\fn typeInfo(comptime T: type) Info {
+        \\    _ = T;
+        \\    return .{};
+        \\}
+        \\fn probe() void {
+        \\    const info = typeInfo(u8);
+        \\    if (info.tag_type) |Tag| {
+        \\        _ = Tag;
+        \\    }
+        \\}
+    ;
+    var source = Source.init(allocator, "fake-typeinfo.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 8), diagnostics.items[0].range.start.line);
+}
+
+test "switch mixing a type and a value gains no type authority" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const builtin = @import("builtin");
+        \\const TypedChoice = switch (builtin.os.tag) {
+        \\    .windows => std.DynLib,
+        \\    else => 0,
+        \\};
+        \\const typed_choice = switch (builtin.os.tag) {
+        \\    .windows => std.DynLib,
+        \\    else => 0,
+        \\};
+    ;
+    var source = Source.init(allocator, "switch-mixed.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.items[0].range.start.line);
+}
+
+test "skript residual: real type aliases are kept and a snake_case type alias is reported" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Ast = @This();
+        \\const Budget = @This();
+        \\const FiniteParameters = std.StaticBitSet(256);
+        \\const RuntimeMap = std.HashMap(MapKey, Value, MapKey.Context, std.hash_map.default_max_load_percentage);
+        \\const TypeOf = @TypeOf(0);
+        \\const elf_dyn_lib = @FieldType(std.DynLib, "inner");
+    ;
+    var source = Source.init(allocator, "skript-type-alias.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings("identifier-style", diagnostics.items[0].rule_id);
+    try std.testing.expectEqual(@as(usize, 7), diagnostics.items[0].range.start.line);
+}
+
+test "skript residual: a snake_case @typeInfo value binding is accepted" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn intrinsicType(comptime func: anytype) void {
+        \\    const func_info = @typeInfo(@TypeOf(func)).@"fn";
+        \\    _ = func_info;
+        \\}
+    ;
+    var source = Source.init(allocator, "skript-typeinfo.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }

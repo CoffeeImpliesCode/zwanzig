@@ -205,10 +205,21 @@ pub fn parseCliArgs(io_context: *compat.Context, allocator: std.mem.Allocator, a
             CliError.InvalidNumericValue => {
                 writeError(io_context, "Error: Invalid numeric value for limit\n");
             },
+            CliError.UnknownFlag => {
+                writeError(io_context, "Error: Unknown option. Options take a separate value " ++
+                    "(for example --format json); run 'zwanzig --help' for the full list.\n");
+            },
         }
         // zwanzig-enable: empty-catch-engine
         std.process.exit(1);
     };
+}
+
+/// A selection that resolves to no `.zig` files analyzed nothing at all. That
+/// is not the same as analyzing code and finding nothing, so it is reported as
+/// a failure instead of a clean run.
+fn requireInputSelection(files: []const []const u8) error{NoInputFiles}!void {
+    if (files.len == 0) return error.NoInputFiles;
 }
 
 fn loadMergedConfig(io_context: *compat.Context, allocator: std.mem.Allocator, cli_args: CliArgs) MergedConfig {
@@ -313,14 +324,10 @@ pub fn runParsed(allocator: std.mem.Allocator, cli_args: CliArgs, io_context: *c
     defer file_discovery.freeDiscoveredFiles(allocator, files);
     log.info("discovered {d} file(s)", .{files.len});
 
-    if (files.len == 0) {
-        var stderr: compat.OutputWriter = undefined;
-        stderr.init(io_context, true);
-        defer stderr.deinit();
-        try stderr.writer().writeAll("No .zig files found.\n");
-        try stderr.flush();
-        return;
-    }
+    requireInputSelection(files) catch {
+        writeError(io_context, "Error: No .zig files found. Nothing was analyzed.\n");
+        std.process.exit(1);
+    };
 
     var analyzer = Analyzer.initWithContext(allocator, io_context);
     defer analyzer.deinit();
@@ -450,4 +457,9 @@ test "configureBuildMetadata borrows CLI metadata" {
 
     try std.testing.expectEqualStrings("gnu", metadata.target.abi.?);
     try std.testing.expectEqualStrings("gnu", analyzer.getBuildMetadata().?.target.abi.?);
+}
+
+test "requireInputSelection rejects an empty selection" {
+    try std.testing.expectError(error.NoInputFiles, requireInputSelection(&.{}));
+    try requireInputSelection(&[_][]const u8{"src/main.zig"});
 }

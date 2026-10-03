@@ -102,6 +102,10 @@ pub fn scanForUnsafeUnwraps(
         // e.g., `const flag = blk: { x orelse break :blk false; ... }; if (flag) { x.? }`
         if (guards.isGuardedByLabeledBlockInvariant(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
+        // Check the standard container-removal contract: a loop condition that
+        // proves a positive `items.len` proves `std.ArrayList.pop`'s payload.
+        if (guards.isGuardedByContainerLength(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
+
         // Find the CFG node containing this AST node
         const cfg_node_idx = findCfgNodeForAst(cfg, ast_node, tree);
         const node_idx = cfg_node_idx orelse {

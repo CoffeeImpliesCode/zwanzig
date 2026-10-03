@@ -2,7 +2,9 @@ const std = @import("std");
 const compat = @import("compat.zig");
 const ast_walk = @import("ast_walk.zig");
 const call_resolver = @import("analysis/call_resolver.zig");
-const Diagnostic = @import("diagnostic.zig").Diagnostic;
+const diagnostic_mod = @import("diagnostic.zig");
+const Diagnostic = diagnostic_mod.Diagnostic;
+const LocationMapper = diagnostic_mod.LocationMapper;
 const import_resolver = @import("analysis/import_resolver.zig");
 const ProjectSources = @import("project_sources.zig").ProjectSources;
 const ProjectReferenceIndex = @import("analysis/project_reference_index.zig").ProjectReferenceIndex;
@@ -307,6 +309,45 @@ fn buildPathLiteral(
     return literal[1 .. literal.len - 1];
 }
 
+fn isSelectedSource(diagnostic_indices: []const usize, index: usize) bool {
+    for (diagnostic_indices) |selected| {
+        if (selected == index) return true;
+    }
+    return false;
+}
+
+/// Report the syntax errors of a project file that the per-file analysis pass
+/// never diagnoses. Build context is only read by this pass, so without a
+/// diagnostic a build script that does not parse would silently remove
+/// project-wide dead-code detection from an otherwise successful run.
+fn appendContextParseErrors(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(Diagnostic),
+    file: import_resolver.File,
+) !void {
+    var mapper = try LocationMapper.init(allocator, file.tree.source);
+    defer mapper.deinit();
+    var message: std.Io.Writer.Allocating = .init(allocator);
+    defer message.deinit();
+    for (file.tree.errors) |parse_error| {
+        message.writer.end = 0;
+        file.tree.renderError(parse_error, &message.writer) catch return error.OutOfMemory;
+        const offset = file.tree.tokens.items(.start)[parse_error.token] + file.tree.errorOffset(parse_error);
+        const location = mapper.byteToLocation(offset);
+        var diagnostic = try Diagnostic.initAtLocation(
+            allocator,
+            file.path,
+            "parse-error",
+            if (parse_error.is_note) .hint else .err,
+            message.written(),
+            location.line,
+            location.column,
+        );
+        errdefer diagnostic.deinit(allocator);
+        try diagnostics.append(allocator, diagnostic);
+    }
+}
+
 pub fn analyze(
     project_sources: *const ProjectSources,
     allocator: std.mem.Allocator,
@@ -316,9 +357,16 @@ pub fn analyze(
     const diagnostic_indices = project_sources.diagnosticFileIndices();
     if (diagnostic_indices.len < 2) return;
     // Incomplete syntax cannot prove the absence of cross-file references.
-    for (resolver_files) |file| {
-        if (file.tree.errors.len != 0) return;
+    // Selected sources already reported their own parse errors, so only the
+    // build context this pass depends on needs a diagnostic here.
+    var incomplete = false;
+    for (resolver_files, 0..) |file, index| {
+        if (file.tree.errors.len == 0) continue;
+        incomplete = true;
+        if (isSelectedSource(diagnostic_indices, index)) continue;
+        try appendContextParseErrors(allocator, diagnostics, file);
     }
+    if (incomplete) return;
 
     const files = try allocator.alloc(FileInfo, resolver_files.len);
     var file_count: usize = 0;
@@ -1343,11 +1391,20 @@ test "project unused analysis requires complete source and build syntax" {
         \\    _ = b.addModule("fixture", .{ .root_source_file = b.path("b.zig") });
         \\}
     ;
-    const scenarios = [_]struct { source: []const u8, build: []const u8, expected: usize }{
-        .{ .source = "const broken = ;", .build = complete_build, .expected = 0 },
-        .{ .source = complete_source, .build = "const broken = ;", .expected = 0 },
-        .{ .source = complete_source, .build = complete_build, .expected = 2 },
+    const scenarios = [_]struct {
+        source: []const u8,
+        build: []const u8,
+        findings: usize,
+        /// Build context this pass must report itself: no per-file analysis
+        /// pass covers it, so an unparsable one would otherwise remove
+        /// project-wide dead-code detection without a trace.
+        broken_context: ?[]const u8,
+    }{
+        .{ .source = "const broken = ;", .build = complete_build, .findings = 0, .broken_context = null },
+        .{ .source = complete_source, .build = "const broken = ;", .findings = 0, .broken_context = "build.zig" },
+        .{ .source = complete_source, .build = complete_build, .findings = 2, .broken_context = null },
     };
+    const Scenarios = @TypeOf(scenarios);
     const names = [_][]const u8{ "a.zig", "malformed.zig", "b.zig" };
     var buffers: [names.len][std.fs.max_path_bytes]u8 = undefined;
     var paths: [names.len][]const u8 = undefined;
@@ -1355,24 +1412,52 @@ test "project unused analysis requires complete source and build syntax" {
         paths[index] = try std.fmt.bufPrint(&buffers[index], "{s}/{s}", .{ directory.path(), name });
     }
     const Harness = struct {
-        fn run(failing_allocator: std.mem.Allocator, sources: *const ProjectSources, expected: usize) !void {
+        fn run(
+            failing_allocator: std.mem.Allocator,
+            sources: *const ProjectSources,
+            cases: *const Scenarios,
+            case_index: usize,
+        ) !void {
+            const scenario = cases[case_index];
             var diagnostics: std.ArrayList(Diagnostic) = .empty;
             defer {
                 for (diagnostics.items) |*item| item.deinit(failing_allocator);
                 diagnostics.deinit(failing_allocator);
             }
             try analyze(sources, failing_allocator, &diagnostics);
-            try std.testing.expectEqual(expected, diagnostics.items.len);
-            if (expected == 0) return;
+
+            var context_reports: usize = 0;
+            for (diagnostics.items) |diagnostic| {
+                if (!std.mem.eql(u8, diagnostic.rule_id, "parse-error")) continue;
+                context_reports += 1;
+                // A selected source is diagnosed by the per-file pass, so
+                // reporting it again here would only duplicate that report.
+                try std.testing.expect(!std.mem.eql(u8, "malformed.zig", std.fs.path.basename(diagnostic.file_path)));
+                if (scenario.broken_context) |name| {
+                    try std.testing.expectEqualStrings(name, std.fs.path.basename(diagnostic.file_path));
+                }
+            }
+            if (scenario.broken_context) |_| {
+                try std.testing.expect(context_reports > 0);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), context_reports);
+            }
+
+            try std.testing.expectEqual(scenario.findings, diagnostics.items.len - context_reports);
+            if (scenario.findings == 0) return;
             try std.testing.expectEqualStrings("a.zig", std.fs.path.basename(diagnostics.items[0].file_path));
             try std.testing.expectEqualStrings("malformed.zig", std.fs.path.basename(diagnostics.items[1].file_path));
         }
     };
-    for (scenarios) |scenario| {
+    for (scenarios, 0..) |scenario, case_index| {
         try directory.writeFile("malformed.zig", scenario.source);
         try directory.writeFile("build.zig", scenario.build);
         var project = try ProjectSources.init(&io_context, allocator, &paths);
         defer project.deinit();
-        try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{ &project, scenario.expected });
+        try std.testing.checkAllAllocationFailures(
+            allocator,
+            Harness.run,
+            .{ &project, &scenarios, case_index },
+        );
     }
 }

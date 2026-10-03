@@ -10,14 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Syntax errors now produce `parse-error` diagnostics without stopping analysis of valid sibling files. Failed type preflight reports `frontend-error`, skips required typed checks, and preserves optional AST fallback.
+- An analysis that stops at a configured worklist or state budget now reports `analysis-limit-exceeded` for the affected function, naming the limit and the value reached, instead of only logging a warning. Findings that need a complete dataflow analysis of that function are missing rather than absent, so the run can no longer exit 0 with suppressed results.
+- Optional-unwrap proofs now inspect every block statement. Assignments and mutations after statement 64 no longer cause false warnings or hide unsafe unwraps. Ordinary blocks borrow the AST statement slice without allocation or copying.
+- Verified standard-library ArrayList length guards now cover declared local, parameter and struct-field receivers. Mutation checks preserve independent value-copy headers but follow pointer-field, transitive and rebound aliases at each mutation site; the guarded pop does not invalidate its own proof.
+- Optional-unwrap proofs distinguish writes deferred until the current scope exits from writes that already ran in nested scopes. Receiver calls invalidate guards only after their receiver and arguments are evaluated; reassigning an alias slot does not count as a write through the old alias.
+- Lazy-init optional guards now account for writes deferred until the branch exits, including aliased and callee writes. A later assignment cannot restore a non-null proof that a pending defer will invalidate. Normal-exit errdefers and unrelated writes remain safe.
+- Budget-exhaustion diagnostics transfer ownership of their formatted messages without leaking or making a second allocation.
+- A selection that resolves to no `.zig` files now exits 1 and reports `Error: No .zig files found. Nothing was analyzed.` instead of exiting 0 with no report.
+- Unknown `--` options are now rejected. A mistyped flag previously ran a different analysis than the one requested, and the `--flag=value` form was silently dropped and then treated as a path.
+- An unparsable build script now reports its own `parse-error` diagnostics. Project-wide `unused-decl` analysis cannot prove the absence of cross-file references without complete syntax, so it still skips, but the reason is now visible instead of silently removing project-wide dead-code detection.
 - Fixed missed divide-by-zero and unreachable-branch diagnostics under supported integer and immutable scalar guards. Floating-point and wider integer domains remain conservative. Function summaries now preserve both success and error paths, including pending caller errors.
-- Fixed state limits across call contexts. Analysis now warns and stops an incomplete function run instead of exceeding the cap. Independent constant-condition checks still report.
+- Fixed state limits across call contexts. Analysis now stops an incomplete function run instead of exceeding the cap. Independent constant-condition checks still report.
 - Fixed thread-limit and shutdown behavior on both frontends. `--threads` includes the calling thread, and executor shutdown waits for submitted work.
 - Fixed analysis ownership and allocation-failure handling, warm-cache declaration annotations, and reference lookup through valid alias cycles. Malformed source no longer enters semantic indexes.
 - Fixed false `unused-decl` reports for contextual constants such as `.empty` in typed initializers, assignments, and returns, without hiding unused constants in unrelated containers.
 - Fixed false project-wide `unused-decl` reports caused by missing references in malformed source or build files. Per-file checks still run on valid sibling files.
 - The default macOS development shell now uses Zig 0.16.0, avoiding the Zig 0.15.2 toolchain failure with current SDKs while retaining an explicit compatibility shell for the older frontend. (#81)
 - Fixed false positives for imported namespace and file-struct aliases, private file-as-struct methods, parameter uses in nested expressions, and allocator cleanup identity. Explicit `const Name: type = ...` aliases and functions declared to return `type` use PascalCase. Comptime parameters referenced from fields or methods of returned anonymous containers count as used.
+- Fixed identifier-style false positives for type-valued expressions, standard-library type factories with literal arguments, and optional type-information payloads. `@typeInfo` result values still require snake_case.
 - Fixed false positives for intentional catch fallback expressions and captured-error storage, while unrelated catch assignments remain reported as swallowed errors.
 - Fixed `sentinel-alloc` false positives when an untyped local directly infers the sentinel slice returned by the allocation.
 - Fixed project `unused-decl` false positives for method references through inline namespaces and nested type aliases.
@@ -34,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- A reproducible six-project performance runner now includes ocean and Zwanzig's own sources, with frozen inputs and exact diagnostic comparisons.
+- A reproducible benchmark runner freezes the source trees you name, defaults to Zwanzig's own sources, and compares diagnostic multisets, exit status and analysis-limit warnings exactly between two runs.
 
 ## [0.15.1]
 

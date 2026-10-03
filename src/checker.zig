@@ -97,6 +97,12 @@ pub const CheckerContext = struct {
     cached_artifacts: ?*CachedArtifacts = null,
     /// Per-file analysis cache. Destroy it before the source, CFGs, and type context.
     analysis_cache: ?*AnalysisCache = null,
+    /// Diagnostics collected for the file under analysis, and the allocator
+    /// that owns them. `getOrAnalyze` reports an exhausted analysis budget
+    /// here, so a caller that collects diagnostics sees the incompleteness
+    /// instead of only the findings that survived it. A checker must pass the
+    /// same allocator to `getOrAnalyze` that owns this list.
+    diagnostics: ?*std.ArrayList(Diagnostic) = null,
     /// Directory to dump CFG DOT files for visualization.
     /// When set, checkers write CFG DOT files to this directory.
     dump_cfg_dir: ?[]const u8 = null,

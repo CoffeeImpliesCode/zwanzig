@@ -31,6 +31,9 @@ pub const CliError = error{
     InvalidTargetTriple,
     InvalidOutputFormat,
     InvalidNumericValue,
+    /// An option zwanzig does not define. Dropping it would run a different
+    /// analysis than the one that was asked for, so it has to be loud.
+    UnknownFlag,
 };
 
 fn outputFormatFromString(s: []const u8) ?OutputFormat {
@@ -163,7 +166,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) CliErro
             if (parsed == 0) return CliError.InvalidNumericValue;
             thread_count = parsed;
         } else if (std.mem.startsWith(u8, arg, "--")) {
-            continue;
+            return CliError.UnknownFlag;
         } else {
             try paths.append(allocator, arg);
         }
@@ -453,4 +456,53 @@ test "parseArgs: --config without value" {
     const result = parseArgs(allocator, &args);
 
     try std.testing.expectError(CliError.MissingFlagValue, result);
+}
+
+test "parseArgs: gate invocation keeps every option and positional path" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{
+        "zwanzig",   "--format", "json",      "--config",  "/repo/.zwanzig.json",
+        "--threads", "4",        "src/a.zig", "build.zig",
+    };
+    const result = try parseArgs(allocator, &args);
+    defer freeCliArgs(allocator, result);
+
+    try std.testing.expectEqual(OutputFormat.json, result.output_format);
+    try std.testing.expectEqualStrings("/repo/.zwanzig.json", result.config_path.?);
+    try std.testing.expectEqual(@as(usize, 4), result.thread_count);
+    try std.testing.expectEqual(@as(usize, 2), result.paths.len);
+    try std.testing.expectEqualStrings("src/a.zig", result.paths[0]);
+    try std.testing.expectEqualStrings("build.zig", result.paths[1]);
+}
+
+test "parseArgs: mistyped boolean flag is rejected instead of ignored" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "zwanzig", "--cach", "file.zig" };
+    const result = parseArgs(allocator, &args);
+
+    try std.testing.expectError(CliError.UnknownFlag, result);
+}
+
+test "parseArgs: --flag=value assignment form is rejected" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "zwanzig", "--format=json", "file.zig" };
+    const result = parseArgs(allocator, &args);
+
+    try std.testing.expectError(CliError.UnknownFlag, result);
+}
+
+test "parseArgs: unknown flag is rejected even with a value attached" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "zwanzig", "--max-step", "10", "file.zig" };
+    const result = parseArgs(allocator, &args);
+
+    try std.testing.expectError(CliError.UnknownFlag, result);
+}
+
+test "parseArgs: unknown flag after valid paths is still rejected" {
+    const allocator = std.testing.allocator;
+    const args = [_][]const u8{ "zwanzig", "file.zig", "--nope" };
+    const result = parseArgs(allocator, &args);
+
+    try std.testing.expectError(CliError.UnknownFlag, result);
 }

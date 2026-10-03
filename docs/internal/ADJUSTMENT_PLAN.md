@@ -4,89 +4,36 @@ This plan originally covered missing branch constraints, error-path summaries, u
 
 ## Verification status
 
-Both frontend CLIs passed smoke checks for guarded integer divides, contradictory guards, conservative floating-point and wide-integer guards, hard call-context limits, and constant warnings under limits. Cold and warm disk-cache runs produced identical diagnostics. Compatible checkers reused one engine run, and one-worker and two-worker runs produced identical diagnostics. Contextual constant references retained the expected unused homonym report.
+For the revision these steps were written against, both frontend CLIs passed smoke checks for guarded integer divides, contradictory guards, conservative floating-point and wide-integer guards, hard call-context limits, and constant warnings under limits. Cold and warm disk-cache runs produced identical diagnostics. Compatible checkers reused one engine run, and one-worker and two-worker runs produced identical diagnostics. Contextual constant references retained the expected unused homonym report.
 
-Full `just test` and `just lint` runs passed under both pinned shells, including analyzer self-checks. Use `nix develop` for Zig 0.16.0 and `nix develop .#zig015` for Zig 0.15.2. Only Zig 0.15.2 defines canonical formatting.
+Use `nix develop` for Zig 0.16.0 and `nix develop .#zig015` for Zig 0.15.2. Only Zig 0.15.2 defines canonical formatting.
+
+Full `just test` and `just lint` runs, including analyzer self-checks, passed for the revision these steps were written against. Later edits are not covered by that result. The verification status of the current revision is recorded in [the migration plan](../ZIG_0_16_MIGRATION_PLAN.md#current-status).
 
 ### Performance measurements
 
-Measured on Linux x86-64 with the Zig 0.16.0 ReleaseSafe frontend, one analysis worker, nice level 15, and sequential runs. These are individual measurements, not statistical estimates. CPU columns show user CPU time; RSS is the process peak reported by GNU time.
+The measured runs that motivated the indexing, reuse and import-resolution work
+used frozen input snapshots, one analysis worker, nice level 15 and unchanged
+default analysis limits, and compared diagnostic multisets, exit status and
+analysis-limit warnings before and after each change. `scripts/benchmark.py`
+implements that procedure; see
+[DEVELOPMENT.md](../DEVELOPMENT.md#performance-measurement).
 
-The baseline is commit `4f3fbce6`, binary SHA-256 `6aab2b0ca68cb4a588445b0153625b71997077a4a1e164ed02ff3ee259886f93`. The measured result binary is `a65f3b03391fa1fc94a388de64cbd50fbd79164d3eb50186a1903aca3962e7fe`. All 343 source files and recorded build/configuration inputs stayed byte-identical, with unchanged source-file membership.
+The workloads themselves, their source-file counts, their timings, their
+diagnostic details and their input and binary hashes are private evidence and are
+not published here. Nothing below is reproducible from this repository, so the
+conclusions are stated qualitatively and no numbers are claimed.
 
-| Workload | Files | Before CPU (s) | After CPU (s) | Speedup | Peak RSS before → after (MiB) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| mon, default limits | 6 | 4.42 | 0.33 | 13.4× | 22.5 → 21.8 |
-| skript, parseable subset | 71 | 115.50 | 19.78 | 5.84× | 32.0 → 49.3 |
-| zmath, 1024-state control | 185 | 26.61 | 6.59 | 4.04× | 62.9 → 81.3 |
-| nogui, default limits | 79 | 196.97 | 124.44 | 1.58× | 100.3 → 89.7 |
-| nogui, `--do todo` | 79 | 0.50 | 0.06 | 8.33× | 20.4 → 5.1 |
-
-Controls and diagnostic checks:
-
-- The skript subset excludes the same two malformed files from both runs: `src/Runtime.zig` and `src/intrinsics/equal.zig`. Both existing diagnostics are unchanged. The new frontend reports two additional errors, independently confirmed by `zig ast-check`: an untyped `@bitCast` in `intrinsics/ffi.zig` and an undeclared `min` in `intrinsics/modules.zig`.
-- The zmath control uses `--max-states-per-point 1024` in both runs. Neither run hits an analysis limit, and all 122 diagnostics are unchanged.
-- mon, nogui, and the AST-only control retain exactly the same diagnostic multisets and report no analysis-limit warnings.
-- Instruction counts fall by 91.9% for mon, 82.4% for the skript control, 79.5% for the zmath control, and 34.4% for nogui. RSS rises in the two controlled workloads; these changes are not a universal memory reduction.
-- The complete 73-file skript run takes 22.81 user CPU seconds, versus 126.63 before, but that ratio includes skipping malformed syntax. Its 18 diagnostics are 15 parse errors, two frontend errors, and one unchanged per-file unused declaration. Eleven former diagnostics on malformed `Runtime.zig` are not emitted. Project-wide non-use claims wait for complete syntax.
-- The default-limit zmath run takes 3.84 user CPU seconds, versus 31.01 before, and retains 122 diagnostics. It emits 18 state-limit warnings. That ratio includes incomplete analyses, so the table uses the non-binding 1024-state control instead.
-
-Raw timings, hardware counters, input hashes, diagnostics, and comparison records remain in `.tmp/perf2-*`. The performance controls do not change production defaults or exclude files from the full-corpus checks.
-
-#### Six-workload follow-up
-
-The follow-up adds ocean and Zwanzig itself, and retains every source in the
-existing workloads. `scripts/benchmark.py` freezes 586 source files plus root
-build/configuration inputs. Snapshot manifest SHA-256:
-`c285c5b2a9cc9e19cbc2a0315415dfbc70e885138d3e32066e30873f791b1051`.
-
-The baseline is commit `351ae9b3`, binary SHA-256
-`a65f3b03391fa1fc94a388de64cbd50fbd79164d3eb50186a1903aca3962e7fe`.
-The verified result binary is
-`fecbaed5f175e313aff0e437da83bf9ad41996134f02e08eda15373ea4f2b4b3`.
-Both use Zig 0.16.0 ReleaseSafe, one worker, nice level 15, and unchanged default
-analysis limits. No builds or tests overlap the timed runs.
-
-The table gives the range of two runs per binary. Instruction reductions use the
-mean counters; RSS columns use the largest process peak in each pair. Host load
-causes substantial timing variation, so these are measurements, not latency guarantees.
-
-| Workload | Files | Before CPU (s) | After CPU (s) | Fewer instructions | Peak RSS before → after (MiB) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| nogui | 79 | 101.66–129.96 | 10.80–11.18 | 91.68% | 89.64 → 88.29 |
-| skript | 73 | 19.38–29.48 | 8.15–8.25 | 67.61% | 50.29 → 48.39 |
-| ocean | 137 | 48.25–74.63 | 15.01–15.04 | 76.65% | 98.55 → 98.44 |
-| Zwanzig | 106 | 6.75–9.07 | 3.51–3.83 | 63.73% | 35.93 → 34.75 |
-| zmath | 185 | 3.61–5.36 | 3.89–3.91 | 13.48% | 66.30 → 66.38 |
-| mon | 6 | 0.21–0.28 | 0.25–0.29 | 2.23% | 21.96 → 21.96 |
-
-Checks and limits:
-
-- All six workloads retain their exact diagnostic multisets, exit status, and
-  analysis-limit warning multisets in both comparisons. Counts are 25, 18, 315,
-  0, 122, and 12 in table order.
-- The full skript workload retains its 15 parse errors, two frontend errors, and
-  one unused declaration. No files are excluded for this comparison.
-- zmath retains 18 state-limit warnings. Its default-limit run is not complete
-  analysis. No meaningful elapsed-time improvement is claimed for zmath or mon.
-- RSS remains near the baseline; zmath's measured maximum rises by 76 KiB.
-  Shared source metadata is outside the engine-owned cache admission budget.
-- Full `just test` and `just lint` gates pass under both pinned toolchains.
-  Both self-lint runs report zero diagnostics over the current 107 source files.
-- The captured-payload fixture checks both a guarded and an unguarded field unwrap
-  inside a nested container method. It exposed and prevented a regression during
-  the index cutover.
-
-Profiles identified repeated enclosing-function scans and AST token-range walks
-as the main nogui cost. Guards now reuse lexical candidates and cached ranges.
-Source-owned declaration parent maps replace per-engine copies. Indexed import
-lookup removes repeated file scans and path normalization, while preserving the
-earliest exact, relative, or package match. Analysis limits and runtime safety
-checks remain unchanged.
-
-Raw evidence is in `.tmp/perf3-baseline{,-repeat}`, `.tmp/perf3-verified{,-repeat}`,
-`.tmp/perf3-inputs`, and `.tmp/perf3-profile*`. Intermediate candidates remain
-separate from the verified result.
+- Profiling identified repeated enclosing-function scans and AST token-range
+  walks as the dominant costs. Guards now reuse lexical candidates and cached
+  ranges.
+- Source-owned declaration parent maps replace per-engine copies.
+- Indexed import lookup removes repeated file scans and path normalization while
+  preserving the earliest exact, relative, or package match.
+- Peak memory stayed close to the baseline; the one workload whose peak rose
+  still stayed inside the engine-owned cache admission budget. Shared source
+  metadata sits outside that budget.
+- Analysis limits and runtime safety checks are unchanged by all of this work.
 
 ## Step 1: Extract branch constraints
 
@@ -127,7 +74,7 @@ A full error-union value redesign and cross-file call execution remain roadmap w
 - The AST checks retain constant-condition and obvious unreachable-code diagnostics.
 - `unreachable-code-engine` also uses path constraints for a limited proof under immutable scalar enclosing guards.
 - Path-based proofs require complete function analysis. A missing exploded-graph node alone does not prove unreachable code.
-- Hard state caps count all call contexts at each CFG point. A limit stops the incomplete analysis and emits a warning.
+- Hard state caps count all call contexts at each CFG point. A limit stops the incomplete analysis and reports `analysis-limit-exceeded` at the affected function.
 - A limit disables incomplete path proofs, not independently established constant-condition warnings.
 
 ### Remaining scope

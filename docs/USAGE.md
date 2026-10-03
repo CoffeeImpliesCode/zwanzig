@@ -85,6 +85,30 @@ Without arguments, zwanzig scans the current directory for `.zig` files. It skip
 - `.zigmod/`
 - `.gyro/`
 
+If the selection resolves to no `.zig` files at all, zwanzig reports
+`Error: No .zig files found. Nothing was analyzed.` on stderr and exits 1
+without producing a report. An empty selection is a failed run, not a clean
+one.
+
+### Options
+
+Every option takes its value as a separate argument (`--format json`, not
+`--format=json`). An option zwanzig does not define is an error rather than a
+silently ignored argument, so a mistyped flag cannot change what gets analyzed
+without saying so.
+
+### Exit status
+
+| Status | Meaning |
+| ---: | --- |
+| 0 | The selection was analyzed and produced no diagnostics |
+| 1 | Diagnostics were reported, or the run could not be trusted as a complete analysis |
+
+Exit status 1 covers CLI errors, a selection with no `.zig` files, and any
+diagnostic at any severity, including `parse-error`, `frontend-error`, and
+`analysis-limit-exceeded`. A report is written to stdout for every run that
+reaches the analysis stage; runs that fail before it write only to stderr.
+
 ## Using as a dependency
 
 Add zwanzig to your project:
@@ -194,7 +218,14 @@ zwanzig --max-steps 200000 --max-states-per-point 50 src/
 
 These are the engine defaults. `--max-steps` limits worklist steps per engine run. `--max-states-per-point` caps retained states at each CFG program point across all call contexts. Widening can combine states within a compatible call context, but cannot increase the cap. Widening is enabled by default. See [docs/CONFIG.md](CONFIG.md) to disable it.
 
-If the engine cannot continue within either limit, it logs a warning and marks that function analysis incomplete. It does not exceed the state cap to admit another call context. Path proofs that require complete analysis then stop. Constant-condition and structural diagnostics can still appear. A limit warning does not mean the function is free of defects. These limits do not bound total process memory.
+If the engine cannot continue within either limit, it stops that function's
+analysis and reports `analysis-limit-exceeded` at the function, naming the limit
+that was reached and the value configured. It does not exceed the state cap to
+admit another call context. Path proofs that require complete analysis then
+stop, so the diagnostic says the findings for that function are missing rather
+than absent. Constant-condition and structural diagnostics can still appear.
+Raising the matching limit removes the diagnostic; these limits do not bound
+total process memory.
 
 ## Incremental caching
 

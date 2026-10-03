@@ -561,6 +561,7 @@ pub const Analyzer = struct {
             .type_context = if (type_ctx) |*ctx| ctx else null,
             .analysis_cache = &analysis_cache,
             .analysis_stats = analysis_stats,
+            .diagnostics = diagnostics,
             .analysis_limits = .{
                 .max_worklist_steps = self.max_worklist_steps,
                 .max_states_per_point = self.max_states_per_point,

@@ -90,6 +90,9 @@ The `Analyzer` (`src/analyzer.zig`) coordinates the analysis process:
 7. Runs enabled native checkers, then enabled legacy rules, and collects diagnostics and actual engine-run statistics
 
 `CheckerContext` carries build metadata, the per-file type context, CFG artifacts, shared analysis, limits, statistics, configuration, and dump directories. Disabled native checkers do not cause type preflight. Legacy rules retain lazy access to `Source` type queries. Allocation failures propagate instead of becoming successful analysis with missing results.
+`CheckerContext` also carries the diagnostics list for the file under analysis
+so that analysis infrastructure, not only individual checkers, can report what
+it could not complete.
 
 #### Rule interface (legacy)
 
@@ -158,13 +161,22 @@ A `.none` checker can receive a type context when another enabled checker reques
 
 `CheckerContext.getOrAnalyze()` returns an exclusive `AnalysisHandle`. Compatible `.configured` requests can reuse an engine when their source, stable CFG, type context, configuration, metadata, artifacts, and limits match. `.plain` analyses and analyses over unstable or privately owned CFGs remain uncached.
 
+Both budgets abort the engine run with one error, so `AnalysisEngine.limit_kind`
+records which one fired. `getOrAnalyze()` turns that into
+`analysis-limit-exceeded` in the diagnostics list carried by the
+`CheckerContext`, naming the limit and the value that was reached. The report is
+emitted where the entry is created, so checkers that later lease the same cached
+engine do not repeat it. Checkers still test `analysis.complete` and drop their
+own results for an incomplete run; the diagnostic is what makes that drop
+visible instead of silent.
+
 ```zig
 var cfg_handle = (try context.getOrBuildCfg(allocator, source, fn_node)) orelse return;
 defer cfg_handle.deinit();
 
 var analysis = try context.getOrAnalyze(allocator, source, &cfg_handle, checker.name, .configured);
 defer analysis.deinit();
-if (!analysis.complete) return;
+if (!analysis.complete) return; // already reported as analysis-limit-exceeded
 
 const graph = analysis.engine.getGraph();
 ```

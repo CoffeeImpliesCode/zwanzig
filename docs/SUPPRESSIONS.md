@@ -44,3 +44,12 @@ const unused3 = 3;  // Reported again
 | `// zwanzig-disable: rule1, rule2` | Suppress specific rules until end of file or `enable` |
 | `// zwanzig-enable` | Re-enable all rules |
 | `// zwanzig-enable: rule1, rule2` | Re-enable specific rules |
+
+## Infrastructure diagnostics
+
+`analysis-limit-exceeded` is an ordinary diagnostic and follows the same
+suppression rules as any other. Suppressing it hides the fact that the
+function's dataflow analysis was truncated, so raise the corresponding
+`max_worklist_steps` or `max_states_per_point` limit instead.
+
+Syntax errors are reported from a separate pass and are not suppressible.

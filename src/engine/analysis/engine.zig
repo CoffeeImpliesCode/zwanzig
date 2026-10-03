@@ -89,6 +89,11 @@ pub const AnalysisEngine = struct {
     /// This is an unowned slice; callers must ensure the underlying data
     /// remains valid for at least as long as this AnalysisEngine instance.
     checker_name: ?[]const u8,
+    /// Which per-run budget stopped the most recent `run`, or null when that
+    /// run reached a fixed point. Both budgets abort the run with the same
+    /// error, so consumers that report an incomplete analysis need this to
+    /// name the limit that actually stopped it.
+    limit_kind: ?LimitKind = null,
     /// Type context for type-aware analysis (optional, not owned).
     type_context: ?*TypeContext,
     /// Config for resource models (optional, not owned).
@@ -101,6 +106,7 @@ pub const AnalysisEngine = struct {
     owned_parent_map: ?[]u32,
     /// Scratch buffer for FQN construction
     fqn_buffer: [256]u8 = undefined,
+    pub const LimitKind = enum { worklist_steps, states_per_point };
 
     pub const ResourceCalls = @import("resource_calls.zig").Mixin(@This());
     pub const Literals = @import("literals.zig").Mixin(@This());
@@ -142,6 +148,7 @@ pub const AnalysisEngine = struct {
             .summary_use_count = 0,
             .build_metadata = null,
             .checker_name = null,
+            .limit_kind = null,
             .type_context = null,
             .config = null,
             .use_widening = false,
@@ -275,6 +282,10 @@ pub const AnalysisEngine = struct {
 
     /// Run the analysis on the CFG, building the exploded graph.
     pub fn run(self: *AnalysisEngine) EngineError!void {
+        // Both budgets can fire in one run, so the reported reason is always
+        // the one that aborted the run rather than a leftover from an earlier
+        // call on a reused engine.
+        self.limit_kind = null;
         const cfg = self.graph.cfg;
 
         // Build function name index if source is available
@@ -325,6 +336,7 @@ pub const AnalysisEngine = struct {
                     item.cfg.fn_name orelse "unknown",
                     file_path,
                 });
+                self.limit_kind = .worklist_steps;
                 return error.AnalysisLimitExceeded;
             }
             try self.processNode(item.node_index, item.edge_kind, item.pending_constraint, item.cfg);
@@ -339,6 +351,7 @@ pub const AnalysisEngine = struct {
     ) EngineError!ExplodedGraph.GetOrCreateResult {
         return self.graph.getOrCreateNodeWithWidening(point, state, options) catch |err| {
             if (err == error.AnalysisLimitExceeded) {
+                self.limit_kind = .states_per_point;
                 log.warn("[{s}] analysis state limit exceeded: {d} states per point, function {s} in {s}, cfg node {d} ({s})", .{
                     self.checker_name orelse "unknown",
                     self.graph.max_states_per_point,
