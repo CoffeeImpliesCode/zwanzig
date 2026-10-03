@@ -9,6 +9,56 @@ const ids = @import("ids.zig");
 
 pub const AnalysisMode = enum { configured, plain };
 
+/// A function whose analysis engine stopped at a configured budget. Findings
+/// that need a complete dataflow analysis of that function are missing, not
+/// absent, so the report has to say so instead of leaving the gap implicit.
+pub const limit_rule_id = "analysis-limit-exceeded";
+
+fn reportLimitExceeded(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(checker_mod.Diagnostic),
+    source: *Source,
+    cfg: *const Cfg,
+    engine: *const AnalysisEngine,
+) std.mem.Allocator.Error!void {
+    const Budget = struct { name: []const u8, value: u64, remedy: []const u8 };
+    // Both budgets abort `run` with one error, and `run` records the one that
+    // fired, so this only names the configured ceiling that was reached.
+    const budget: Budget = switch (engine.limit_kind orelse .worklist_steps) {
+        .worklist_steps => .{
+            .name = "worklist step",
+            .value = engine.max_worklist_steps,
+            .remedy = "--max-steps or max_worklist_steps",
+        },
+        .states_per_point => .{
+            .name = "per-point state",
+            .value = engine.getGraph().max_states_per_point,
+            .remedy = "--max-states-per-point or max_states_per_point",
+        },
+    };
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "analysis limit exceeded: {s} limit {d} reached while analyzing `{s}`; " ++
+            "findings that require a complete dataflow analysis of this function were not produced. Raise {s}.",
+        .{ budget.name, budget.value, cfg.fn_name orelse "<anonymous>", budget.remedy },
+    );
+    errdefer allocator.free(message);
+
+    var location: checker_mod.Location = .init(1, 1);
+    if (cfg.fn_ast_node) |fn_node| {
+        const token = (try source.ast()).nodes.items(.main_token)[ids.astIndex(fn_node)];
+        location = try source.tokenLocation(token);
+    }
+    const diagnostic: checker_mod.Diagnostic = .{
+        .file_path = source.getFilePath(),
+        .rule_id = limit_rule_id,
+        .severity = .err,
+        .message = message,
+        .range = .fromSingleLocation(location),
+    };
+    try diagnostics.append(allocator, diagnostic);
+}
+
 /// An exclusive lease. Do not copy it or keep engine pointers after deinit.
 /// Graph results remain read-only, but lazy engine query caches may grow.
 /// The source, CFGs, type context, and optional cache must outlive the lease.
@@ -189,7 +239,15 @@ pub fn getOrAnalyze(
     };
     engine.run() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.AnalysisLimitExceeded => entry.complete = false,
+        error.AnalysisLimitExceeded => {
+            entry.complete = false;
+            // Consumers of this handle drop everything that needs a complete
+            // analysis, so report the gap where the error is swallowed rather
+            // than letting an unanalyzed function read as a clean one.
+            if (context.diagnostics) |list| {
+                try reportLimitExceeded(allocator, list, key.source, key.cfg, engine);
+            }
+        },
     };
     if (cache) |owner| return owner.lease(entry);
     return .{ .engine = engine, .complete = entry.complete, .entry = entry, .cache = null };
@@ -363,6 +421,70 @@ test "AnalysisCache separates limits and retains incomplete results" {
     defer widened.deinit();
     try std.testing.expect(widened.complete);
     try std.testing.expectEqual(@as(u64, 4), stats.total_runs);
+}
+
+test "AnalysisCache reports an exhausted budget once per incomplete analysis" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "reported.zig", "fn foo() void {}");
+    defer source.deinit();
+    var artifacts = checker_mod.CachedArtifacts.init(allocator);
+    defer artifacts.deinit();
+    var cache = AnalysisCache.init(allocator);
+    defer cache.deinit();
+    var stats: checker_mod.AnalysisStats = .{};
+    var diagnostics: std.ArrayList(checker_mod.Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    var context: checker_mod.CheckerContext = .{
+        .build_metadata = null,
+        .cached_artifacts = &artifacts,
+        .analysis_cache = &cache,
+        .analysis_stats = &stats,
+        .diagnostics = &diagnostics,
+    };
+    var cfg = try buildTestCfg(&source, context);
+    defer cfg.deinit();
+
+    // A function analyzed to a fixed point must not look like a truncated one.
+    {
+        var complete = try context.getOrAnalyze(allocator, &source, &cfg, "complete", .configured);
+        defer complete.deinit();
+        try std.testing.expect(complete.complete);
+    }
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+
+    context.analysis_limits = .{ .max_worklist_steps = 0 };
+    {
+        var limited = try context.getOrAnalyze(allocator, &source, &cfg, "limited", .configured);
+        defer limited.deinit();
+        try std.testing.expect(!limited.complete);
+    }
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    {
+        const reported = diagnostics.items[0];
+        try std.testing.expectEqualStrings(limit_rule_id, reported.rule_id);
+        try std.testing.expectEqual(checker_mod.Severity.err, reported.severity);
+        try std.testing.expectEqualStrings("reported.zig", reported.file_path);
+    }
+
+    // A second consumer leasing the same engine reuses the first report rather
+    // than claiming the same gap again.
+    {
+        var again = try context.getOrAnalyze(allocator, &source, &cfg, "other", .configured);
+        defer again.deinit();
+        try std.testing.expect(!again.complete);
+    }
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+
+    context.analysis_limits = .{ .max_states_per_point = 0 };
+    {
+        var capped = try context.getOrAnalyze(allocator, &source, &cfg, "capped", .configured);
+        defer capped.deinit();
+        try std.testing.expect(!capped.complete);
+    }
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
 }
 
 test "AnalysisCache keys borrowed source type metadata and artifact identities" {
