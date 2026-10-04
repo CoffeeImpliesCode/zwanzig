@@ -43,6 +43,10 @@ pub const IrTag = enum {
     catch_expr,
     /// `unreachable` literal — terminates the current path
     unreachable_stmt,
+    /// `break :label` - ends the current path and jumps to the exit node of
+    /// the labeled block. Unlabeled `break` stays a plain expression: this
+    /// analysis does not model loop exits.
+    break_stmt,
 };
 
 /// A single IR node representing a statement or expression.

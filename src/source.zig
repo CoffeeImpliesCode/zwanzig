@@ -165,21 +165,22 @@ pub const Source = struct {
         if (self.zir_load_error) |err| return err;
 
         self.zir_load_attempted = true;
-        self.loadZirBridge() catch |err| {
+        return self.loadZirBridge() catch |err| {
             self.zir_load_error = err;
             log.debug("ZIR bridge unavailable for {s}: {s}", .{ self.file_path, @errorName(err) });
             return err;
         };
-        return &self.cached_zir_bridge.?;
     }
 
-    fn loadZirBridge(self: *Source) ZirBridgeError!void {
+    fn loadZirBridge(self: *Source) ZirBridgeError!*const ZirBridge {
         // Preserve AST allocation errors before the bridge's parse-error boundary.
         _ = try self.ast();
         var bridge = ZirBridge.init(self.allocator);
         errdefer bridge.deinit();
         try bridge.loadFromSource(self);
         self.cached_zir_bridge = bridge;
+        if (self.cached_zir_bridge) |*cached| return cached;
+        unreachable;
     }
 
     /// Check if type information is available for this source.
@@ -447,6 +448,19 @@ test "Source required ZIR preserves parse and generation allocation failures" {
         try testing.expect(source.zirBridge() == null);
         try testing.expectError(error.OutOfMemory, source.requireZirBridge());
     }
+
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var source = Source.init(allocator, "oom.zig",
+                "const x: u8 = 1;\nfn next(value: u8) u8 { return value + 1; }");
+            defer source.deinit();
+            const bridge = try source.requireZirBridge();
+            const declaration = bridge.findDeclByName("x") orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(TypeInfo.TypeKind.uint, declaration.type_info.kind);
+            try std.testing.expectEqual(@as(u16, 8), declaration.type_info.size_bits);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Harness.run, .{});
 }
 
 test "Source hasTypeInfo" {

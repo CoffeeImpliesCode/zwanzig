@@ -12,13 +12,16 @@ const CfgNodeId = ids.CfgNodeId;
 const AstNodeId = ids.AstNodeId;
 const engine_mod = @import("../engine.zig");
 const AnalysisEngine = engine_mod.AnalysisEngine;
+const value = @import("../engine/value.zig");
+const import_resolver = @import("../analysis/import_resolver.zig");
 
 /// Engine-based checker that detects catch blocks that swallow errors.
 /// An error is considered "swallowed" when:
 /// - The catch block has a non-empty handler body
-/// - The handler does NOT rethrow the error (return error or propagate)
-/// - The handler does NOT log the error (call to std.debug/log functions)
 /// - The handler simply ignores the error and continues execution
+/// - The handler stores the caught payload only on some paths, in a binding
+///   that dies with the handler, or under a shadowed name
+/// - The handler does NOT log the error (call to std.debug/log functions)
 ///
 /// This checker uses the CFG and analysis engine to trace error handling paths
 /// and identify catch handlers that swallow errors without proper handling.
@@ -125,6 +128,8 @@ pub const SwallowedErrorChecker = struct {
     /// 2. The handler does NOT return an error
     /// 3. The handler does NOT appear to log the error
     /// 4. The handler completes normally (reaches merge point)
+    /// 5. The handler does NOT record the caught payload on every path that
+    ///    reaches that merge point
     fn isErrorSwallowed(
         cfg: *const Cfg,
         catch_node_idx: CfgNodeId,
@@ -160,7 +165,17 @@ pub const SwallowedErrorChecker = struct {
         }
 
         if (payload_token) |token| {
-            if (handlerStoresCaughtError(tree, handler_ast, token)) return false;
+            // The handler merge is the handler's normal continuation: a
+            // catch without one leaves the function instead.
+            if (try handlerStoresCaughtError(
+                cfg,
+                entry,
+                merge_node orelse cfg.exit,
+                handler_ast,
+                token,
+                tree,
+                allocator,
+            )) return false;
         }
 
         // Trace through the handler to see if it:
@@ -250,30 +265,6 @@ pub const SwallowedErrorChecker = struct {
         return !has_return and !has_call and !has_input_progress and reaches_merge_from_handler;
     }
 
-    const ErrorStoreFinder = struct {
-        payload_name: []const u8,
-        found: bool = false,
-        stop: bool = false,
-
-        pub fn visit(
-            self: *ErrorStoreFinder,
-            tree: *const std.zig.Ast,
-            node: u32,
-            tag: std.zig.Ast.Node.Tag,
-        ) !void {
-            if (tag != .assign) return;
-
-            const assignment = tree.nodes.items(.data)[node].node_and_node;
-            const lhs = @intFromEnum(assignment[0]);
-            const rhs = @intFromEnum(assignment[1]);
-            if (isDiscardIdentifier(tree, lhs)) return;
-            if (!isPayloadIdentifier(tree, rhs, self.payload_name)) return;
-
-            self.found = true;
-            self.stop = true;
-        }
-    };
-
     fn isBlockHandler(tree: *const std.zig.Ast, handler_ast: AstNodeId) bool {
         const handler = ids.astIndex(handler_ast);
         const tags = tree.nodes.items(.tag);
@@ -307,45 +298,382 @@ pub const SwallowedErrorChecker = struct {
         return payload_token;
     }
 
+    /// A path through the handler that has not stored the caught payload yet.
+    const path_without_store: u2 = 1;
+    /// A path through the handler that has already stored the caught payload.
+    const path_with_store: u2 = 2;
+
+    /// Prove that the handler records the caught payload on every path that
+    /// continues past it, and therefore does not swallow the error.
+    ///
+    /// The proof walks the handler's CFG region from the handler entry to this
+    /// catch's merge node and carries one bit per path: whether the payload has
+    /// been stored so far. Only feasible edges are followed, so a statically
+    /// unreachable arm such as `if (false)` contributes no path at all. A path
+    /// that reaches the continuation without storing the payload leaves the
+    /// handler with the error dropped, so the exemption is withheld. Paths that
+    /// end in `return`, `unreachable`, or a propagated `try` error never
+    /// continue and need no store.
+    ///
+    /// The walk is structural: it reads the CFG and the AST only, so the
+    /// verdict does not depend on whether the analysis engine finished inside
+    /// its budget.
     fn handlerStoresCaughtError(
-        tree: *const std.zig.Ast,
+        cfg: *const Cfg,
+        entry: CfgNodeId,
+        continuation: CfgNodeId,
         handler_ast: AstNodeId,
         payload_token: u32,
-    ) bool {
+        tree: *const std.zig.Ast,
+        allocator: std.mem.Allocator,
+    ) CheckerError!bool {
         const token_tags = tree.tokens.items(.tag);
-        if (payload_token >= token_tags.len or token_tags[payload_token] != .identifier) {
+        if (payload_token >= token_tags.len or token_tags[payload_token] != .identifier) return false;
+
+        var declared_names: std.ArrayList(HandlerBinding) = .empty;
+        defer declared_names.deinit(allocator);
+        try collectHandlerDeclarations(tree, ids.astIndex(handler_ast), &declared_names, allocator);
+
+        const proof = PayloadStoreProof{
+            .tree = tree,
+            .payload_name = import_resolver.normalizeIdentifier(tree.tokenSlice(payload_token)),
+            .declared_names = declared_names.items,
+        };
+
+        const paths = try allocator.alloc(u2, cfg.nodes.items.len);
+        defer allocator.free(paths);
+        @memset(paths, 0);
+
+        var work: std.ArrayList(CfgNodeId) = .empty;
+        defer work.deinit(allocator);
+
+        const entry_index = ids.cfgIndex(entry);
+        if (entry_index >= paths.len) return false;
+        paths[entry_index] = if (proof.nodeStoresPayload(cfg, entry)) path_with_store else path_without_store;
+        try work.append(allocator, entry);
+
+        while (work.items.len > 0) {
+            const node_idx = work.pop() orelse continue;
+            const current = paths[ids.cfgIndex(node_idx)];
+            if (current == 0) continue;
+
+            for (cfg.edges.items) |edge| {
+                if (edge.from != node_idx) continue;
+                if (!isFeasibleEdge(tree, cfg, node_idx, edge)) continue;
+
+                if (edge.to == continuation) {
+                    if ((current & path_without_store) != 0) return false;
+                    continue;
+                }
+
+                const target = ids.cfgIndex(edge.to);
+                if (target >= paths.len) continue;
+                const reached = if (proof.nodeStoresPayload(cfg, edge.to)) path_with_store else current;
+                const merged = paths[target] | reached;
+                if (merged == paths[target]) continue;
+                paths[target] = merged;
+                try work.append(allocator, edge.to);
+            }
+        }
+        return true;
+    }
+
+    /// Filter the CFG edges a runtime path can actually take.
+    ///
+    /// `return` and `unreachable` end the path, a `try` error edge leaves the
+    /// function, and a statically known condition removes the arm that cannot
+    /// be selected.
+    fn isFeasibleEdge(
+        tree: *const std.zig.Ast,
+        cfg: *const Cfg,
+        from: CfgNodeId,
+        edge: cfg_mod.CfgEdge,
+    ) bool {
+        const cfg_node = cfg.getNode(from) orelse return false;
+        switch (cfg_node.ir_node.tag) {
+            .ret, .unreachable_stmt => return false,
+            .try_expr => {
+                if (edge.kind == .try_error) return false;
+            },
+            .branch => {
+                if (ifConditionLiteral(tree, cfg_node.ir_node)) |taken| {
+                    if (edge.kind == .branch_true) return taken;
+                    if (edge.kind == .branch_false) return !taken;
+                }
+            },
+            .loop_header => {
+                if (whileConditionLiteral(tree, cfg_node.ir_node)) |taken| {
+                    if (edge.kind == .branch_true) return taken;
+                    if (edge.kind == .loop_exit) return !taken;
+                }
+            },
+            else => {},
+        }
+        return true;
+    }
+
+    /// Statically known `if` condition, if the branch node is an `if` whose
+    /// condition is a `true`/`false` literal.
+    fn ifConditionLiteral(tree: *const std.zig.Ast, ir_node: cfg_mod.IrNode) ?bool {
+        const ast_node = ir_node.ast_node orelse return null;
+        const tags = tree.nodes.items(.tag);
+        if (ast_node >= tags.len) return null;
+        switch (tags[ast_node]) {
+            .@"if", .if_simple => {},
+            else => return null,
+        }
+        const condition = ir_node.operand_node orelse return null;
+        return value.evaluateBoolLiteral(tree, condition);
+    }
+
+    /// Statically known `while` condition, if the loop header's condition is a
+    /// `true`/`false` literal.
+    fn whileConditionLiteral(tree: *const std.zig.Ast, ir_node: cfg_mod.IrNode) ?bool {
+        const ast_node = ir_node.ast_node orelse return null;
+        const tags = tree.nodes.items(.tag);
+        if (ast_node >= tags.len) return null;
+        switch (tags[ast_node]) {
+            .@"while", .while_simple, .while_cont => {},
+            else => return null,
+        }
+        const full_while = tree.fullWhile(@enumFromInt(ast_node)) orelse return null;
+        return value.evaluateBoolLiteral(tree, @intFromEnum(full_while.ast.cond_expr));
+    }
+
+    const HandlerBinding = struct {
+        name: []const u8,
+        declaration: u32 = 0,
+    };
+
+    /// Binding identity of the payload caught by one handler.
+    const PayloadStoreProof = struct {
+        tree: *const std.zig.Ast,
+        payload_name: []const u8,
+        declared_names: []const HandlerBinding,
+
+        /// True when the node assigns the caught payload into a binding that
+        /// outlives the handler.
+        fn nodeStoresPayload(self: *const PayloadStoreProof, cfg: *const Cfg, node_idx: CfgNodeId) bool {
+            const cfg_node = cfg.getNode(node_idx) orelse return false;
+            if (cfg_node.ir_node.tag != .assign) return false;
+            const ast_node = cfg_node.ir_node.ast_node orelse return false;
+
+            const tags = self.tree.nodes.items(.tag);
+            if (ast_node == 0 or ast_node >= tags.len or tags[ast_node] != .assign) return false;
+
+            const assignment = self.tree.nodes.items(.data)[ast_node].node_and_node;
+            const lhs = @intFromEnum(assignment[0]);
+            const rhs = @intFromEnum(assignment[1]);
+            if (isDiscardIdentifier(self.tree, lhs)) return false;
+            if (!self.referencesCaughtPayload(rhs)) return false;
+
+            return self.targetOutlivesHandler(lhs);
+        }
+
+        /// Follow immutable aliases through storage projections. Declaration
+        /// tokens strictly decrease, so alias cycles need no depth cutoff.
+        fn targetOutlivesHandler(self: *const PayloadStoreProof, lhs: u32) bool {
+            var base = placeBase(self.tree, lhs);
+            const indirect = base != lhs;
+            var before = self.tree.firstToken(@enumFromInt(lhs));
+            const tags = self.tree.nodes.items(.tag);
+            const datas = self.tree.nodes.items(.data);
+            while (identifierToken(self.tree, base)) |token| {
+                const name = import_resolver.normalizeIdentifier(self.tree.tokenSlice(token));
+                var binding: ?HandlerBinding = null;
+                for (self.declared_names) |declared| {
+                    if (!std.mem.eql(u8, declared.name, name)) continue;
+                    if (binding != null) return false;
+                    binding = declared;
+                }
+                const local = binding orelse return true;
+                if (!indirect or local.declaration == 0) return false;
+                const declaration = self.tree.fullVarDecl(@enumFromInt(local.declaration)) orelse return false;
+                if (self.tree.tokenTag(declaration.ast.mut_token) != .keyword_const) return false;
+                if (declaration.ast.mut_token >= before) return false;
+                before = declaration.ast.mut_token;
+                var initializer = @intFromEnum(declaration.ast.init_node.unwrap() orelse return false);
+                if (initializer >= tags.len) return false;
+                if (tags[initializer] == .address_of) initializer = @intFromEnum(datas[initializer].node);
+                base = placeBase(self.tree, initializer);
+            }
             return false;
         }
 
-        var finder = ErrorStoreFinder{
-            .payload_name = tree.tokenSlice(payload_token),
-        };
-        ast_walk.walk(ErrorStoreFinder, tree, ids.astIndex(handler_ast), &finder) catch return false;
-        return finder.found;
+        /// True when the handler binds this name anywhere. Both sides are
+        /// identifier slices with `@"..."` quoting normalized away.
+        fn declaresName(self: *const PayloadStoreProof, name: []const u8) bool {
+            for (self.declared_names) |declared| {
+                if (std.mem.eql(u8, declared.name, name)) return true;
+            }
+            return false;
+        }
+
+        /// The caught binding answers to its name for the whole handler unless
+        /// the handler binds that name again. Nothing outside the handler can
+        /// shadow it, because the catch clause introduces the payload.
+        fn referencesCaughtPayload(self: *const PayloadStoreProof, node: u32) bool {
+            if (!isPayloadIdentifier(self.tree, node, self.payload_name)) return false;
+            return !self.declaresName(self.payload_name);
+        }
+    };
+
+    /// Root binding of an assignment target such as `state.saved`, `items[0]`,
+    /// or `ptr.*`.
+    fn placeBase(tree: *const std.zig.Ast, node: u32) u32 {
+        const tags = tree.nodes.items(.tag);
+        var current = node;
+        while (current != 0 and current < tags.len) {
+            const data = tree.nodes.items(.data)[current];
+            current = switch (tags[current]) {
+                .field_access => @intFromEnum(data.node_and_token[0]),
+                .array_access => @intFromEnum(data.node_and_node[0]),
+                .deref => @intFromEnum(data.node),
+                .grouped_expression => @intFromEnum(data.node_and_token[0]),
+                else => return current,
+            };
+        }
+        return current;
     }
 
-    fn isPayloadIdentifier(
-        tree: *const std.zig.Ast,
-        node: u32,
-        payload_name: []const u8,
-    ) bool {
+    fn identifierToken(tree: *const std.zig.Ast, node: u32) ?u32 {
         const tags = tree.nodes.items(.tag);
-        if (node == 0 or node >= tags.len or tags[node] != .identifier) return false;
-
+        if (node == 0 or node >= tags.len or tags[node] != .identifier) return null;
         const token = tree.nodes.items(.main_token)[node];
+        if (!isIdentifierToken(tree, token)) return null;
+        return token;
+    }
+
+    fn isIdentifierToken(tree: *const std.zig.Ast, token: u32) bool {
         const token_tags = tree.tokens.items(.tag);
-        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
-        return std.mem.eql(u8, tree.tokenSlice(token), payload_name);
+        return token < token_tags.len and token_tags[token] == .identifier;
+    }
+
+    fn varDeclName(tree: *const std.zig.Ast, node: u32) ?u32 {
+        const full = tree.fullVarDecl(@enumFromInt(node)) orelse return null;
+        const name_token = full.ast.mut_token + 1;
+        if (!isIdentifierToken(tree, name_token)) return null;
+        return name_token;
+    }
+
+    fn isPayloadIdentifier(tree: *const std.zig.Ast, node: u32, payload_name: []const u8) bool {
+        const token = identifierToken(tree, node) orelse return false;
+        return std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(token)), payload_name);
     }
 
     fn isDiscardIdentifier(tree: *const std.zig.Ast, node: u32) bool {
-        const tags = tree.nodes.items(.tag);
-        if (node == 0 or node >= tags.len or tags[node] != .identifier) return false;
-
-        const token = tree.nodes.items(.main_token)[node];
-        const token_tags = tree.tokens.items(.tag);
-        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
+        const token = identifierToken(tree, node) orelse return false;
         return std.mem.eql(u8, tree.tokenSlice(token), "_");
+    }
+
+    /// Record handler-local bindings. Immutable pointer aliases can lead to
+    /// outside storage; local values and unresolved captures cannot.
+    fn collectHandlerDeclarations(
+        tree: *const std.zig.Ast,
+        handler_ast: u32,
+        names: *std.ArrayList(HandlerBinding),
+        allocator: std.mem.Allocator,
+    ) CheckerError!void {
+        if (handler_ast == 0 or handler_ast >= tree.nodes.items(.tag).len) return;
+        var collector = DeclNameCollector{ .names = names, .allocator = allocator };
+        try ast_walk.walk(DeclNameCollector, tree, handler_ast, &collector);
+    }
+
+    const DeclNameCollector = struct {
+        names: *std.ArrayList(HandlerBinding),
+        allocator: std.mem.Allocator,
+        stop: bool = false,
+
+        pub fn visit(
+            self: *@This(),
+            tree: *const std.zig.Ast,
+            node: u32,
+            tag: std.zig.Ast.Node.Tag,
+        ) !void {
+            if (import_resolver.isVarDeclTag(tag)) {
+                const name_token = varDeclName(tree, node) orelse return;
+                try self.names.append(self.allocator, .{
+                    .name = import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)),
+                    .declaration = node,
+                });
+                return;
+            }
+            switch (tag) {
+                .fn_decl => try appendFnParamNames(tree, node, self.names, self.allocator),
+                .@"if", .if_simple => {
+                    const full_if = tree.fullIf(@enumFromInt(node)) orelse return;
+                    try appendCaptureNames(tree, full_if.payload_token, self.names, self.allocator);
+                    try appendCaptureNames(tree, full_if.error_token, self.names, self.allocator);
+                },
+                .@"while", .while_simple, .while_cont => {
+                    const full_while = tree.fullWhile(@enumFromInt(node)) orelse return;
+                    try appendCaptureNames(tree, full_while.payload_token, self.names, self.allocator);
+                    try appendCaptureNames(tree, full_while.error_token, self.names, self.allocator);
+                },
+                .@"for", .for_simple => {
+                    const full_for = tree.fullFor(@enumFromInt(node)) orelse return;
+                    try appendCaptureNames(
+                        tree,
+                        if (full_for.payload_token != 0) full_for.payload_token else null,
+                        self.names,
+                        self.allocator,
+                    );
+                },
+                else => {
+                    const full_case = tree.fullSwitchCase(@enumFromInt(node)) orelse return;
+                    try appendCaptureNames(tree, full_case.payload_token, self.names, self.allocator);
+                },
+            }
+        }
+    };
+
+    /// Names bound by a capture such as `|value|`, `|*value|`, or
+    /// `|item, index|`. The token points just past the opening pipe.
+    fn appendCaptureNames(
+        tree: *const std.zig.Ast,
+        payload_token: ?u32,
+        names: *std.ArrayList(HandlerBinding),
+        allocator: std.mem.Allocator,
+    ) CheckerError!void {
+        var token = payload_token orelse return;
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len) return;
+        if (token_tags[token] == .pipe) token += 1;
+        while (token < token_tags.len) : (token += 1) {
+            if (token_tags[token] == .pipe) return;
+            if (token_tags[token] != .identifier) continue;
+            try appendName(tree, token, names, allocator);
+        }
+    }
+
+    fn appendFnParamNames(
+        tree: *const std.zig.Ast,
+        fn_node: u32,
+        names: *std.ArrayList(HandlerBinding),
+        allocator: std.mem.Allocator,
+    ) CheckerError!void {
+        const tags = tree.nodes.items(.tag);
+        if (fn_node >= tags.len or tags[fn_node] != .fn_decl) return;
+        const proto_node = @intFromEnum(tree.nodes.items(.data)[fn_node].node_and_node[0]);
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, @enumFromInt(proto_node)) orelse return;
+        var parameters = proto.iterate(tree);
+        while (parameters.next()) |parameter| {
+            const name_token = parameter.name_token orelse continue;
+            if (!isIdentifierToken(tree, name_token)) continue;
+            try appendName(tree, name_token, names, allocator);
+        }
+    }
+
+    /// Append a bound name with `@"..."` quoting normalized away, so quoted and
+    /// bare spellings of one identifier compare equal.
+    fn appendName(
+        tree: *const std.zig.Ast,
+        token: u32,
+        names: *std.ArrayList(HandlerBinding),
+        allocator: std.mem.Allocator,
+    ) CheckerError!void {
+        try names.append(allocator, .{ .name = import_resolver.normalizeIdentifier(tree.tokenSlice(token)) });
     }
 
     const ConditionIdentifierFinder = struct {
@@ -819,5 +1147,196 @@ test "skript regression: malformed input recovery is not a swallowed error" {
         try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
         try std.testing.expectEqual(@as(usize, 16), diagnostics.items[0].range.start.line);
         try std.testing.expectEqual(@as(u64, 3), stats.total_runs);
+    }
+}
+
+test "swallowed_error - storing on one branch only is not proof" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const State = struct { saved: ?anyerror = null, ignored: bool = false };
+        \\fn operation() error{Failed}!void { return error.Failed; }
+        \\fn record(state: *State, keep: bool) void {
+        \\    operation() catch |err| {
+        \\        if (keep) { state.saved = err; }
+        \\        state.ignored = true;
+        \\    };
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // The store proof is structural, so the verdict holds for the engine run
+    // and for the conservative fallback alike.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
+        try std.testing.expectEqual(@as(usize, 4), diagnostics.items[0].range.start.line);
+    }
+}
+
+test "swallowed_error - storing in an unreachable branch is not proof" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const State = struct { saved: ?anyerror = null, ignored: bool = false };
+        \\fn operation() error{Failed}!void { return error.Failed; }
+        \\fn record(state: *State) void {
+        \\    operation() catch |err| {
+        \\        if (false) { state.saved = err; }
+        \\        state.ignored = true;
+        \\    };
+        \\}
+        \\fn spin(state: *State) void {
+        \\    operation() catch |err| {
+        \\        while (false) { state.saved = err; }
+        \\        state.ignored = true;
+        \\    };
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 4), diagnostics.items[0].range.start.line);
+        try std.testing.expectEqual(@as(usize, 10), diagnostics.items[1].range.start.line);
+        for (diagnostics.items) |diagnostic| {
+            try std.testing.expectEqualStrings("swallowed-error", diagnostic.rule_id);
+        }
+    }
+}
+
+test "swallowed_error - a handler-local binding is not a store" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const State = struct { saved: ?anyerror = null, ignored: bool = false };
+        \\fn operation() error{Failed}!void { return error.Failed; }
+        \\fn record(state: *State) void {
+        \\    operation() catch |err| {
+        \\        var local: ?anyerror = null;
+        \\        local = err;
+        \\        state.ignored = local != null;
+        \\    };
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try std.testing.expectEqualStrings("swallowed-error", diagnostics.items[0].rule_id);
+    }
+}
+
+test "swallowed_error - a shadowed name is not the caught payload" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const State = struct { saved: ?anyerror = null };
+        \\fn operation() error{Failed}!void { return error.Failed; }
+        \\fn shadowedDecl(state: *State) void {
+        \\    operation() catch |err| {
+        \\        const err = error.Shadowed;
+        \\        state.saved = err;
+        \\    };
+        \\}
+        \\fn shadowedCapture(state: *State, maybe: ?anyerror) void {
+        \\    operation() catch |err| {
+        \\        if (maybe) |err| {
+        \\            state.saved = err;
+        \\        } else {
+        \\            state.saved = err;
+        \\        }
+        \\    };
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // Both arms store into `state`, but the then arm stores the if-capture
+    // that shadows the caught payload, so the handler still drops the error.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 4), diagnostics.items[0].range.start.line);
+        try std.testing.expectEqual(@as(usize, 10), diagnostics.items[1].range.start.line);
+        for (diagnostics.items) |diagnostic| {
+            try std.testing.expectEqualStrings("swallowed-error", diagnostic.rule_id);
+        }
+    }
+}
+
+test "swallowed_error - storing on every path keeps the exemption" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const State = struct { first: ?anyerror = null, second: ?anyerror = null };
+        \\fn operation() error{Failed}!void { return error.Failed; }
+        \\fn bothBranches(state: *State, first: bool) void {
+        \\    operation() catch |err| {
+        \\        if (first) { state.first = err; } else { state.second = err; }
+        \\    };
+        \\}
+        \\fn everyArm(state: *State, code: u8) void {
+        \\    operation() catch |err| {
+        \\        switch (code) {
+        \\            0 => { state.first = err; },
+        \\            else => { state.second = err; },
+        \\        }
+        \\    };
+        \\}
+        \\fn afterMaybeEmptyLoop(state: *State, keep: bool) void {
+        \\    operation() catch |err| {
+        \\        while (keep) { state.first = err; }
+        \\        state.second = err;
+        \\    };
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
     }
 }

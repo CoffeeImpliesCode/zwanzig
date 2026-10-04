@@ -15,6 +15,13 @@ pub const ResourceState = enum {
     closed,
 };
 
+/// True for the states that mean "the program still holds this resource".
+/// These are the states the leak check is derived from, which makes them the
+/// ones a wider state must not absorb.
+fn isHeldResource(state: ResourceState) bool {
+    return state == .allocated or state == .open;
+}
+
 pub const StoreViolationKind = enum {
     double_free,
     free_without_alloc,
@@ -500,21 +507,66 @@ pub const Store = struct {
         }
     }
 
+    /// Escape every resource reachable from `container` through ownership.
+    ///
+    /// Ownership nests: an aggregate holds the payloads stored in it and a
+    /// payload holds the resources of its own fields, so a container that
+    /// leaves the function takes everything below it with it. Resources the
+    /// container never owned stay exactly where they were.
+    ///
+    /// The closure is gathered before anything is mutated, so an allocation
+    /// failure leaves the ownership graph exactly as it was. The collected
+    /// list doubles as the traversal queue, and a container with no owned
+    /// descendants allocates nothing at all.
     pub fn escapeOwned(self: *Store, container: VarId) std.mem.Allocator.Error!void {
         const container_root = self.canonical(container);
-        var to_escape: std.ArrayList(VarId) = .empty;
-        defer to_escape.deinit(self.allocator);
+        var closure: std.ArrayList(VarId) = .empty;
+        defer closure.deinit(self.allocator);
 
-        var iter = self.owners.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.* == container_root) {
-                try to_escape.append(self.allocator, entry.key_ptr.*);
+        // `closure` holds the visited set: index 0 starts at the container
+        // itself, so seeding the walk costs no append.
+        var depth: usize = 0;
+        while (depth <= closure.items.len) : (depth += 1) {
+            const current: VarId = if (depth == 0) container_root else closure.items[depth - 1];
+            var iter = self.owners.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.* != current) continue;
+                if (std.mem.indexOfScalar(VarId, closure.items, entry.key_ptr.*) != null) continue;
+                try closure.append(self.allocator, entry.key_ptr.*);
             }
         }
 
-        for (to_escape.items) |resource| {
+        for (closure.items) |resource| {
             self.escapeRegion(resource);
         }
+    }
+
+    /// Move ownership of everything `payload` owns onto `container`.
+    ///
+    /// Storing a container into an aggregate (`models[i] = model`) hands the
+    /// payload's contents to that aggregate, so the resources the payload
+    /// holds travel with it and belong to the aggregate from then on. Only
+    /// resources that already name `payload` as their owner move: a plain
+    /// value stored into an aggregate keeps its own ownership, so a genuine
+    /// leak is still reported against the value that leaked it.
+    pub fn adoptOwnedResources(self: *Store, payload: VarId, container: VarId) void {
+        const payload_root = self.canonical(payload);
+        const container_root = self.canonical(container);
+        if (payload_root == container_root) return;
+        var iter = self.owners.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == payload_root) entry.value_ptr.* = container_root;
+        }
+    }
+
+    /// True when `container` owns at least one resource.
+    pub fn hasOwnedResources(self: *const Store, container: VarId) bool {
+        const root = self.canonical(container);
+        var iter = self.owners.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == root) return true;
+        }
+        return false;
     }
 
     pub fn markAllocated(self: *Store, region: VarId) !void {
@@ -1012,7 +1064,11 @@ pub const Store = struct {
     }
 
     /// Returns true if `self` is at least as general as `other`.
-    /// Missing entries in `self` are treated as unknown/no-info.
+    /// Missing entries in `self` are treated as unknown/no-info, except for
+    /// resources that `other` is known to still hold. Leak reporting is derived
+    /// from `.allocated` and `.open` alone, so neither absence nor `unknown` in
+    /// `self` may stand in for them: absorbing a held resource drops the state
+    /// that carries it and the leak goes with it.
     pub fn subsumes(self: *const Store, other: *const Store) bool {
         var res_iter = self.resources.iterator();
         while (res_iter.next()) |entry| {
@@ -1020,6 +1076,13 @@ pub const Store = struct {
             const self_state = entry.value_ptr.*;
             const other_state = other.resources.get(region) orelse .unknown;
             if (self_state != .unknown and self_state != other_state) return false;
+        }
+
+        var held_iter = other.resources.iterator();
+        while (held_iter.next()) |entry| {
+            if (!isHeldResource(entry.value_ptr.*)) continue;
+            const self_state = self.resources.get(entry.key_ptr.*) orelse return false;
+            if (self_state != entry.value_ptr.*) return false;
         }
 
         var alias_iter = self.aliases.iterator();
@@ -1341,7 +1404,9 @@ test "Store subsumes preserves violations" {
     const region = ids.varId(99);
     try specific.markAllocated(region);
 
-    try testing.expect(general.subsumes(&specific));
+    // A state that does not know about the allocation cannot stand in for one
+    // that does: the leak is only ever reported from a held resource.
+    try testing.expect(!general.subsumes(&specific));
 
     try specific.markFreed(region, 1);
     try specific.markFreed(region, 2);
@@ -1353,6 +1418,59 @@ test "Store subsumes preserves violations" {
     try general.markFreed(region, 2);
 
     try testing.expect(general.subsumes(&specific));
+}
+
+test "Store subsumes keeps held resources on the more precise side" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const region = ids.varId(7);
+    const other = ids.varId(8);
+
+    // An unknown entry stands in for a released or never-taken resource, which
+    // is the only reason a missing entry may stand in for anything at all.
+    var released = Store.init(allocator);
+    defer released.deinit();
+    try released.markFreed(region, 1);
+    var empty = Store.init(allocator);
+    defer empty.deinit();
+    try testing.expect(empty.subsumes(&released));
+
+    // Widening is where `.unknown` resource states come from.
+    var allocated = Store.init(allocator);
+    defer allocated.deinit();
+    try allocated.markAllocated(region);
+    var never_allocated = Store.init(allocator);
+    defer never_allocated.deinit();
+    try never_allocated.markNonAllocated(region);
+    var widened = try allocated.widen(&never_allocated, allocator);
+    defer widened.deinit();
+    try testing.expectEqual(ResourceState.unknown, widened.getState(region).?);
+    var holding = Store.init(allocator);
+    defer holding.deinit();
+    try holding.markAllocated(region);
+
+    // Neither absence nor `unknown` absorbs a resource that is still held.
+    try testing.expect(!empty.subsumes(&holding));
+    try testing.expect(!widened.subsumes(&holding));
+
+    // The same holds for an open handle, the other state leaks are reported from.
+    var opened = Store.init(allocator);
+    defer opened.deinit();
+    try opened.markOpened(region);
+    try testing.expect(!empty.subsumes(&opened));
+    try testing.expect(!widened.subsumes(&opened));
+
+    // The held resource must match exactly: a different region is a leak.
+    var other_region = Store.init(allocator);
+    defer other_region.deinit();
+    try other_region.markAllocated(other);
+    try testing.expect(!other_region.subsumes(&holding));
+
+    var matching = Store.init(allocator);
+    defer matching.deinit();
+    try matching.markAllocated(region);
+    try testing.expect(matching.subsumes(&holding));
 }
 
 test "Store violation clones isolate branches without allocating unchanged history" {

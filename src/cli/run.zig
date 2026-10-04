@@ -134,8 +134,11 @@ fn printUsage(io_context: *compat.Context) !void {
     try writer.writeAll("\n  Note: --do and --skip are mutually exclusive and override config file.\n");
     try writer.writeAll("\nArguments:\n");
     try writer.writeAll("  [path...]         Files or directories to analyze (default: current directory)\n");
-    try writer.writeAll("\nIgnored directories:\n");
-    try writer.writeAll("  zig-cache/, zig-out/, .zigmod/, .gyro/\n");
+    try writer.writeAll("\nIgnored directories (exact names, skipped while recursing):\n");
+    try writer.writeAll("  zig-cache/, .zig-cache/, .zig-global-cache/, zig-out/, .zigmod/, .gyro/,\n");
+    try writer.writeAll("  zig-pkg/, third_party/, .git/, .jj/\n");
+    try writer.writeAll("  Other hidden directories are scanned. A path given on the command line or\n");
+    try writer.writeAll("  with --file is always analyzed, even inside a skipped directory.\n");
     try stdout.flush();
 }
 

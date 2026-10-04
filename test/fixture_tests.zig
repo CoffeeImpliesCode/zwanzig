@@ -20,6 +20,7 @@ const UnusedParameterRule = src.rules.unused_parameter.UnusedParameterRule;
 const ReturnLocalPointerRule = src.rules.return_local_pointer.ReturnLocalPointerRule;
 const DeinitLifecycleRule = src.rules.deinit_lifecycle.DeinitLifecycleRule;
 const OptionalUnwrapEngineChecker = src.checkers.optional_unwrap_engine.OptionalUnwrapEngineChecker;
+const SwallowedErrorChecker = src.checkers.swallowed_error.SwallowedErrorChecker;
 const UnreachableCodeChecker = src.checkers.unreachable_code_checker.UnreachableCodeChecker;
 const StoreViolationsEngineChecker = src.checkers.store_violations_engine.StoreViolationsEngineChecker;
 const StackEscapeEngineChecker = src.checkers.stack_escape_engine.StackEscapeEngineChecker;
@@ -622,6 +623,10 @@ test "deinit_lifecycle fixtures" {
 
 test "optional_unwrap fixtures" {
     try runCheckerFixturesInDir(std.testing.allocator, &OptionalUnwrapEngineChecker.checker, "test/fixtures/optional_unwrap");
+}
+
+test "swallowed_error fixtures" {
+    try runCheckerFixturesInDir(std.testing.allocator, &SwallowedErrorChecker.checker, "test/fixtures/swallowed_error");
 }
 
 test "unreachable_code_engine fixtures" {

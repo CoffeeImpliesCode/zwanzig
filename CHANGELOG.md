@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Captured-error storage now suppresses `swallowed-error` only when every continuing handler path records the caught payload outside the handler. Partial, unreachable, local-only, and shadowed-payload stores no longer hide warnings.
+- Fake or mutable `std.testing` namespace aliases no longer hide unused declarations through `refAllDecls` or `refAllDeclsRecursive`. Genuine immutable import and namespace aliases remain supported.
+- Initialization methods now suppress `optional-unwrap` only when the field is non-null at every successful exit, after deferred writes. Conditional initialization, later resets, and mutating return paths no longer hide unsafe unwraps.
+- Benchmark documentation now lists all matching workload, analyzer, execution, and completion checks required before comparing results. (#1)
+- Type and import resolution now log the search and frame limit when a bounded walk stops early, instead of silently treating the result as unresolved. (#2)
+- Recursive file discovery now skips current Zig cache layouts, dependency directories, and Git/Jujutsu metadata. Other hidden directories remain included, and explicit file or directory selections override exclusions. (#3)
+- Optional-unwrap warnings inside `for` loops now explain that separate validation passes do not establish a tracked non-null proof. Writes inside the consuming loop remain reported. (#4)
+- Field assertions now survive writes to independent local values and slice headers without treating writes through elements or pointer fields as disjoint. (#44)
+- Allocation failures during frontend generation, metadata extraction, and duplicate-import reporting now propagate without leaking partial results or silently dropping findings. (#57)
+- Default dataflow analysis now preserves resource ownership and possible-zero values across acyclic branch joins. Loop widening remains enabled; joins no longer hide leaks or possible division by zero. (#21, #25)
+- Labeled block exits now retain their branch constraints and execute reached scope defers before the jump. Guarded division stays quiet; break operands and deferred zero assignments remain checked. (#25)
 - Syntax errors now produce `parse-error` diagnostics without stopping analysis of valid sibling files. Failed type preflight reports `frontend-error`, skips required typed checks, and preserves optional AST fallback.
 - An analysis that stops at a configured worklist or state budget now reports `analysis-limit-exceeded` for the affected function, naming the limit and the value reached, instead of only logging a warning. Findings that need a complete dataflow analysis of that function are missing rather than absent, so the run can no longer exit 0 with suppressed results.
 - Optional-unwrap proofs now inspect every block statement. Assignments and mutations after statement 64 no longer cause false warnings or hide unsafe unwraps. Ordinary blocks borrow the AST statement slice without allocation or copying.
@@ -34,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed stack overflows when the Zig 0.16.0 frontend analyzes generic container parameters or `unused-decl` follows cyclic aliases and namespace imports.
 - Fixed excess analysis concurrency with `--threads 1` on Zig 0.16.0 and double-free failures when the analysis graph runs out of memory.
 - Fixed optional-unwrap false positives after field assertions and calls that write a different struct field. Self-lint now reports failures in CI.
+- A release wrapper is now recognized when the callee leaves a leading parameter unnamed, as `closeDir(_: *Context, directory: *Directory)` does. A `compat`-style directory handle closed that way is no longer reported as leaked, while a wrapper that closes behind a branch, closes a second resource field, or is only named like a close still is.
+- Returning a member of a declared error set (`return ConfigError.InvalidConfigFormat;`) now takes the error path, so the `errdefer` cleanup for that path runs and resources still live on it are no longer reported as leaked. Modeling that path also exposed a real double free in this project's own escape-model parser, where an error return freed a slice its `errdefer` frees again; the redundant frees are gone.
+- Storing a value into an aggregate no longer lets that value escape. A returned aggregate keeps the payload resources handed to it, and a store that cannot be proven to land in a fresh slot - a cursor that advances by zero, a constant index, a later write through the aggregate, or an aggregate that is replaced - keeps reporting the dropped payload.
 
 ### Changed
 
@@ -45,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - A reproducible benchmark runner freezes the source trees you name, defaults to Zwanzig's own sources, and compares diagnostic multisets, exit status and analysis-limit warnings exactly between two runs.
+- Conditional constructor field proofs now support private, closed-source type factories. Caller resets, alternate nullable constructions, public factories, and opaque pointer or callback escapes keep unsafe unwraps reported.
 
 ## [0.15.1]
 

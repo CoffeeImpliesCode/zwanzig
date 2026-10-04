@@ -6,6 +6,16 @@ const ast_walk = @import("../ast_walk.zig");
 const TypeContext = @import("../type_context.zig").TypeContext;
 const TypeInfo = @import("../zir_bridge.zig").TypeInfo;
 
+const log = std.log.scoped(.call_resolver);
+
+/// Frames a bounded resolution walk in this file may consume before it has to
+/// answer conservatively. The limit bounds stack use; it is not evidence that
+/// the chain is absent, so every exit at the limit names the walk that stopped.
+const resolution_budget_frames: usize = 64;
+
+/// Parent-map climb budget for ancestor queries, reported like any other one.
+const ancestor_map_budget_frames: usize = 256;
+
 pub const ResolvedType = struct {
     file_index: usize,
     type_name: ?[]const u8 = null,
@@ -157,6 +167,18 @@ pub fn constructFqn(
     return buffer[0..pos];
 }
 
+/// Path of the file a `TypeContext` tree belongs to, so a budget cut-off can
+/// name the source it truncated.
+fn typeContextFilePath(type_ctx: *TypeContext, tree: *const std.zig.Ast) ?[]const u8 {
+    if (type_ctx.project_resolver) |project| {
+        for (project.files) |file| {
+            if (file.tree == tree) return file.path;
+        }
+        return null;
+    }
+    return type_ctx.source.file_path;
+}
+
 pub fn resolveResultLocationType(
     tree: *const std.zig.Ast,
     type_ctx: *TypeContext,
@@ -169,7 +191,12 @@ pub fn resolveResultLocationType(
 
     var node = expr_node;
     var depth: u32 = 0;
-    while (node < parent_map.len and depth < 64) : (depth += 1) {
+    while (node < parent_map.len) {
+        if (depth >= resolution_budget_frames) {
+            reportResolutionBudget("result-location parent climb", resolution_budget_frames, typeContextFilePath(type_ctx, tree));
+            return null;
+        }
+        depth += 1;
         const parent = parent_map[node];
         if (parent == 0 or parent >= tags.len) break;
 
@@ -212,7 +239,7 @@ pub fn resolveResultLocationType(
                 return null;
             },
             .@"return" => {
-                if (findAncestorFn(tags, parent_map, parent)) |fn_node| {
+                if (findAncestorFn(type_ctx, tree, parent_map, parent)) |fn_node| {
                     if (type_ctx.getContainingFunctionReturnType(fn_node)) |ti| {
                         if (!isUnknownTypeInfo(ti)) return ti;
                     }
@@ -283,7 +310,17 @@ const BindingResolution = struct {
 
 const ScopeRange = lexical_index.ScopeRange;
 
-const CallableInfo = struct {
+/// Identity of the function a call expression actually reaches.
+///
+/// `file_index` and `proto_node` together name one prototype in one project
+/// file, so a consumer can compare a resolved callee against another one for
+/// equality without re-deriving either half. `implicit_self_count` is the
+/// number of leading prototype parameters that are not written at the call
+/// site; explicit argument `i` is prototype parameter `i + implicit_self_count`.
+/// A prototype that only resolves for some receivers (a generic, or a member
+/// found through a type the receiver expression does not pin down) is never
+/// reported here: the record is only produced once the binding is unambiguous.
+pub const CallableInfo = struct {
     proto_node: u32,
     file_index: usize,
     implicit_self_count: usize,
@@ -520,13 +557,16 @@ pub const ProjectTypeResolver = struct {
     }
 
     fn resolveExpectedTypeNode(self: ProjectTypeResolver, expression: u32, depth: u8) ?ResolvedTypeNode {
-        if (depth >= 64) return null;
+        if (depth >= resolution_budget_frames) {
+            reportResolutionBudget("expected-type resolution", resolution_budget_frames, self.currentFile().path);
+            return null;
+        }
         const tree = self.currentFile().tree;
         if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
         const datas = tree.nodes.items(.data);
         var node = expression;
-        for (0..64) |_| {
+        for (0..resolution_budget_frames) |_| {
             const parent = self.parentNode(node) orelse return null;
             switch (tags[parent]) {
                 .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
@@ -571,11 +611,15 @@ pub const ProjectTypeResolver = struct {
                 else => return null,
             }
         }
+        reportResolutionBudget("expected-type parent climb", resolution_budget_frames, self.currentFile().path);
         return null;
     }
 
     fn resolveArgumentTypeAtNode(self: ProjectTypeResolver, call_node: u32, argument: u32, depth: u8) ?ResolvedTypeNode {
-        if (depth >= 64) return null;
+        if (depth >= resolution_budget_frames) {
+            reportResolutionBudget("call-argument type resolution", resolution_budget_frames, self.currentFile().path);
+            return null;
+        }
         const tree = self.currentFile().tree;
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, @enumFromInt(call_node)) orelse return null;
@@ -629,30 +673,172 @@ pub const ProjectTypeResolver = struct {
         };
     }
 
+    /// Direct `@import(import_path)` binding proof; this does not follow aliases.
     pub fn isVerifiedImportBinding(
         self: ProjectTypeResolver,
         node: usize,
         import_path: []const u8,
     ) bool {
         const tree = self.currentFile().tree;
-        const tags = tree.nodes.items(.tag);
-        const declaration_node = self.resolveDeclarationNode(node) orelse return false;
-        if (declaration_node >= tags.len or !import_resolver.isVarDeclTag(tags[declaration_node])) return false;
-        const full = tree.fullVarDecl(@enumFromInt(declaration_node)) orelse return false;
-        const init_node = full.ast.init_node.unwrap() orelse return false;
-        const declared_path = import_resolver.importPathFromBuiltinCall(
-            tree,
-            @intFromEnum(init_node),
-        ) orelse return false;
+        const declaration_node = self.resolveBindingDeclaration(node) orelse return false;
+        const init_node = self.varDeclInitializer(declaration_node) orelse return false;
+        const declared_path = import_resolver.importPathFromBuiltinCall(tree, init_node) orelse return false;
         return std.mem.eql(u8, declared_path, import_path);
     }
 
-    fn resolveCallableAtCall(self: ProjectTypeResolver, call_node: u32) ?CallableInfo {
+    /// Verified `std.testing` namespace identity for the receiver of a
+    /// reflection call. Only genuine `@import("std")` provenance counts, so a
+    /// user declaration spelled like `std.testing` cannot stand in for the real
+    /// namespace, while immutable aliases of the namespace stay trusted.
+    pub fn isStdTestingNamespaceExpr(self: ProjectTypeResolver, node: usize) bool {
+        if (self.currentFile().tree.errors.len != 0) return false;
+        var visited: [resolution_budget_frames]u32 = undefined;
+        return self.isStdTestingNamespaceExprVisited(node, &visited, 0);
+    }
+
+    /// Record a binding on the current walk's chain. Returns false when the
+    /// walk must stop: a repeated binding is a cycle, an exhausted budget is
+    /// a truncation, and only the truncation is reported.
+    fn recordVisitedBinding(
+        self: ProjectTypeResolver,
+        visited: *[resolution_budget_frames]u32,
+        depth: usize,
+        declaration_node: u32,
+        walk: []const u8,
+    ) bool {
+        return switch (pushVisitedBinding(visited, depth, declaration_node)) {
+            .recorded => true,
+            .repeated => false,
+            .exhausted => blk: {
+                reportResolutionBudget(walk, resolution_budget_frames, self.currentFile().path);
+                break :blk false;
+            },
+        };
+    }
+
+    fn isStdTestingNamespaceExprVisited(
+        self: ProjectTypeResolver,
+        node: usize,
+        visited: *[resolution_budget_frames]u32,
+        depth: usize,
+    ) bool {
+        const tree = self.currentFile().tree;
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return false;
+        if (depth >= visited.len) {
+            reportResolutionBudget("std.testing namespace alias walk", resolution_budget_frames, self.currentFile().path);
+            return false;
+        }
+
+        switch (tags[node]) {
+            .field_access => {
+                const access = tree.nodes.items(.data)[node].node_and_token;
+                const member_name = import_resolver.normalizeIdentifier(tree.tokenSlice(access[1]));
+                if (!std.mem.eql(u8, member_name, "testing")) return false;
+                return self.isVerifiedImportExprVisited(@intFromEnum(access[0]), "std", visited, depth, true);
+            },
+            .identifier => {
+                const declaration_node = self.resolveBindingDeclaration(node) orelse return false;
+                if (!self.recordVisitedBinding(visited, depth, declaration_node, "std.testing namespace alias walk")) return false;
+                const init = self.constInitializer(self.file_index, declaration_node) orelse return false;
+                return self.isStdTestingNamespaceExprVisited(init.node_index, visited, depth + 1);
+            },
+            .grouped_expression,
+            .unwrap_optional,
+            => return self.isStdTestingNamespaceExprVisited(
+                @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]),
+                visited,
+                depth,
+            ),
+            else => return false,
+        }
+    }
+
+    fn isVerifiedImportExprVisited(
+        self: ProjectTypeResolver,
+        node: usize,
+        import_path: []const u8,
+        visited: *[resolution_budget_frames]u32,
+        depth: usize,
+        comptime const_only: bool,
+    ) bool {
+        const tree = self.currentFile().tree;
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return false;
+        if (depth >= visited.len) {
+            reportResolutionBudget("verified-import alias walk", resolution_budget_frames, self.currentFile().path);
+            return false;
+        }
+
+        switch (tags[node]) {
+            .identifier => {
+                const declaration_node = self.resolveBindingDeclaration(node) orelse return false;
+                if (!self.recordVisitedBinding(visited, depth, declaration_node, "verified-import alias walk")) return false;
+                const init_node = if (const_only)
+                    (self.constInitializer(self.file_index, declaration_node) orelse return false).node_index
+                else
+                    self.varDeclInitializer(declaration_node) orelse return false;
+                return self.isVerifiedImportExprVisited(init_node, import_path, visited, depth + 1, const_only);
+            },
+            .builtin_call,
+            .builtin_call_comma,
+            .builtin_call_two,
+            .builtin_call_two_comma,
+            => {
+                const declared_path = import_resolver.importPathFromBuiltinCall(tree, node) orelse return false;
+                return std.mem.eql(u8, declared_path, import_path);
+            },
+            .grouped_expression,
+            .unwrap_optional,
+            => return self.isVerifiedImportExprVisited(
+                @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]),
+                import_path,
+                visited,
+                depth,
+                const_only,
+            ),
+            else => return false,
+        }
+    }
+
+    /// Lexical binding of an identifier reference, ignoring its value.
+    /// Malformed files never yield a binding, so provenance checks fail closed.
+    fn resolveBindingDeclaration(self: ProjectTypeResolver, node: usize) ?u32 {
+        const tree = self.currentFile().tree;
+        if (tree.errors.len != 0) return null;
+        const name = import_resolver.identifierName(tree, node) orelse return null;
+        return self.findNearestBinding(name, node).declaration_node;
+    }
+
+    /// Initializer of the `const`/`var` binding at `declaration_node`; only
+    /// those declarations can carry import provenance.
+    fn varDeclInitializer(self: ProjectTypeResolver, declaration_node: u32) ?u32 {
+        const tree = self.currentFile().tree;
+        const tags = tree.nodes.items(.tag);
+        if (declaration_node >= tags.len or !import_resolver.isVarDeclTag(tags[declaration_node])) return null;
+        const full = tree.fullVarDecl(@enumFromInt(declaration_node)) orelse return null;
+        const init_node = full.ast.init_node.unwrap() orelse return null;
+        return @intFromEnum(init_node);
+    }
+
+    /// Resolve the function a call expression reaches, across the whole
+    /// project: a namespace-qualified or re-exported callee is followed to
+    /// the prototype that defines it.
+    ///
+    /// Returns null when the callee is not a project function, when the file
+    /// has parse errors, or when the binding is ambiguous; callers must read
+    /// that as "unknown", never as "some other function". The prototype and
+    /// the file holding it are borrowed from `self.files` and stay valid as
+    /// long as the resolver's file list does.
+    pub fn resolveCallableAtCall(self: ProjectTypeResolver, call_node: u32) ?CallableInfo {
         return self.resolveCallableAtCallDepth(call_node, 0);
     }
 
     fn resolveCallableAtCallDepth(self: ProjectTypeResolver, call_node: u32, depth: u8) ?CallableInfo {
-        if (depth >= 64) return null;
+        if (depth >= resolution_budget_frames) {
+            reportResolutionBudget("callable resolution", resolution_budget_frames, self.currentFile().path);
+            return null;
+        }
         const tree = self.currentFile().tree;
         if (tree.errors.len != 0) return null;
         const tags = tree.nodes.items(.tag);
@@ -1330,19 +1516,23 @@ pub const ProjectTypeResolver = struct {
     }
 
     fn isStdAllocatorExpr(self: ProjectTypeResolver, node: usize) bool {
-        var visited: [64]u32 = undefined;
+        var visited: [resolution_budget_frames]u32 = undefined;
         return self.isStdAllocatorExprVisited(node, &visited, 0);
     }
 
     fn isStdAllocatorExprVisited(
         self: ProjectTypeResolver,
         node: usize,
-        visited: *[64]u32,
+        visited: *[resolution_budget_frames]u32,
         depth: usize,
     ) bool {
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
-        if (node >= tags.len or depth >= visited.len) return false;
+        if (node >= tags.len) return false;
+        if (depth >= visited.len) {
+            reportResolutionBudget("std.mem.Allocator expression walk", resolution_budget_frames, self.currentFile().path);
+            return false;
+        }
 
         switch (tags[node]) {
             .field_access => {
@@ -1352,8 +1542,7 @@ pub const ProjectTypeResolver = struct {
                 return self.isStdMemExprVisited(@intFromEnum(access[0]), visited, depth);
             },
             .identifier => {
-                const name = import_resolver.identifierName(tree, node) orelse return false;
-                const declaration_node = self.findNearestBinding(name, node).declaration_node orelse return false;
+                const declaration_node = self.resolveBindingDeclaration(node) orelse return false;
                 return self.isStdAllocatorBinding(declaration_node, visited, depth);
             },
             .grouped_expression,
@@ -1387,12 +1576,10 @@ pub const ProjectTypeResolver = struct {
     fn isStdAllocatorBinding(
         self: ProjectTypeResolver,
         declaration_node: u32,
-        visited: *[64]u32,
+        visited: *[resolution_budget_frames]u32,
         depth: usize,
     ) bool {
-        if (depth >= visited.len) return false;
-        if (std.mem.indexOfScalar(u32, visited[0..depth], declaration_node) != null) return false;
-        visited[depth] = declaration_node;
+        if (!self.recordVisitedBinding(visited, depth, declaration_node, "std.mem.Allocator binding walk")) return false;
 
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
@@ -1414,23 +1601,26 @@ pub const ProjectTypeResolver = struct {
     fn isStdMemExprVisited(
         self: ProjectTypeResolver,
         node: usize,
-        visited: *[64]u32,
+        visited: *[resolution_budget_frames]u32,
         depth: usize,
     ) bool {
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
-        if (node >= tags.len or depth >= visited.len) return false;
+        if (node >= tags.len) return false;
+        if (depth >= visited.len) {
+            reportResolutionBudget("std.mem namespace walk", resolution_budget_frames, self.currentFile().path);
+            return false;
+        }
 
         switch (tags[node]) {
             .field_access => {
                 const access = tree.nodes.items(.data)[node].node_and_token;
                 const member_name = import_resolver.normalizeIdentifier(tree.tokenSlice(access[1]));
                 if (!std.mem.eql(u8, member_name, "mem")) return false;
-                return self.isStdImportExprVisited(@intFromEnum(access[0]), visited, depth);
+                return self.isVerifiedImportExprVisited(@intFromEnum(access[0]), "std", visited, depth, false);
             },
             .identifier => {
-                const name = import_resolver.identifierName(tree, node) orelse return false;
-                const declaration_node = self.findNearestBinding(name, node).declaration_node orelse return false;
+                const declaration_node = self.resolveBindingDeclaration(node) orelse return false;
                 return self.isStdMemBinding(declaration_node, visited, depth);
             },
             else => return false,
@@ -1440,12 +1630,10 @@ pub const ProjectTypeResolver = struct {
     fn isStdMemBinding(
         self: ProjectTypeResolver,
         declaration_node: u32,
-        visited: *[64]u32,
+        visited: *[resolution_budget_frames]u32,
         depth: usize,
     ) bool {
-        if (depth >= visited.len) return false;
-        if (std.mem.indexOfScalar(u32, visited[0..depth], declaration_node) != null) return false;
-        visited[depth] = declaration_node;
+        if (!self.recordVisitedBinding(visited, depth, declaration_node, "std.mem binding walk")) return false;
 
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
@@ -1460,31 +1648,6 @@ pub const ProjectTypeResolver = struct {
         }
         if (full.ast.init_node.unwrap()) |init_node| {
             if (self.isStdMemExprVisited(@intFromEnum(init_node), visited, depth + 1)) return true;
-        }
-        return false;
-    }
-
-    fn isStdImportExprVisited(
-        self: ProjectTypeResolver,
-        node: usize,
-        visited: *[64]u32,
-        depth: usize,
-    ) bool {
-        const tree = self.currentFile().tree;
-        const tags = tree.nodes.items(.tag);
-        if (node >= tags.len or depth >= visited.len) return false;
-        if (tags[node] != .identifier) return false;
-
-        const name = import_resolver.identifierName(tree, node) orelse return false;
-        const declaration_node = self.findNearestBinding(name, node).declaration_node orelse return false;
-        if (std.mem.indexOfScalar(u32, visited[0..depth], declaration_node) != null) return false;
-        visited[depth] = declaration_node;
-
-        if (declaration_node >= tags.len or !import_resolver.isVarDeclTag(tags[declaration_node])) return false;
-        const full = tree.fullVarDecl(@enumFromInt(declaration_node)) orelse return false;
-        const init_node = full.ast.init_node.unwrap() orelse return false;
-        if (import_resolver.importPathFromBuiltinCall(tree, @intFromEnum(init_node))) |import_path| {
-            return std.mem.eql(u8, import_path, "std");
         }
         return false;
     }
@@ -1528,7 +1691,7 @@ pub const ProjectTypeResolver = struct {
                 const pair = tree.nodes.items(.data)[node].node_and_node;
                 const base_type = self.resolveExprTypeNode(@intFromEnum(pair[0])) orelse return null;
                 const base_resolver = self.forFile(base_type.file_index);
-                var visited: [64]u32 = undefined;
+                var visited: [resolution_budget_frames]u32 = undefined;
                 return base_resolver.resolveArrayElementTypeNode(base_type.node_index, &visited, 0);
             },
             .call,
@@ -1652,12 +1815,16 @@ pub const ProjectTypeResolver = struct {
     fn resolveArrayElementTypeNode(
         self: ProjectTypeResolver,
         node: usize,
-        visited: *[64]u32,
+        visited: *[resolution_budget_frames]u32,
         depth: usize,
     ) ?ResolvedTypeNode {
         const tree = self.currentFile().tree;
         const tags = tree.nodes.items(.tag);
-        if (node >= tags.len or depth >= visited.len) return null;
+        if (node >= tags.len) return null;
+        if (depth >= visited.len) {
+            reportResolutionBudget("array element type walk", resolution_budget_frames, self.currentFile().path);
+            return null;
+        }
 
         switch (tags[node]) {
             .slice,
@@ -1963,6 +2130,46 @@ pub const ProjectTypeResolver = struct {
         return null;
     }
 };
+
+const VisitedBinding = enum {
+    /// Recorded on the current chain; the walk may continue.
+    recorded,
+    /// Already on the current chain; an alias cycle ends the walk.
+    repeated,
+    /// The chain budget ran out; the walk is truncated, not cycled.
+    exhausted,
+};
+
+/// Name a walk that stopped at its frame budget. The answer stays
+/// conservative, but the cut-off is reported so a truncated search is never
+/// read as a chain that does not exist.
+fn reportResolutionBudget(walk: []const u8, frames: usize, path: ?[]const u8) void {
+    const file = if (path) |candidate| candidate else "";
+    if (file.len == 0) {
+        log.warn("resolution budget exceeded: {s} stopped at the {d}-frame limit; the answer stays conservative", .{
+            walk,
+            frames,
+        });
+        return;
+    }
+    log.warn("resolution budget exceeded: {s} stopped at the {d}-frame limit in {s}; the answer stays conservative", .{
+        walk,
+        frames,
+        file,
+    });
+}
+
+/// Record `declaration_node` on the current trusted-import resolution chain.
+/// Returns `repeated` when the binding is already recorded and `exhausted`
+/// when the chain budget ran out; either one stops the walk, and only the
+/// second is a budget report.
+fn pushVisitedBinding(visited: *[resolution_budget_frames]u32, depth: usize, declaration_node: u32) VisitedBinding {
+    if (depth >= visited.len) return .exhausted;
+    if (std.mem.indexOfScalar(u32, visited[0..depth], declaration_node) != null) return .repeated;
+    visited[depth] = declaration_node;
+    return .recorded;
+}
+
 fn functionProtoNode(tree: *const std.zig.Ast, node: u32) ?u32 {
     const tags = tree.nodes.items(.tag);
     if (node >= tags.len) return null;
@@ -2130,10 +2337,21 @@ fn isUnknownTypeInfo(info: TypeInfo) bool {
     return info.kind == .unknown and info.type_str == null and !info.hasSentinel();
 }
 
-fn findAncestorFn(tags: []const std.zig.Ast.Node.Tag, parent_map: []const u32, start_node: u32) ?u32 {
+fn findAncestorFn(
+    type_ctx: *TypeContext,
+    tree: *const std.zig.Ast,
+    parent_map: []const u32,
+    start_node: u32,
+) ?u32 {
+    const tags = tree.nodes.items(.tag);
     var node = start_node;
     var depth: u32 = 0;
-    while (node < parent_map.len and depth < 64) : (depth += 1) {
+    while (node < parent_map.len) {
+        if (depth >= resolution_budget_frames) {
+            reportResolutionBudget("enclosing-function parent climb", resolution_budget_frames, typeContextFilePath(type_ctx, tree));
+            return null;
+        }
+        depth += 1;
         const parent = parent_map[node];
         if (parent == 0 or parent >= tags.len) return null;
         if (tags[parent] == .fn_decl) return parent;
@@ -2174,7 +2392,12 @@ fn nodeIsAncestor(ancestor: u32, descendant: u32, parent_map: []const u32) bool 
     if (ancestor == descendant) return true;
     var node = descendant;
     var depth: u32 = 0;
-    while (node < parent_map.len and depth < 256) : (depth += 1) {
+    while (node < parent_map.len) {
+        if (depth >= ancestor_map_budget_frames) {
+            reportResolutionBudget("ancestor-map climb", ancestor_map_budget_frames, null);
+            return false;
+        }
+        depth += 1;
         const parent = parent_map[node];
         if (parent == 0 or parent >= parent_map.len) return false;
         if (parent == ancestor) return true;

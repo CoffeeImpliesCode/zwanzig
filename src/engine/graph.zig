@@ -247,7 +247,9 @@ pub const ExplodedGraph = struct {
     /// Flow:
     /// 1. Apply optional widening at the current program point.
     /// 2. Deduplicate by (point, state) hash as usual.
-    /// 3. Drop states subsumed by an existing node at this point.
+    /// 3. Drop states subsumed by an existing node at this point. Subsumption
+    ///    continues from the existing node, so it may only absorb a state that
+    ///    adds no fact the checkers read; see `Store.subsumes`.
     /// 4. At the state cap, widen in the same context or return AnalysisLimitExceeded.
     /// 5. Otherwise, create a new node.
     /// On error, the caller retains ownership of the input state.

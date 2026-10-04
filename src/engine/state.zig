@@ -87,7 +87,8 @@ pub const CallSite = struct {
 };
 
 /// Key for identifying a widening point in a specific interprocedural context.
-/// Used to track states at loop headers and other join points for widening.
+/// Used to track states at loop headers, the only points where a state can be
+/// replaced after the point was already processed.
 /// States from different calling contexts must not be merged.
 pub const WideningKey = struct {
     /// Hash of the ProgramPoint (node + CFG + pre/post)
@@ -351,6 +352,17 @@ pub const ProgramState = struct {
     pub fn trackOwnership(self: *ProgramState, resource: VarId, container: VarId) !void {
         try self.store.recordOwnership(resource, container);
         self.invalidateCache();
+    }
+
+    /// Hand a payload's owned resources to the aggregate storing it.
+    pub fn adoptOwnedResources(self: *ProgramState, payload: VarId, container: VarId) void {
+        self.store.adoptOwnedResources(payload, container);
+        self.invalidateCache();
+    }
+
+    /// True when `container` owns at least one resource in this state.
+    pub fn hasOwnedResources(self: *const ProgramState, container: VarId) bool {
+        return self.store.hasOwnedResources(container);
     }
 
     /// Track a region aliasing another region.

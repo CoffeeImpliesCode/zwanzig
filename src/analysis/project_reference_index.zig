@@ -3,6 +3,9 @@ const ast_walk = @import("../ast_walk.zig");
 const import_resolver = @import("import_resolver.zig");
 const ProjectTypeResolver = @import("call_resolver.zig").ProjectTypeResolver;
 
+/// No build script supplied a name table for this file set.
+const no_module_names: import_resolver.ModuleNames = .empty;
+
 /// Invocation-owned namespace edges. Resolver files and their ASTs remain borrowed.
 pub const ProjectReferenceIndex = struct {
     arena: std.heap.ArenaAllocator,
@@ -123,6 +126,15 @@ pub const ProjectReferenceIndex = struct {
         }
     }
 
+    /// Build-registered import names shared with the path resolver, so both
+    /// spellings of an import name answer from the same build context.
+    fn moduleNames(self: *const ProjectReferenceIndex) *const import_resolver.ModuleNames {
+        if (self.files.len != 0) {
+            if (self.files[0].path_index) |index| return &index.module_names;
+        }
+        return &no_module_names;
+    }
+
     fn importTargets(self: *ProjectReferenceIndex, file: usize, path: []const u8) Error![]const usize {
         if (self.file_indexes[file].imports.get(path)) |cached| return cached;
         var result: std.ArrayList(usize) = .empty;
@@ -136,7 +148,14 @@ pub const ProjectReferenceIndex = struct {
                 try self.appendMatching(&result, candidates.items, file, path);
             }
         } else |_| {}
-        if (self.package_names.get(path)) |candidates| try self.appendMatching(&result, candidates.items, file, path);
+        // A build-registered name names one module root, and the basename stem
+        // cannot tell that root from an unrelated file sharing its stem, so the
+        // registration is the only answer for a name the build binds.
+        if (import_resolver.registeredModuleTarget(self.moduleNames(), path)) |registered| {
+            try result.append(self.arena.allocator(), registered);
+        } else if (self.package_names.get(path)) |candidates| {
+            try self.appendMatching(&result, candidates.items, file, path);
+        }
         // usingnamespace follows the first matching file, just like the resolver.
         std.mem.sort(usize, result.items, {}, std.sort.asc(usize));
         try self.file_indexes[file].imports.put(self.arena.allocator(), path, result.items);

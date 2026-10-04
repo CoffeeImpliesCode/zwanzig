@@ -442,18 +442,16 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
         if (param_array.items.len == 0) return ConfigError.InvalidConfigFormat;
 
         var indices = try allocator.alloc(u32, param_array.items.len);
+        // Keep indices locally owned until the completed model is appended.
         errdefer allocator.free(indices);
         for (param_array.items, 0..) |param_item, i| {
             if (param_item != .integer) {
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             }
             if (param_item.integer < 0) {
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             }
             indices[i] = std.math.cast(u32, param_item.integer) orelse {
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             };
         }
@@ -465,7 +463,6 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
 
         if (model_obj.get("fqn")) |v| {
             if (v != .string) {
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             }
             model.fqn = try allocator.dupe(u8, v.string);
@@ -474,7 +471,6 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
         if (model_obj.get("method_name")) |v| {
             if (v != .string) {
                 if (model.fqn) |name| allocator.free(name);
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             }
             model.method_name = try allocator.dupe(u8, v.string);
@@ -484,7 +480,6 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
             if (v != .string) {
                 if (model.fqn) |name| allocator.free(name);
                 if (model.method_name) |name| allocator.free(name);
-                allocator.free(indices);
                 return ConfigError.InvalidConfigFormat;
             }
             model.receiver_type = try allocator.dupe(u8, v.string);
@@ -495,7 +490,6 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
             if (model.fqn) |name| allocator.free(name);
             if (model.method_name) |name| allocator.free(name);
             if (model.receiver_type) |ty| allocator.free(ty);
-            allocator.free(indices);
             return ConfigError.InvalidConfigFormat;
         }
 
@@ -784,6 +778,28 @@ test "parseConfig: escape_models" {
     try std.testing.expectEqualStrings("append", second.method_name.?);
     try std.testing.expectEqualStrings("std.ArrayList", second.receiver_type.?);
     try std.testing.expectEqual(EscapeCapture.receiver, second.captures_into);
+}
+
+test "parseConfig: invalid escape models release partially parsed indices and names" {
+    const inputs = [_][]const u8{
+        \\{"escape_models":[{"param_indices":["bad"],"fqn":"match","captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[-1],"fqn":"match","captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[4294967296],"fqn":"match","captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[0],"fqn":12,"captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[0],"fqn":"match","method_name":12,"captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[0],"fqn":"match","method_name":"run","receiver_type":12,"captures_into":"return"}]}
+        ,
+        \\{"escape_models":[{"param_indices":[0],"captures_into":"return"}]}
+        ,
+    };
+    for (inputs) |content| {
+        try std.testing.expectError(ConfigError.InvalidConfigFormat, parseConfig(std.testing.allocator, content));
+    }
 }
 
 test "parseConfig: resource_models invalid kind" {

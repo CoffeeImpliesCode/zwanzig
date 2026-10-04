@@ -577,6 +577,7 @@ The IR (`src/ir.zig`) defines:
 | `errdefer_stmt` | Errdefer statement body |
 | `try_expr` | Try expression - propagates errors to caller |
 | `catch_expr` | Catch expression - handles errors locally |
+| `break_stmt` | Labeled-block exit, after operand evaluation and before exited-scope defers |
 
 ### IR node structure
 

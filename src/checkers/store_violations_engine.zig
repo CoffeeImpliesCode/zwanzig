@@ -11,6 +11,7 @@ const ResourceModel = config_mod.ResourceModel;
 const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
 const store_mod = @import("../engine/store.zig");
+const import_resolver = @import("../analysis/import_resolver.zig");
 const StoreViolation = store_mod.StoreViolation;
 
 /// Engine-based checker that reports store violations (double-free, free without alloc).
@@ -265,6 +266,213 @@ test "store_violations_engine keeps fractional and wide integer paths reachable"
             for (diagnostics.items) |diagnostic| {
                 try std.testing.expectEqual(@as(usize, 8), diagnostic.range.start.line);
                 try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "double-free") != null);
+            }
+        }
+    }
+}
+
+/// Consumer findings for the resource checker, keyed by the shape of the guard
+/// around the allocation. The fractional and wide-integer bodies are the ones the
+/// consumer reports for issue #21: their numeric domain has no witness the
+/// engine's integer lattice can represent, so the state entering the guard's
+/// join is identical on both sides of it.
+const resource_cases = [_]struct { name: []const u8, code: [:0]const u8, expected: usize, message: []const u8 }{
+    .{ .name = "leak under a fractional guard", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn fractionalLeak(allocator: std.mem.Allocator, input: f64) !void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            var ptr = try allocator.alloc(u8, 1);
+    \\            std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "double free under a fractional guard", .expected = 1, .message = "double-free", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn fractionalDoubleFree(allocator: std.mem.Allocator, input: f64) void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            const ptr = allocator.alloc(u8, 1) catch return;
+    \\            allocator.free(ptr);
+    \\            allocator.free(ptr);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "use after free under a fractional guard", .expected = 1, .message = "use after free", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn fractionalUseAfterFree(allocator: std.mem.Allocator, input: f64) void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            const ptr = allocator.alloc(u8, 1) catch return;
+    \\            allocator.free(ptr);
+    \\            std.mem.doNotOptimizeAway(ptr);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "empty integer guard stays silent", .expected = 0, .message = "", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn unreachableDoubleFree(allocator: std.mem.Allocator, input: i32) void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            const ptr = allocator.alloc(u8, 1) catch return;
+    \\            allocator.free(ptr);
+    \\            allocator.free(ptr);
+    \\        }
+    \\    }
+    \\}
+    \\
+    \\fn unreachableUseAfterFree(allocator: std.mem.Allocator, input: i32) void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            const ptr = allocator.alloc(u8, 1) catch return;
+    \\            allocator.free(ptr);
+    \\            std.mem.doNotOptimizeAway(ptr);
+    \\        }
+    \\    }
+    \\}
+    \\
+    \\fn unreachableLeak(allocator: std.mem.Allocator, input: i32) !void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value < 1) {
+    \\            var ptr = try allocator.alloc(u8, 1);
+    \\            std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "leak under a wide unsigned guard", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn wideUnsignedLeak(allocator: std.mem.Allocator, input: u64) !void {
+    \\    const value = input;
+    \\    if (value > 0) {
+    \\        if (value > 9223372036854775807) {
+    \\            var ptr = try allocator.alloc(u8, 1);
+    \\            std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "leak under a wide signed guard", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn wideSignedLeak(allocator: std.mem.Allocator, input: i128) !void {
+    \\    const value = input;
+    \\    if (value < 0) {
+    \\        if (value < -9223372036854775808) {
+    \\            var ptr = try allocator.alloc(u8, 1);
+    \\            std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\        }
+    \\    }
+    \\}
+    },
+    .{ .name = "leak across an inlined call", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn leakyHelper(allocator: std.mem.Allocator, size: usize) void {
+    \\    const ptr = allocator.alloc(u8, size) catch return;
+    \\    _ = ptr;
+    \\}
+    \\
+    \\fn caller(allocator: std.mem.Allocator) void {
+    \\    leakyHelper(allocator, 10,);
+    \\}
+    },
+    .{ .name = "unconditional leak", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn straightLineLeak(allocator: std.mem.Allocator) !void {
+    \\    var ptr = try allocator.alloc(u8, 1);
+    \\    std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\}
+    },
+    // The loop comes first and the join after it: a leak is read off the state
+    // that reaches the function exit, so a loop downstream of the join would
+    // merge the arms at its own header and hide what this case is about. One arm
+    // holds an allocation and one holds nothing, so widening the join turns the
+    // held resource into `unknown` and the leak on the holding arm is lost.
+    .{ .name = "leak at a join after a loop", .expected = 1, .message = "resource leak", .code = 
+    \\const std = @import("std");
+    \\
+    \\fn leakPastLoop(allocator: std.mem.Allocator, flag: bool) !void {
+    \\    var i: usize = 0;
+    \\    while (i < 4) : (i += 1) {
+    \\        i += 1;
+    \\    }
+    \\    if (flag) {
+    \\        var ptr = try allocator.alloc(u8, 1);
+    \\        std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+    \\    }
+    \\}
+    },
+};
+
+test "store_violations_engine findings survive the CLI widening default" {
+    // The CLI turns widening on; the fixtures pin the widened-off behaviour.
+    // Both must agree. A leak is read off the state that reaches the function
+    // exit, so a join that widens (turning a held resource into `unknown`) or
+    // that subsumes the state holding it away both erase it.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    for (resource_cases) |case| {
+        for ([_]bool{ false, true }) |with_types| {
+            var narrow = Source.init(allocator, "resource-widening.zig", case.code);
+            defer narrow.deinit();
+            var narrow_types = TypeContext.init(allocator, &narrow);
+            defer narrow_types.deinit();
+            var narrow_diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer narrow_diagnostics.deinit(allocator);
+            defer for (narrow_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+
+            var wide = Source.init(allocator, "resource-widening.zig", case.code);
+            defer wide.deinit();
+            var wide_types = TypeContext.init(allocator, &wide);
+            defer wide_types.deinit();
+            var wide_diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer wide_diagnostics.deinit(allocator);
+            defer for (wide_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+
+            try StoreViolationsEngineChecker.checker.checkAst(&narrow, allocator, &narrow_diagnostics, .{
+                .build_metadata = null,
+                .type_context = if (with_types) &narrow_types else null,
+                .analysis_limits = .{ .use_widening = false },
+            });
+            try StoreViolationsEngineChecker.checker.checkAst(&wide, allocator, &wide_diagnostics, .{
+                .build_metadata = null,
+                .type_context = if (with_types) &wide_types else null,
+                .analysis_limits = .{ .use_widening = true },
+            });
+
+            const narrow_items = narrow_diagnostics.items;
+            try testing.expectEqual(case.expected, narrow_items.len);
+            for (narrow_items) |diagnostic| {
+                try testing.expectEqualStrings("store-violations-engine", diagnostic.rule_id);
+                try testing.expectEqual(checker_mod.Severity.err, diagnostic.severity);
+                try testing.expect(std.mem.indexOf(u8, diagnostic.message, case.message) != null);
+            }
+
+            try testing.expectEqual(narrow_items.len, wide_diagnostics.items.len);
+            for (narrow_items, wide_diagnostics.items) |expected, actual| {
+                try testing.expectEqualStrings(expected.file_path, actual.file_path);
+                try testing.expectEqualStrings(expected.rule_id, actual.rule_id);
+                try testing.expectEqualStrings(expected.message, actual.message);
+                try testing.expectEqual(expected.severity, actual.severity);
+                try testing.expectEqual(expected.range, actual.range);
+                try testing.expectEqual(expected.related_range, actual.related_range);
             }
         }
     }
@@ -797,4 +1005,249 @@ test "skript regression: close-like state methods are not resource closes" {
     ;
 
     try expectStoreDiagnostics(code, 1, "use after close");
+}
+
+test "a wrapper proven to close its argument releases the caller's resource" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // `compat.closeDir` re-exports a helper whose body closes the directory it
+    // is handed. `compat.nextDir` takes the same `*Directory` and only reads
+    // it, `closeDirFake` closes a look-alike on a different field, and
+    // `closeSometimes` closes behind a branch: none of those is a release, so
+    // the proof has to come from the body, never from the name.
+    const io_code: [:0]const u8 =
+        \\const std = @import("std");
+        \\pub const Context = struct {};
+        \\pub const Handle = struct {
+        \\    raw: std.posix.fd_t,
+        \\    fn close(_: *Handle) void {}
+        \\};
+        \\pub const Directory = struct {
+        \\    handle: std.fs.File,
+        \\    other: Handle,
+        \\};
+        \\pub fn openDir(_: *Context, path: []const u8) !Directory {
+        \\    _ = path;
+        \\    return .{ .handle = undefined };
+        \\}
+        \\pub fn closeDir(_: *Context, directory: *Directory) void {
+        \\    directory.handle.close();
+        \\}
+        \\pub fn nextDir(_: *Context, directory: *Directory) !u32 {
+        \\    _ = directory;
+        \\    return 0;
+        \\}
+        \\pub fn closeDirFake(_: *Context, directory: *Directory) void {
+        \\    directory.other.close();
+        \\}
+        \\pub fn closeSometimes(_: *Context, directory: *Directory, flag: bool) void {
+        \\    if (flag) directory.handle.close();
+        \\}
+        \\pub const Pair = struct {
+        \\    primary: std.fs.File,
+        \\    secondary: std.fs.File,
+        \\};
+        \\pub fn openPair(_: *Context, path: []const u8) !Pair {
+        \\    _ = path;
+        \\    return .{ .primary = undefined, .secondary = undefined };
+        \\}
+        \\pub fn closeSecondary(_: *Context, pair: *Pair) void {
+        \\    pair.secondary.close();
+        \\}
+    ;
+    const app_code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const compat = @import("io.zig");
+        \\fn released(ctx: *compat.Context) !void {
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    defer compat.closeDir(ctx, &directory);
+        \\    _ = &directory;
+        \\}
+        \\fn iterated(ctx: *compat.Context) !void {
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    defer compat.nextDir(ctx, &directory);
+        \\    _ = &directory;
+        \\}
+        \\fn leaked(ctx: *compat.Context) !void {
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    _ = &directory;
+        \\}
+        \\fn wrongTarget(ctx: *compat.Context) !void {
+        \\    var other = try compat.openDir(ctx, "other");
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    defer compat.closeDir(ctx, &other);
+        \\    _ = &directory;
+        \\    _ = &other;
+        \\}
+        \\fn fakedRelease(ctx: *compat.Context) !void {
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    defer compat.closeDirFake(ctx, &directory);
+        \\    _ = &directory;
+        \\}
+        \\fn conditionalRelease(ctx: *compat.Context, flag: bool) !void {
+        \\    var directory = try compat.openDir(ctx, "p");
+        \\    defer compat.closeSometimes(ctx, &directory, flag);
+        \\    _ = &directory;
+        \\}
+        \\fn wrongResourceField(ctx: *compat.Context) !void {
+        \\    var pair = try compat.openPair(ctx, "p");
+        \\    defer compat.closeSecondary(ctx, &pair);
+        \\    _ = &pair;
+        \\}
+    ;
+
+    var io_source = Source.init(allocator, "io.zig", io_code);
+    defer io_source.deinit();
+    var app_source = Source.init(allocator, "app.zig", app_code);
+    defer app_source.deinit();
+    var type_ctx = TypeContext.init(allocator, &app_source);
+    defer type_ctx.deinit();
+
+    const files = [_]import_resolver.File{
+        .{ .path = io_source.getFilePath(), .tree = try io_source.ast() },
+        .{ .path = app_source.getFilePath(), .tree = try app_source.ast() },
+    };
+    type_ctx.project_resolver = .{ .files = &files, .file_index = 1 };
+
+    const cfg = Config{
+        .rule_filter = .none,
+        .resource_models = &.{
+            ResourceModel{ .kind = .open, .method_name = "openDir" },
+            ResourceModel{ .kind = .open, .method_name = "openPair" },
+        },
+    };
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diag| diag.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try StoreViolationsEngineChecker.checker.checkAst(&app_source, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &type_ctx,
+        .config = &cfg,
+    });
+
+    // Only `released` releases. Every other call site keeps its leak:
+    // `iterated` (nextDir reads only), `fakedRelease` (close on a look-alike
+    // field), `conditionalRelease` (close behind a branch),
+    // `wrongResourceField` (a wrapper carrying two genuine resource fields
+    // closes the wrong one), `leaked` (no release at all) and `wrongTarget`
+    // (release of a different variable).
+    var leaks: usize = 0;
+    for (diagnostics.items) |diag| {
+        if (std.mem.indexOf(u8, diag.message, "resource leak") != null) leaks += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), leaks);
+    try testing.expectEqual(@as(usize, 6), diagnostics.items.len);
+}
+
+test "a returned aggregate carries the payload resources it holds" {
+    // Each case runs as its own Source. Combined into one file the
+    // field-allocated resources all report against the same out-of-range
+    // token, so the checker folds them into a single diagnostic and one
+    // unsafe case could hide behind another.
+    // Kept as a string-literal pointer, not a slice, so `++` below stays a
+    // compile-time concatenation and each case ends up sentinel-terminated.
+    const model_type =
+        \\const std = @import("std");
+        \\const ResourceModel = struct {
+        \\    kind: u8,
+        \\    method_name: ?[]const u8 = null,
+        \\    receiver_type: ?[]const u8 = null,
+        \\    return_type: ?[]const u8 = null,
+        \\};
+    ;
+
+    // Proven shape: the store is the penultimate statement of the loop body,
+    // the last statement is `valid_count += 1`, both bindings are declared
+    // outside the loop, and nothing else writes the cursor or reaches the
+    // aggregate, so the resources travel with the returned aggregate.
+    const proven_shape = model_type ++
+        \\fn parseResourceModels(allocator: std.mem.Allocator, n: usize) ![]ResourceModel {
+        \\    var models = try allocator.alloc(ResourceModel, n);
+        \\    var valid_count: usize = 0;
+        \\    errdefer allocator.free(models);
+        \\    for (0..n) |_| {
+        \\        var model = ResourceModel{ .kind = 0 };
+        \\        model.method_name = try allocator.dupe(u8, "method");
+        \\        model.receiver_type = try allocator.dupe(u8, "receiver");
+        \\        model.return_type = try allocator.dupe(u8, "return");
+        \\        models[valid_count] = model;
+        \\        valid_count += 1;
+        \\    }
+        \\    return models;
+        \\}
+    ;
+    try expectStoreDiagnostics(proven_shape, 0, "resource leak");
+
+    // A cursor that advances by zero lands on the same element every pass.
+    const zero_step_cursor = model_type ++
+        \\fn zeroStepCursor(allocator: std.mem.Allocator, n: usize) ![]ResourceModel {
+        \\    var models = try allocator.alloc(ResourceModel, n);
+        \\    var slot: usize = 0;
+        \\    for (0..n) |_| {
+        \\        var model = ResourceModel{ .kind = 0 };
+        \\        model.method_name = try allocator.dupe(u8, "method");
+        \\        models[slot] = model;
+        \\        slot += 0;
+        \\    }
+        \\    return models;
+        \\}
+    ;
+    try expectStoreDiagnostics(zero_step_cursor, 1, "resource leak");
+
+    // A constant cursor is one store site that repeats the same element.
+    const const_index_loop = model_type ++
+        \\fn constIndexLoop(allocator: std.mem.Allocator, n: usize) ![]ResourceModel {
+        \\    var models = try allocator.alloc(ResourceModel, n);
+        \\    const slot: usize = 0;
+        \\    for (0..n) |_| {
+        \\        var model = ResourceModel{ .kind = 0 };
+        \\        model.method_name = try allocator.dupe(u8, "method");
+        \\        models[slot] = model;
+        \\    }
+        \\    return models;
+        \\}
+    ;
+    try expectStoreDiagnostics(const_index_loop, 1, "resource leak");
+
+    // A field write through the aggregate after the store drops the payload.
+    const overwrite_after_store = model_type ++
+        \\fn overwriteAfterStore(allocator: std.mem.Allocator) ![]ResourceModel {
+        \\    var models = try allocator.alloc(ResourceModel, 2);
+        \\    var slot: usize = 0;
+        \\    var model = ResourceModel{ .kind = 0 };
+        \\    model.method_name = try allocator.dupe(u8, "method");
+        \\    models[slot] = model;
+        \\    models[slot].method_name = null;
+        \\    return models;
+        \\}
+    ;
+    try expectStoreDiagnostics(overwrite_after_store, 1, "resource leak");
+
+    // A whole-place reassignment of the aggregate drops the payload too.
+    const whole_overwrite = model_type ++
+        \\fn wholeOverwrite(allocator: std.mem.Allocator) ![]ResourceModel {
+        \\    var models = try allocator.alloc(ResourceModel, 2);
+        \\    var slot: usize = 0;
+        \\    var model = ResourceModel{ .kind = 0 };
+        \\    model.method_name = try allocator.dupe(u8, "method");
+        \\    models[slot] = model;
+        \\    models = try allocator.alloc(ResourceModel, 2);
+        \\    return models;
+        \\}
+    ;
+    try expectStoreDiagnostics(whole_overwrite, 1, "resource leak");
+
+    // A payload that never reaches an aggregate is never handed over.
+    const dropped_payload = model_type ++
+        \\fn dropResourceModels(allocator: std.mem.Allocator) !usize {
+        \\    var model = ResourceModel{ .kind = 0 };
+        \\    model.method_name = try allocator.dupe(u8, "method");
+        \\    _ = &model;
+        \\    return 0;
+        \\}
+    ;
+    try expectStoreDiagnostics(dropped_payload, 1, "resource leak");
 }

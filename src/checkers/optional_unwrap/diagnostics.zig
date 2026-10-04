@@ -187,6 +187,7 @@ pub fn reportUnsafeUnwrap(
     diagnostics: *std.ArrayList(Diagnostic),
     main_token: u32,
     token_starts: []const u32,
+    message: []const u8,
 ) CheckerError!void {
     if (main_token >= token_starts.len) return;
 
@@ -197,7 +198,7 @@ pub fn reportUnsafeUnwrap(
         src.getFilePath(),
         "optional-unwrap",
         .warning,
-        "forced optional unwrap can panic at runtime",
+        message,
         loc.line,
         loc.column,
     );
@@ -232,6 +233,7 @@ fn testUnwrapDiagnosticAllocationFailure(allocator: std.mem.Allocator) !void {
             &diagnostics,
             tree.nodes.items(.main_token)[index],
             tree.tokens.items(.start),
+            "forced optional unwrap can panic at runtime",
         );
         try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
         try std.testing.expectEqual(@as(usize, 2), diagnostics.items[0].range.start.line);

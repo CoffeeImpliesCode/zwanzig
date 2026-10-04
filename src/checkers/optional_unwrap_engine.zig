@@ -1433,3 +1433,75 @@ test "reassigning an alias slot preserves only the independently stored optional
 
     try expectOptionalUnwrapDiagnosticLines(code, &.{ 12, 18, 28, 32 });
 }
+
+test "initialization method proves the field at successful exit, not its first assignment" {
+    const code: [:0]const u8 =
+        \\pub const State = struct {
+        \\    texture: ?u32 = null,
+        \\    fn ensureDeferred(self: *State) !void {
+        \\        self.texture = 1;
+        \\        defer self.texture = null;
+        \\    }
+        \\    pub fn readDeferred(self: *State) u32 {
+        \\        self.ensureDeferred() catch return 0;
+        \\        return self.texture.?;
+        \\    }
+        \\    fn ensureConditional(self: *State, take: bool) !void {
+        \\        if (take) { self.texture = 1; }
+        \\    }
+        \\    pub fn readConditional(self: *State, take: bool) u32 {
+        \\        self.ensureConditional(take) catch return 0;
+        \\        return self.texture.?;
+        \\    }
+        \\    fn ensureOverwritten(self: *State) !void {
+        \\        self.texture = 1;
+        \\        self.texture = null;
+        \\    }
+        \\    pub fn readOverwritten(self: *State) u32 {
+        \\        self.ensureOverwritten() catch return 0;
+        \\        return self.texture.?;
+        \\    }
+        \\};
+    ;
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 9, 16, 24 });
+}
+
+test "method proof joins every successful return and preserves intermediate scope facts" {
+    const code: [:0]const u8 =
+        \\pub const State = struct {
+        \\    texture: ?u32 = null,
+        \\    other: u32 = 0,
+        \\    fn reset(self: *State) void { self.texture = null; }
+        \\    fn resetTrue(self: *State) bool { self.texture = null; return true; }
+        \\    fn resetSuccess(self: *State) !void { self.texture = null; }
+        \\    fn clearFailure(self: *State) error{Failed}!void { self.texture = null; return error.Failed; }
+        \\    fn clearMaybe(self: *State) ?u32 { self.texture = null; return null; }
+        \\    fn conditionReset(self: *State) !void { self.texture = 1; if (self.resetTrue()) {} }
+        \\    pub fn readCondition(self: *State) u32 { self.conditionReset() catch return 0; return self.texture.?; }
+        \\    fn switchReset(self: *State, take: bool) !void { self.texture = 1; switch (take) { true => self.reset(), false => {} } }
+        \\    pub fn readSwitch(self: *State, take: bool) u32 { self.switchReset(take) catch return 0; return self.texture.?; }
+        \\    fn returnReset(self: *State) !void { self.texture = 1; return self.resetSuccess(); }
+        \\    pub fn readReturn(self: *State) u32 { self.returnReset() catch return 0; return self.texture.?; }
+        \\    fn loopEarly(self: *State, take: bool) !void { while (take) { return; } self.texture = 1; }
+        \\    pub fn readLoopEarly(self: *State, take: bool) u32 { self.loopEarly(take) catch return 0; return self.texture.?; }
+        \\    fn loopElse(self: *State, take: bool) !void { while (take) { break; } else { return; } self.texture = 1; }
+        \\    pub fn readLoopElse(self: *State, take: bool) u32 { self.loopElse(take) catch return 0; return self.texture.?; }
+        \\    fn labeledExit(self: *State, take: bool) !void { outer: { if (take) break :outer; self.texture = 1; } }
+        \\    pub fn readLabeled(self: *State, take: bool) u32 { self.labeledExit(take) catch return 0; return self.texture.?; }
+        \\    fn catchExit(self: *State) !void { self.texture = 1; self.clearFailure() catch return; self.texture = 1; }
+        \\    pub fn readCatch(self: *State) u32 { self.catchExit() catch return 0; return self.texture.?; }
+        \\    fn optionalExit(self: *State) !void { self.texture = 1; const number = self.clearMaybe() orelse return; _ = number; self.texture = 1; }
+        \\    pub fn readOptional(self: *State) u32 { self.optionalExit() catch return 0; return self.texture.?; }
+        \\    fn prefixScope(self: *State) !void { { self.other = 1; } self.texture = 1; }
+        \\    pub fn readPrefix(self: *State) u32 { self.prefixScope() catch return 0; return self.texture.?; }
+        \\    fn exitedDefer(self: *State) !void { { defer self.texture = null; self.other = 1; } self.texture = 1; }
+        \\    pub fn readExitedDefer(self: *State) u32 { self.exitedDefer() catch return 0; return self.texture.?; }
+        \\    fn switchInitialize(self: *State, take: bool) !void { switch (take) { true => { self.texture = 1; }, false => { self.texture = 2; } } }
+        \\    pub fn readSwitchInitialized(self: *State, take: bool) u32 { self.switchInitialize(take) catch return 0; return self.texture.?; }
+        \\    const Mode = enum { first, second };
+        \\    fn initializeMode(self: *State, mode: Mode) !void { switch (mode) { .first => { self.texture = 1; }, .second => { self.texture = 2; } } }
+        \\    pub fn readMode(self: *State, mode: Mode) u32 { self.initializeMode(mode) catch return 0; return self.texture.?; }
+        \\};
+    ;
+    try expectOptionalUnwrapDiagnosticLines(code, &.{ 10, 12, 14, 16, 18, 20, 22, 24 });
+}

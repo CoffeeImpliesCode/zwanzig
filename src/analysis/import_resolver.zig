@@ -3,6 +3,13 @@ const ast_walk = @import("../ast_walk.zig");
 const ProjectTypeResolver = @import("call_resolver.zig").ProjectTypeResolver;
 const LexicalIndex = @import("lexical_index.zig").LexicalIndex;
 
+const log = std.log.scoped(.import_resolver);
+
+/// Files a re-export walk may visit before it has to answer conservatively.
+/// The limit bounds stack use; it is not evidence that the import chain is
+/// absent, so every exit at the limit names the walk that stopped.
+const resolution_budget_frames: usize = 64;
+
 pub const File = struct {
     path: []const u8,
     tree: *const std.zig.Ast,
@@ -11,12 +18,47 @@ pub const File = struct {
     path_index: ?*const PathIndex = null,
 };
 
+/// A module root a build script bound to an import name.
+pub const RegisteredModule = struct {
+    file: usize,
+    /// Two roots bound to one name resolve to nothing rather than to an
+    /// arbitrary choice.
+    ambiguous: bool = false,
+};
+
+/// Import names read from the analyzed build scripts, keyed by name.
+pub const ModuleNames = std.StringHashMapUnmanaged(RegisteredModule);
+
+/// Record the module root a build script binds to `name`.
+pub fn addModuleName(allocator: std.mem.Allocator, names: *ModuleNames, name: []const u8, file: usize) !void {
+    const result = try names.getOrPut(allocator, name);
+    if (result.found_existing) {
+        if (result.value_ptr.file != file) result.value_ptr.ambiguous = true;
+        return;
+    }
+    errdefer _ = names.remove(name);
+    result.key_ptr.* = try allocator.dupe(u8, name);
+    result.value_ptr.* = .{ .file = file };
+}
+
+/// Root a build script bound to a bare import name. A name no registration
+/// reaches, or one bound to two roots, answers null so the caller keeps its
+/// own fallback instead of an invented answer.
+pub fn registeredModuleTarget(names: *const ModuleNames, import_path: []const u8) ?usize {
+    if (names.count() == 0) return null;
+    if (std.mem.indexOfScalar(u8, import_path, '/') != null) return null;
+    if (std.mem.endsWith(u8, import_path, ".zig")) return null;
+    const registered = names.get(import_path) orelse return null;
+    return if (registered.ambiguous) null else registered.file;
+}
+
 /// Owns normalized keys and borrows the immutable file slice and exact paths.
 pub const PathIndex = struct {
     files: []const File,
     exact: std.StringHashMapUnmanaged(ExactPath) = .empty,
     normalized: std.StringHashMapUnmanaged(usize) = .empty,
     package_stems: std.StringHashMapUnmanaged(usize) = .empty,
+    module_names: ModuleNames = .empty,
 
     const ExactPath = struct {
         original: usize,
@@ -51,6 +93,9 @@ pub const PathIndex = struct {
     }
 
     pub fn deinit(self: *PathIndex, allocator: std.mem.Allocator) void {
+        var module_keys = self.module_names.keyIterator();
+        while (module_keys.next()) |key| allocator.free(key.*);
+        self.module_names.deinit(allocator);
         var keys = self.normalized.keyIterator();
         while (keys.next()) |key| allocator.free(key.*);
         self.normalized.deinit(allocator);
@@ -86,7 +131,14 @@ pub const PathIndex = struct {
             first = firstMatch(first, equivalent);
         }
         if (std.mem.indexOfScalar(u8, import_path, '/') == null and !std.mem.endsWith(u8, import_path, ".zig")) {
-            first = firstMatch(first, self.package_stems.get(import_path));
+            // A build-registered name names one module root, and the basename
+            // stem cannot tell that root from an unrelated file sharing its
+            // stem, so the registration is the only answer for a bound name.
+            if (registeredModuleTarget(&self.module_names, import_path)) |registered| {
+                first = firstMatch(first, registered);
+            } else {
+                first = firstMatch(first, self.package_stems.get(import_path));
+            }
         }
         return first;
     }
@@ -110,8 +162,27 @@ pub fn findFileIndexByPath(files: []const File, path: []const u8) ?usize {
     return null;
 }
 
+/// Name a walk that stopped at its frame budget. The answer stays
+/// conservative, but the cut-off is reported so a truncated search is never
+/// read as an import chain that does not exist.
+fn reportResolutionBudget(walk: []const u8, frames: usize, path: ?[]const u8) void {
+    const file = if (path) |candidate| candidate else "";
+    if (file.len == 0) {
+        log.warn("resolution budget exceeded: {s} stopped at the {d}-frame limit; the answer stays conservative", .{
+            walk,
+            frames,
+        });
+        return;
+    }
+    log.warn("resolution budget exceeded: {s} stopped at the {d}-frame limit in {s}; the answer stays conservative", .{
+        walk,
+        frames,
+        file,
+    });
+}
+
 pub fn filePubliclyImportsPath(files: []const File, file_index: usize, target_path: []const u8) bool {
-    var visited: [64]usize = undefined;
+    var visited: [resolution_budget_frames]usize = undefined;
     return filePubliclyImportsPathVisited(files, file_index, target_path, &visited, 0);
 }
 
@@ -119,10 +190,13 @@ fn filePubliclyImportsPathVisited(
     files: []const File,
     file_index: usize,
     target_path: []const u8,
-    visited: *[64]usize,
+    visited: *[resolution_budget_frames]usize,
     depth: usize,
 ) bool {
-    if (depth >= visited.len) return false;
+    if (depth >= visited.len) {
+        reportResolutionBudget("public import re-export walk", resolution_budget_frames, if (file_index < files.len) files[file_index].path else null);
+        return false;
+    }
     if (std.mem.indexOfScalar(usize, visited[0..depth], file_index) != null) return false;
     visited[depth] = file_index;
     if (file_index >= files.len) return false;
@@ -187,7 +261,7 @@ pub fn fileUsingnamespaceImportsPath(
     importer_path: []const u8,
     target_path: []const u8,
 ) bool {
-    var visited: [64]usize = undefined;
+    var visited: [resolution_budget_frames]usize = undefined;
     return usingnamespaceImportsPathVisited(files, tree, importer_path, target_path, false, &visited, 0);
 }
 
@@ -197,7 +271,7 @@ fn usingnamespaceImportsPathVisited(
     importer_path: []const u8,
     target_path: []const u8,
     public_only: bool,
-    visited: *[64]usize,
+    visited: *[resolution_budget_frames]usize,
     depth: usize,
 ) bool {
     if (tree.errors.len != 0) return false;
@@ -234,7 +308,7 @@ pub fn initNodeImportsPath(
 }
 
 fn initNodeImportsFile(file: File, node: usize, target_path: []const u8) bool {
-    var visited: [64]u32 = undefined;
+    var visited: [resolution_budget_frames]u32 = undefined;
     return initNodeImportsPathVisited(file, node, target_path, &visited, 0);
 }
 
@@ -242,13 +316,17 @@ fn initNodeImportsPathVisited(
     file: File,
     node: usize,
     target_path: []const u8,
-    visited: *[64]u32,
+    visited: *[resolution_budget_frames]u32,
     depth: usize,
 ) bool {
     const tree = file.tree;
     if (tree.errors.len != 0) return false;
     const tags = tree.nodes.items(.tag);
-    if (node >= tags.len or depth >= visited.len) return false;
+    if (node >= tags.len) return false;
+    if (depth >= visited.len) {
+        reportResolutionBudget("initializer import walk", resolution_budget_frames, file.path);
+        return false;
+    }
 
     switch (tags[node]) {
         .builtin_call,
@@ -314,7 +392,7 @@ fn aliasInitImportsPath(
     file: File,
     alias_node: u32,
     target_path: []const u8,
-    visited: *[64]u32,
+    visited: *[resolution_budget_frames]u32,
     depth: usize,
 ) bool {
     const tree = file.tree;
@@ -601,7 +679,7 @@ fn isPubToken(tree: *const std.zig.Ast, token: ?std.zig.Ast.TokenIndex) bool {
 const InitPathScanner = struct {
     file: File,
     target_path: []const u8,
-    visited: *[64]u32,
+    visited: *[resolution_budget_frames]u32,
     depth: usize,
     found: bool = false,
     stop: bool = false,

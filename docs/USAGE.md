@@ -78,12 +78,26 @@ zwanzig --file src --file tests
 
 ### File discovery
 
-Without arguments, zwanzig scans the current directory for `.zig` files. It skips:
+Without arguments, zwanzig scans the current directory for `.zig` files. While
+recursing it skips these exact directory names:
 
 - `zig-cache/`
+- `.zig-cache/`
+- `.zig-global-cache/`
 - `zig-out/`
 - `.zigmod/`
 - `.gyro/`
+- `zig-pkg/`
+- `third_party/`
+- `.git/`
+- `.jj/`
+
+The names are matched exactly and hidden directories are not skipped as a class,
+so first-party sources kept in a hidden directory such as `.firstparty/` are
+still analyzed. The skip list applies only to directories found while walking a
+selected path. A path you name directly, as an argument or with `--file`, is
+always analyzed, whether it is one of these directories itself or a file inside
+one.
 
 If the selection resolves to no `.zig` files at all, zwanzig reports
 `Error: No .zig files found. Nothing was analyzed.` on stderr and exits 1
@@ -206,7 +220,9 @@ On a busy machine, use one analysis thread with no background analysis workers:
 zwanzig --threads 1 ~/projects/example/src/
 ```
 
-Do not pass the project root unless you also want to analyze its dependency and generated-source directories.
+Pass the project root only for the breadth you want. A recursive scan skips the
+generated, vendored and VCS directories listed under File discovery above, and
+naming one of those directories explicitly is what adds it to the selection.
 
 ## Analysis limits
 

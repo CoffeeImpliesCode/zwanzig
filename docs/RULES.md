@@ -93,7 +93,9 @@ Detects unused container-level `const`, `var`, and `fn` declarations that aren't
 
 When `unused-decl` is enabled and more than one file is analyzed, zwanzig also runs a project pass over all analyzed files. That pass reports public top-level declarations that are not referenced by any other analyzed file, while ignoring `build.zig`'s `build` entrypoint, package API roots discovered from `root_source_file` in analyzed or workspace `build.zig` files, and alias-style re-exports to avoid library facade noise. Declarations exposed through another used public declaration's type, signature, field, initializer surface, typed receiver method call, or result-location method call are treated as used. Method references through nested inline namespaces and type aliases are also resolved.
 Private file-as-struct methods called through `self.method` are treated as used, even when an unrelated field has the same name. A bare field read never counts as a method call, so a same-named field on another type does not mask an unused method.
+Calls to the real `std.testing.refAllDecls` and `refAllDeclsRecursive` also keep the target container's declarations reachable. Immutable aliases of the imported `std` module or its `testing` namespace are supported. Fake namespaces, shadowed bindings, and mutable aliases do not grant this exemption.
 Cyclic type aliases and namespace re-exports stop at the repeated binding or file. They do not prevent resolution of independent declarations.
+Bounded type and import searches log a warning when they exhaust their resolution budget. The warning names the search and its frame limit; the conservative result is not proof that the type or reference is absent. Cycle detection remains separate from budget exhaustion.
 Contextual constants such as `.empty` count as references when the result type identifies their container, including typed initialization, assignment, and return expressions. A same-named constant in another container remains eligible for an unused-declaration report.
 Project-wide unused-public reports require valid syntax in every prepared source and build file. If parsing fails, Zwanzig defers those reports rather than treating missing references as non-use. Per-file checks still run on valid siblings.
 
@@ -453,6 +455,8 @@ fn foo(condition: bool) i32 {
 
 Flags forced optional unwraps using `.?`, which panic at runtime if the value is `null`. Prefer handling the optional with `if (opt) |value|` or `orelse`.
 
+Non-null proofs do not carry between separate validation and consumption loops. Warnings for unwraps inside a `for` body explain this limit. Check for null in the consuming loop; writes during that loop can invalidate an earlier validation pass.
+
 **Bad:**
 ```zig
 fn readConfig(opt: ?[]const u8) []const u8 {
@@ -531,6 +535,8 @@ Field guards also support `std.debug.assert(state.value != null)` and `try std.t
 A write through the address of a different struct field preserves the guard.
 Replacing the guarded field or passing its address to a mutating call invalidates it.
 An ignored `expect` error does not establish a guard.
+Writes to an independent local value, including a slice parameter's `len` or `ptr` header, preserve a field assertion. Writes through the slice's elements or through a pointer remain potential mutations of the guarded object.
+
 
 **Switch null-case guard:**
 ```zig
@@ -554,6 +560,17 @@ fn render(self: *Self) void {
     draw(self.texture.?);  // Safe: ensureTexture assigns self.texture on success
 }
 ```
+
+The callee must leave the field non-null on every successful return or fallthrough, after its deferred writes run. A conditional assignment, later reset, mutating return operand, or pending reset in `defer` does not prove the unwrap safe.
+
+**Conditional construction:**
+
+A private type factory can establish a field invariant when every visible construction stores a non-null value under the same `comptime bool` condition that guards the unwrap. The constructor's name is not evidence.
+
+This proof requires a closed source: no public or exported root declarations except a parameterless `main` returning `void` or `!void`. The source must not expose addresses, use undefined storage, replace an instance, write the guarded field, or pass an instance or its type to an opaque call. Local calls are inspected with the rest of the source. Direct writes to sibling fields remain permitted.
+Unclassified aggregate constructions, including contextual array elements and switch results, do not establish this proof.
+
+Public factories, runtime flags, missing assertions, alternate nullable constructions, pointer escapes, and caller or callee resets retain the warning. For these cases, check the field at the use site.
 
 **Try-assign guard:**
 ```zig
@@ -583,6 +600,8 @@ The checker is path-sensitive and tracks:
 - mixed-path outcomes (reports "possible" when some paths are safe and some are unsafe)
 
 Integer guard refinement requires a proven domain that fits signed 64-bit values: signed integers up to 64 bits and unsigned integers up to 63 bits. Floating-point, unknown, and wider domains remain conservative.
+
+Labeled `break` statements that exit an enclosing block preserve the constraints of the continuing path. The engine evaluates the break operand and runs reached defers in the exited scopes before the jump. Unresolved labels and loop breaks remain conservative; they do not remove a possible-zero path.
 
 Supported operations:
 - binary operators: `/` and `%`
@@ -637,7 +656,7 @@ Detects catch blocks that ignore errors without rethrowing or logging. An error 
 - Doesn't rethrow the error
 - Doesn't call any functions (potential logging)
 - Simply continues execution
-- A fallback expression in `catch` counts as intentional handling. Storing the captured error also counts as handling. Assignments unrelated to the captured error remain swallowed.
+- A fallback expression in `catch` counts as intentional handling. Captured-error storage counts only when every path that continues past the handler stores that payload outside the handler. Immutable pointer aliases to caller-owned storage are supported. Handler-local values, shadowed payloads, unreachable stores, and storage on only some continuing paths do not grant this exemption. Assignments unrelated to the captured error remain swallowed.
 
 If the engine reaches an analysis limit, structural checks still inspect the handler up to its catch merge. A call after the merge does not count as error handling. A handler that terminates with `unreachable` does not silently continue.
 
@@ -675,13 +694,15 @@ fn baz() i32 {
 
 Detects allocator/resource misuse: double-free, free-without-alloc, close-without-open, use-after-free/close, leaks, and **defer-frees-escapee** (a resource freed by `defer` that has already escaped into an outer container).
 
-**Error-path leak policy:** Leak checks run only on normal return paths. When a function returns an error (detected by literal error values or type-based analysis), leak reports are suppressed. This avoids false positives in code that cleans up via `errdefer`.
+**Error-path leak policy:** Leak checks run only on normal return paths. When a function returns an error - a literal error value, a member of a declared error set such as `ConfigError.InvalidConfigFormat`, or a switch or conditional whose branches all return one - the path takes the error state, the `errdefer` cleanup for it is applied, and leak reports are suppressed. This avoids false positives in code that cleans up via `errdefer`.
 
 **Tracking scope:** The rule only tracks resources created by known alloc/open APIs (including built-in models for common std allocator and file/posix patterns). Closing a value that was not opened by a tracked API is reported as "close without tracked open". This includes manually constructed handles (for example, `std.fs.File{ .handle = fd }`) or values provided by external code, unless you model ownership with `resource_models`.
 
+**Release wrappers:** A wrapper that closes the resource it is handed releases the caller's argument, so `compat.closeDir(ctx, &directory)` ends the caller's hold just as `directory.close()` does. The proof comes from the callee's body, never from its spelling: the callee must resolve to one function declaration, its body must be a single unconditional statement that closes a genuine resource field - `std.fs.File`, `std.fs.Dir`, `std.fs.IterableDir`, `std.posix.fd_t`, `std.Io.File` or `std.Io.Dir` - and that wrapper type must carry exactly one such field. A sibling that only reads the argument, a close behind a branch, a close on a second resource field, and a look-alike close on any other type are all still reported, and the caller must pass the resource by address.
+
 **Diagnostics per path:** When multiple control-flow paths violate the rule, multiple diagnostics can be emitted for the same source line.
 
-Resources stored in aggregates are treated as escaping with the aggregate.
+**Resources stored in aggregates:** `aggregate[index] = payload` moves the payload's resources into the aggregate, so they travel with it and are released with it. The transfer needs a proof that the store lands in a slot that stays reachable: the store must be the penultimate statement of a `for` body whose last statement is `<index> += 1`, both the aggregate and the index must be declared outside that loop, and nothing else in the function may write the index or reach the aggregate - no second store, no field or whole-aggregate assignment, and no call that takes either by value or address (a proven allocator release is the one call allowed through). Every store that cannot be proven this way leaves the resources with the payload, so a payload dropped by a cursor that advances by zero, a constant index, a later write through the aggregate, or an aggregate that is replaced is still reported. A value stored into an aggregate that owns nothing is unchanged.
 
 **Resource modeling:** Built-in allocator detection includes `alloc`/`free`, `dupe`, and `create`/`destroy`. Configurable `resource_models` can add project-specific APIs. Model matching uses shared call resolution for identifier calls, receiver methods, receiver types, and FQNs. `kind: "free_owned"` models APIs like `deinit` that free resources owned by a value without freeing the value itself.
 

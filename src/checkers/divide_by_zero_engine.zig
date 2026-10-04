@@ -4,6 +4,7 @@ const Checker = checker_mod.Checker;
 const CheckerError = checker_mod.CheckerError;
 const Diagnostic = checker_mod.Diagnostic;
 const Source = @import("../source.zig").Source;
+const TypeContext = @import("../type_context.zig").TypeContext;
 const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
 const scan = @import("divide_by_zero/scan.zig");
@@ -72,6 +73,189 @@ pub const DivideByZeroEngineChecker = struct {
         try scan.scanForZeroDivisors(src, allocator, diagnostics, tree, engine, cfg_handle.cfg, fn_node, reported);
     }
 };
+
+const DivisorExpectation = enum { none, definite, possible };
+
+/// Consumer findings for a divide-by-zero site, keyed by the branch shape of the
+/// denominator. Every entry is a fixture body verbatim, so the expectation here
+/// and the pinned fixture expectation cannot drift apart.
+const divisor_cases = [_]struct { name: []const u8, code: [:0]const u8, expectation: DivisorExpectation }{
+    .{ .name = "branch may reach zero", .expectation = .possible, .code = 
+    \\pub fn warn(flag: bool) i32 {
+    \\    var d: i32 = 2;
+    \\    if (flag) {
+    \\        d = 0;
+    \\    }
+    \\    return @divTrunc(20, d);
+    \\}
+    },
+    .{ .name = "shifted range may reach zero", .expectation = .possible, .code = 
+    \\pub fn warn(flag: bool) i32 {
+    \\    var x: i32 = 0;
+    \\    if (flag) {
+    \\        x = -1;
+    \\    }
+    \\    return @divTrunc(10, x + 1);
+    \\}
+    },
+    // The join sits in front of a loop, so a widening rule that treats "can reach
+    // a loop" as "is in a loop" merges the arms here and loses the zero path. The
+    // division is between the join and the loop, so the loop header never gets
+    // to merge the arms either: what the checker reads is decided by the join.
+    .{ .name = "branch join in front of a loop", .expectation = .possible, .code = 
+    \\pub fn warn(flag: bool) i32 {
+    \\    var d: i32 = 2;
+    \\    if (flag) {
+    \\        d = 0;
+    \\    }
+    \\    const first = @divTrunc(20, d);
+    \\    var i: i32 = 0;
+    \\    while (i < 4) : (i += 1) {
+    \\        i += 1;
+    \\    }
+    \\    return first;
+    \\}
+    },
+    .{ .name = "literal zero", .expectation = .definite, .code = 
+    \\pub fn bad() i32 {
+    \\    return @divTrunc(10, 0);
+    \\}
+    },
+    .{ .name = "guard keeps it non-zero", .expectation = .none, .code = 
+    \\pub fn ok(x: i32) i32 {
+    \\    if (x != 0) {
+    \\        return @divTrunc(10, x);
+    \\    }
+    \\    return 0;
+    \\}
+    },
+    .{ .name = "float denominator", .expectation = .none, .code = 
+    \\pub fn ok() f64 {
+    \\    var denominator: f64 = 0;
+    \\    denominator += 1;
+    \\    return 1.0 / denominator;
+    \\}
+    },
+};
+
+test "divide_by_zero_engine findings survive the CLI widening default" {
+    // The CLI turns widening on; the fixtures pin the widened-off behaviour.
+    // Both must agree. A denominator that is zero on only one path is decided by
+    // the states kept at the branch join, so widening that join collapses the
+    // per-path denominators into a single `unknown` and the warning is lost.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    for (divisor_cases) |case| {
+        for ([_]bool{ false, true }) |with_types| {
+            var narrow = Source.init(allocator, "divisor-widening.zig", case.code);
+            defer narrow.deinit();
+            var narrow_types = TypeContext.init(allocator, &narrow);
+            defer narrow_types.deinit();
+            var narrow_diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer narrow_diagnostics.deinit(allocator);
+            defer for (narrow_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+
+            var wide = Source.init(allocator, "divisor-widening.zig", case.code);
+            defer wide.deinit();
+            var wide_types = TypeContext.init(allocator, &wide);
+            defer wide_types.deinit();
+            var wide_diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer wide_diagnostics.deinit(allocator);
+            defer for (wide_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+
+            try DivideByZeroEngineChecker.checker.checkAst(&narrow, allocator, &narrow_diagnostics, .{
+                .build_metadata = null,
+                .type_context = if (with_types) &narrow_types else null,
+                .analysis_limits = .{ .use_widening = false },
+            });
+            try DivideByZeroEngineChecker.checker.checkAst(&wide, allocator, &wide_diagnostics, .{
+                .build_metadata = null,
+                .type_context = if (with_types) &wide_types else null,
+                .analysis_limits = .{ .use_widening = true },
+            });
+
+            const narrow_items = narrow_diagnostics.items;
+            switch (case.expectation) {
+                .none => try testing.expectEqual(@as(usize, 0), narrow_items.len),
+                .definite => {
+                    try testing.expectEqual(@as(usize, 1), narrow_items.len);
+                    try testing.expectEqual(checker_mod.Severity.err, narrow_items[0].severity);
+                    try testing.expectEqualStrings("division by zero can panic at runtime", narrow_items[0].message);
+                },
+                .possible => {
+                    try testing.expectEqual(@as(usize, 1), narrow_items.len);
+                    try testing.expectEqual(checker_mod.Severity.warning, narrow_items[0].severity);
+                    try testing.expectEqualStrings("possible division by zero can panic at runtime", narrow_items[0].message);
+                },
+            }
+
+            try testing.expectEqual(narrow_items.len, wide_diagnostics.items.len);
+            for (narrow_items, wide_diagnostics.items) |expected, actual| {
+                try testing.expectEqualStrings(expected.file_path, actual.file_path);
+                try testing.expectEqualStrings(expected.rule_id, actual.rule_id);
+                try testing.expectEqualStrings(expected.message, actual.message);
+                try testing.expectEqual(expected.severity, actual.severity);
+                try testing.expectEqual(expected.range, actual.range);
+                try testing.expectEqual(expected.related_range, actual.related_range);
+            }
+        }
+    }
+}
+
+test "labeled break unwinds defers through a deep scope chain" {
+    // The labeled break crosses seventy nested scopes to reach the defer that
+    // owns the zero. Scope tracking borrows the caller's frames, so depth costs
+    // nothing and the write survives; an analyzer that keeps only a bounded
+    // prefix of scopes drops the innermost defer, and the division after the
+    // block then keeps seeing the pre-block value and reads as safe.
+
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const depth = 70;
+    var code_buf: std.ArrayList(u8) = .empty;
+    defer code_buf.deinit(allocator);
+    try code_buf.appendSlice(allocator,
+        \\pub fn deep() i64 {
+        \\    var denominator: i64 = 3;
+        \\    outer: {
+        \\
+    );
+    for (0..depth) |_| try code_buf.appendSlice(allocator, "        {\n");
+    try code_buf.appendSlice(allocator,
+        \\            defer denominator = 0;
+        \\            break :outer;
+        \\
+    );
+    for (0..depth) |_| try code_buf.appendSlice(allocator, "        }\n");
+    try code_buf.appendSlice(allocator,
+        \\    }
+        \\    return @divTrunc(1, denominator);
+        \\}
+        \\
+    );
+    const code = try code_buf.toOwnedSliceSentinel(allocator, 0);
+    defer allocator.free(code);
+
+    var source = Source.init(allocator, "deep-scope-chain.zig", code);
+    defer source.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try DivideByZeroEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{ .build_metadata = null });
+
+    // Lines: three header lines, `depth` openings, the defer and the break,
+    // `depth` closings, the outer block's own close, then the division.
+    const division_line: usize = 3 + 2 * depth + 4;
+    try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try testing.expectEqual(checker_mod.Severity.err, diagnostics.items[0].severity);
+    try testing.expectEqual(division_line, diagnostics.items[0].range.start.line);
+    try testing.expectEqualStrings("division by zero can panic at runtime", diagnostics.items[0].message);
+}
 
 test "configured checker leases preserve standalone diagnostics" {
     const testing = std.testing;

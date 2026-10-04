@@ -69,21 +69,25 @@ const ProjectContext = struct {
     allocator: std.mem.Allocator,
     files: []const import_resolver.File,
     build_file_indices: []const usize,
+    path_index: ?*import_resolver.PathIndex,
     api_roots: std.ArrayList(usize) = .empty,
     public_api_files: std.ArrayList(usize) = .empty,
     api_root_membership: std.AutoHashMapUnmanaged(usize, void) = .empty,
     public_api_membership: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    build_modules: std.AutoHashMapUnmanaged(u32, usize) = .empty,
     references: ProjectReferenceIndex,
 
     fn init(
         allocator: std.mem.Allocator,
         files: []const import_resolver.File,
         build_file_indices: []const usize,
+        path_index: ?*import_resolver.PathIndex,
     ) !ProjectContext {
         return .{
             .allocator = allocator,
             .files = files,
             .build_file_indices = build_file_indices,
+            .path_index = path_index,
             .references = try ProjectReferenceIndex.init(allocator, files),
         };
     }
@@ -91,6 +95,7 @@ const ProjectContext = struct {
     fn deinit(self: *ProjectContext) void {
         self.references.deinit();
         self.public_api_membership.deinit(self.allocator);
+        self.build_modules.deinit(self.allocator);
         self.api_root_membership.deinit(self.allocator);
         self.public_api_files.deinit(self.allocator);
         self.api_roots.deinit(self.allocator);
@@ -101,6 +106,14 @@ const ProjectContext = struct {
             if (file_index >= self.files.len) continue;
             try self.collectBuildRootSourceFiles(file_index);
         }
+    }
+
+    /// Bind an import name to a module root the build script declares. The
+    /// table is the one every import resolver shares, so `@import(name)`
+    /// answers the same file here and in the type resolver.
+    fn registerModuleName(self: *ProjectContext, name: []const u8, file_index: usize) !void {
+        const path_index = self.path_index orelse return;
+        try import_resolver.addModuleName(self.allocator, &path_index.module_names, name, file_index);
     }
 
     fn collectPublicApiFiles(self: *ProjectContext) !void {
@@ -154,34 +167,103 @@ const ProjectContext = struct {
         if (tree.errors.len != 0) return;
         const build_receiver = buildFunctionReceiver(tree, resolver) orelse return;
         const tags = tree.nodes.items(.tag);
+
+        // A module declaration binds a variable to a root source file, and an
+        // import registration names that binding rather than the file, so every
+        // binding is read before any registration is.
+        for (tags, 0..) |tag, node_index| {
+            if (!import_resolver.isVarDeclTag(tag)) continue;
+            const full = tree.fullVarDecl(@enumFromInt(node_index)) orelse continue;
+            const init_node = full.ast.init_node.unwrap() orelse continue;
+            const root_index = self.buildModuleRoot(
+                tree,
+                @intFromEnum(init_node),
+                build_path,
+                resolver,
+                build_receiver,
+            ) orelse continue;
+            try self.build_modules.put(self.allocator, @intCast(node_index), root_index);
+        }
+
         for (tags, 0..) |tag, node_index| {
             if (!call_resolver.isCallNode(tag)) continue;
-            if (!isBuildMethodCall(tree, resolver, @intCast(node_index), build_receiver)) continue;
+            const call_node: u32 = @intCast(node_index);
+            if (self.buildModuleRoot(tree, call_node, build_path, resolver, build_receiver)) |root_index| {
+                // `addModule` publishes the module under its own name.
+                if (moduleDeclaredName(tree, call_node)) |name| {
+                    try self.appendApiRoot(root_index);
+                    try self.registerModuleName(name, root_index);
+                }
+            }
+            try self.collectBuildImportName(tree, call_node, resolver);
+        }
+    }
 
-            var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
-            const call = tree.fullCall(&call_buffer, @enumFromInt(node_index)) orelse continue;
-            const callee = @intFromEnum(call.ast.fn_expr);
-            const method = tree.tokenSlice(tree.nodes.items(.data)[callee].node_and_token[1]);
-            if (!std.mem.eql(u8, method, "addModule") and !std.mem.eql(u8, method, "createModule")) continue;
-            for (call.ast.params) |param_node| {
-                const parameter = @intFromEnum(param_node);
-                if (parameter >= tags.len) continue;
+    /// Root source file a build script binds to the module this call creates.
+    fn buildModuleRoot(
+        self: *ProjectContext,
+        tree: *const std.zig.Ast,
+        node: u32,
+        build_path: []const u8,
+        resolver: call_resolver.ProjectTypeResolver,
+        build_receiver: BuildReceiver,
+    ) ?usize {
+        if (!isBuildMethodCall(tree, resolver, node, build_receiver)) return null;
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return null;
 
-                var struct_buffer: [2]std.zig.Ast.Node.Index = undefined;
-                const struct_init = tree.fullStructInit(
-                    &struct_buffer,
-                    @enumFromInt(parameter),
-                ) orelse continue;
-                for (struct_init.ast.fields) |field_node| {
-                    const field_name = structInitFieldName(tree, field_node) orelse continue;
-                    if (!std.mem.eql(u8, field_name, "root_source_file")) continue;
-                    const root_path = buildPathLiteral(tree, resolver, @intFromEnum(field_node), build_receiver) orelse continue;
-                    if (import_resolver.resolveImportToFileIndex(self.files, build_path, root_path)) |root_index| {
-                        try self.appendApiRoot(root_index);
-                    }
+        var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, @enumFromInt(node)) orelse return null;
+        const callee = @intFromEnum(call.ast.fn_expr);
+        if (callee >= tags.len or tags[callee] != .field_access) return null;
+        const method = tree.tokenSlice(tree.nodes.items(.data)[callee].node_and_token[1]);
+        if (!std.mem.eql(u8, method, "addModule") and !std.mem.eql(u8, method, "createModule")) return null;
+        for (call.ast.params) |param_node| {
+            const parameter = @intFromEnum(param_node);
+            if (parameter >= tags.len) continue;
+
+            var struct_buffer: [2]std.zig.Ast.Node.Index = undefined;
+            const struct_init = tree.fullStructInit(
+                &struct_buffer,
+                @enumFromInt(parameter),
+            ) orelse continue;
+            for (struct_init.ast.fields) |field_node| {
+                const field_name = structInitFieldName(tree, field_node) orelse continue;
+                if (!std.mem.eql(u8, field_name, "root_source_file")) continue;
+                const root_path = buildPathLiteral(tree, resolver, @intFromEnum(field_node), build_receiver) orelse continue;
+                if (import_resolver.resolveImportToFileIndex(self.files, build_path, root_path)) |root_index| {
+                    return root_index;
                 }
             }
         }
+        return null;
+    }
+
+    /// `module.addImport("name", module)` publishes the module bound to the
+    /// second argument, so `@import("name")` in an analyzed source file names
+    /// that root. A name no registration reaches stays unresolved.
+    fn collectBuildImportName(
+        self: *ProjectContext,
+        tree: *const std.zig.Ast,
+        node: u32,
+        resolver: call_resolver.ProjectTypeResolver,
+    ) !void {
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return;
+
+        var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const call = tree.fullCall(&call_buffer, @enumFromInt(node)) orelse return;
+        const callee = @intFromEnum(call.ast.fn_expr);
+        if (callee >= tags.len or tags[callee] != .field_access) return;
+        if (!std.mem.eql(u8, tree.tokenSlice(tree.nodes.items(.data)[callee].node_and_token[1]), "addImport")) return;
+        if (call.ast.params.len != 2) return;
+
+        const name = stringLiteralSlice(tree, @intFromEnum(call.ast.params[0])) orelse return;
+        const binding = @intFromEnum(call.ast.params[1]);
+        if (binding >= tags.len or tags[binding] != .identifier) return;
+        const declaration = resolver.resolveDeclarationNode(binding) orelse return;
+        const root_index = self.build_modules.get(declaration) orelse return;
+        try self.registerModuleName(name, root_index);
     }
 };
 
@@ -299,9 +381,29 @@ fn buildPathLiteral(
     const field_name = tree.tokenSlice(access[1]);
     if (!std.mem.eql(u8, field_name, "path")) return null;
 
-    const argument = @intFromEnum(call.ast.params[0]);
-    if (argument >= tags.len or tags[argument] != .string_literal) return null;
-    const main_token = tree.nodes.items(.main_token)[argument];
+    return stringLiteralSlice(tree, @intFromEnum(call.ast.params[0]));
+}
+
+/// Name `addModule` publishes the module under. `createModule` takes no such
+/// parameter, so a module it creates stays unpublished.
+fn moduleDeclaredName(tree: *const std.zig.Ast, node: u32) ?[]const u8 {
+    const tags = tree.nodes.items(.tag);
+    if (node >= tags.len) return null;
+
+    var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const call = tree.fullCall(&call_buffer, @enumFromInt(node)) orelse return null;
+    const callee = @intFromEnum(call.ast.fn_expr);
+    if (callee >= tags.len or tags[callee] != .field_access) return null;
+    if (!std.mem.eql(u8, tree.tokenSlice(tree.nodes.items(.data)[callee].node_and_token[1]), "addModule")) return null;
+    if (call.ast.params.len == 0) return null;
+    return stringLiteralSlice(tree, @intFromEnum(call.ast.params[0]));
+}
+
+/// Text of a string literal node, without its surrounding quotes.
+fn stringLiteralSlice(tree: *const std.zig.Ast, node: u32) ?[]const u8 {
+    const tags = tree.nodes.items(.tag);
+    if (node >= tags.len or tags[node] != .string_literal) return null;
+    const main_token = tree.nodes.items(.main_token)[node];
     const token_tags = tree.tokens.items(.tag);
     if (main_token >= token_tags.len or token_tags[main_token] != .string_literal) return null;
     const literal = tree.tokenSlice(main_token);
@@ -389,6 +491,7 @@ pub fn analyze(
         allocator,
         resolver_files,
         project_sources.buildFileIndices(),
+        project_sources.path_index,
     );
     defer project.deinit();
     try project.collectApiRoots();
@@ -1244,7 +1347,7 @@ test "project public API closure follows conditional aliases and cycles" {
         .{ .path = "condition.zig", .tree = &empty },
         .{ .path = "hidden.zig", .tree = &empty },
     };
-    var project = try ProjectContext.init(allocator, &files, &.{});
+    var project = try ProjectContext.init(allocator, &files, &.{}, null);
     defer project.deinit();
     try project.appendApiRoot(0);
     try project.collectPublicApiFiles();
@@ -1414,7 +1517,8 @@ test "project unused analysis requires complete source and build syntax" {
     const Harness = struct {
         fn run(
             failing_allocator: std.mem.Allocator,
-            sources: *const ProjectSources,
+            io: *compat.Context,
+            input_paths: []const []const u8,
             cases: *const Scenarios,
             case_index: usize,
         ) !void {
@@ -1424,7 +1528,9 @@ test "project unused analysis requires complete source and build syntax" {
                 for (diagnostics.items) |*item| item.deinit(failing_allocator);
                 diagnostics.deinit(failing_allocator);
             }
-            try analyze(sources, failing_allocator, &diagnostics);
+            var sources = try ProjectSources.init(io, failing_allocator, input_paths);
+            defer sources.deinit();
+            try analyze(&sources, failing_allocator, &diagnostics);
 
             var context_reports: usize = 0;
             for (diagnostics.items) |diagnostic| {
@@ -1452,12 +1558,82 @@ test "project unused analysis requires complete source and build syntax" {
     for (scenarios, 0..) |scenario, case_index| {
         try directory.writeFile("malformed.zig", scenario.source);
         try directory.writeFile("build.zig", scenario.build);
-        var project = try ProjectSources.init(&io_context, allocator, &paths);
-        defer project.deinit();
         try std.testing.checkAllAllocationFailures(
             allocator,
             Harness.run,
-            .{ &project, &scenarios, case_index },
+            .{ &io_context, &paths, &scenarios, case_index },
         );
+    }
+}
+
+test "project unused follows only the module name a build script actually registers" {
+    const allocator = std.testing.allocator;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var directory = compat.TestDir.init();
+    defer directory.cleanup();
+
+    try directory.writeFile("root.zig", "pub const leaf = @import(\"leaf.zig\");\n");
+    try directory.writeFile("leaf.zig", "pub fn calledFromConsumer() void {}\npub fn neverCalled() void {}\n");
+    try directory.writeFile("other.zig", "pub fn otherModule() void {}\n");
+    try directory.writeFile("consumer.zig",
+        \\const lib = @import("lib_alias");
+        \\pub fn main() void {
+        \\    lib.leaf.calledFromConsumer();
+        \\}
+    );
+
+    const build_prefix =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const lib = b.createModule(.{ .root_source_file = b.path("root.zig") });
+        \\    const other = b.createModule(.{ .root_source_file = b.path("other.zig") });
+        \\    const consumer = b.createModule(.{ .root_source_file = b.path("consumer.zig") });
+        \\
+    ;
+    const scenarios = [_]struct {
+        registrations: []const u8,
+        /// The consumer reaches `calledFromConsumer` only through a name the
+        /// build registers for the module whose root re-exports the leaf.
+        reaches_leaf: bool,
+    }{
+        .{ .registrations = "    consumer.addImport(\"lib_alias\", lib);\n", .reaches_leaf = true },
+        .{ .registrations = "", .reaches_leaf = false },
+        .{ .registrations = "    consumer.addImport(\"lib_alias\", other);\n", .reaches_leaf = false },
+        .{
+            .registrations = "    consumer.addImport(\"lib_alias\", lib);\n" ++
+                "    consumer.addImport(\"lib_alias\", other);\n",
+            .reaches_leaf = false,
+        },
+    };
+
+    const names = [_][]const u8{ "root.zig", "leaf.zig", "other.zig", "consumer.zig" };
+    var buffers: [names.len][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        paths[index] = try std.fmt.bufPrint(&buffers[index], "{s}/{s}", .{ directory.path(), name });
+    }
+
+    inline for (scenarios) |scenario| {
+        try directory.writeFile("build.zig", build_prefix ++ scenario.registrations ++ "}\n");
+        var project = try ProjectSources.init(&io_context, allocator, &paths);
+        defer project.deinit();
+
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*item| item.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try analyze(&project, allocator, &diagnostics);
+
+        var reached: usize = 0;
+        var unreached: usize = 0;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "calledFromConsumer") != null) reached += 1;
+            if (std.mem.indexOf(u8, diagnostic.message, "neverCalled") != null) unreached += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), unreached);
+        const expected_reached: usize = if (scenario.reaches_leaf) 0 else 1;
+        try std.testing.expectEqual(expected_reached, reached);
     }
 }

@@ -44,7 +44,7 @@ pub fn Mixin(comptime _Engine: type) type {
             for (callee_cfg.nodes.items) |cfg_node| {
                 if (cfg_node.ir_node.tag == .try_expr) may_return_error = true;
                 switch (cfg_node.ir_node.tag) {
-                    .fn_entry, .fn_exit, .ret, .var_decl, .block, .expr, .nop, .branch => {},
+                    .fn_entry, .fn_exit, .ret, .var_decl, .block, .expr, .nop, .branch, .break_stmt => {},
                     else => only_computation = false,
                 }
             }

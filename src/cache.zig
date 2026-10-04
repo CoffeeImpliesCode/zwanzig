@@ -493,16 +493,32 @@ test "Cache: clear releases collected names on allocation failure" {
             var setup = try Cache.initAt(std.testing.allocator, context, path);
             defer setup.deinit();
             const rules = [_][]const u8{"rule1"};
-            const key = CacheKey.init("clear allocation failure", null, "1.0.0", false, &rules, null);
-            try setup.put(key, "cached data");
+            const keys = [_]CacheKey{
+                CacheKey.init("first cached file", null, "1.0.0", false, &rules, null),
+                CacheKey.init("second cached file", null, "1.0.0", false, &rules, null),
+                CacheKey.init("third cached file", null, "1.0.0", false, &rules, null),
+            };
+            for (keys) |key| try setup.put(key, "cached data");
 
             var cache = try Cache.initAt(failing_allocator, context, path);
             defer cache.deinit();
-            try cache.clear();
+            cache.clear() catch |err| {
+                if (err == error.OutOfMemory) {
+                    for (keys) |key| {
+                        const retained = try setup.get(key);
+                        defer if (retained) |data| std.testing.allocator.free(data);
+                        try std.testing.expect(retained != null);
+                        try std.testing.expectEqualStrings("cached data", retained.?);
+                    }
+                }
+                return err;
+            };
 
-            const remaining = try setup.get(key);
-            defer if (remaining) |data| std.testing.allocator.free(data);
-            try std.testing.expect(remaining == null);
+            for (keys) |key| {
+                const remaining = try setup.get(key);
+                defer if (remaining) |data| std.testing.allocator.free(data);
+                try std.testing.expect(remaining == null);
+            }
         }
     };
     try std.testing.checkAllAllocationFailures(

@@ -43,7 +43,7 @@ pub fn isGuardedByAssertion(
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const call = tree.fullCall(&buffer, @enumFromInt(call_node)) orelse continue;
         if (call.ast.params.len != 1) continue;
-        const name = assertions.resolveDebugAssertionName(tree, call.ast.fn_expr, scope) orelse
+        const name = assertions.resolveDebugAssertionName(tree, call.ast.fn_expr, scope, query.lexical) orelse
             if (is_try) assertions.resolveAssertionName(tree, call.ast.fn_expr, scope) orelse continue else continue;
         if (assertions.constraintKindForName(name) != .boolean) continue;
         const condition = @intFromEnum(call.ast.params[0]);
@@ -707,7 +707,7 @@ fn scanBlockForPriorAssignment(
     return fact;
 }
 
-fn isDefinitelyNonNullExpression(
+pub fn isDefinitelyNonNullExpression(
     tree: *const std.zig.Ast,
     node: u32,
     type_context: ?*TypeContext,
@@ -746,10 +746,90 @@ fn isDefinitelyNonNullExpression(
             return isEarlyExitNode(fallback, tags) or
                 isDefinitelyNonNullExpression(tree, fallback, type_context, tags, datas);
         },
+        .@"try", .@"catch" => {
+            // The wrapper's own resolved type is the value the code after it
+            // receives, and `try` has already peeled the error union off it:
+            // the operand's type is still `!T`, which proves nothing, while
+            // the wrapper's is `T`.
+            if (typeInfoProvesNonNull(type_context, node)) return true;
+            const operand = completionOperand(tree, node, tags, datas) orelse return false;
+            return isDefinitelyNonNullExpression(tree, operand, type_context, tags, datas);
+        },
         else => return typeInfoProvesNonNull(type_context, node),
     }
 }
 
+/// The value a `try` or `catch` wrapper hands to the code after it, when
+/// arriving there means the wrapper's operand completed and the statement
+/// around it therefore stored that operand.
+///
+/// `try` leaves the function before the statement finishes, so the
+/// assignment always ran. `catch` runs a handler instead, and that handler
+/// supplies the value the statement stores; the assignment only performed
+/// the operand when the handler leaves the enclosing scope. `orelse` keeps
+/// the operand's own nullability and `errdefer` is not an expression, so
+/// neither is peeled here.
+fn completionOperand(
+    tree: *const std.zig.Ast,
+    node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) ?u32 {
+    if (node >= tags.len) return null;
+    switch (tags[node]) {
+        .@"try" => return @intFromEnum(datas[node].node),
+        .@"catch" => {
+            const handler = @intFromEnum(datas[node].node_and_node[1]);
+            if (!handlerPreventsCompletion(tree, handler, tags, datas)) return null;
+            return @intFromEnum(datas[node].node_and_node[0]);
+        },
+        else => return null,
+    }
+}
+
+/// Does a `catch` handler keep its statement from finishing? Only then did the
+/// statement store the operand's value rather than the handler's.
+///
+/// `return` and `unreachable` always do, and a bare `break`/`continue` leaves
+/// the construct that encloses the statement. A *labeled* `break` does not:
+/// `catch |err| blk: { record(err); break :blk value; }` ends the handler's
+/// own block and supplies `value` as the statement's result, so the operand's
+/// value never reaches the field. An empty block handler completes too, so it
+/// proves nothing.
+pub fn handlerPreventsCompletion(
+    tree: *const std.zig.Ast,
+    node: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) bool {
+    if (node >= tags.len) return false;
+    switch (tags[node]) {
+        .@"return", .unreachable_literal => return true,
+        .@"break", .@"continue" => return datas[node].opt_token_and_opt_node[0] == .none,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var inline_statements: [2]u32 = undefined;
+            const statements = ast_walk.getBlockStatements(tree, node, &inline_statements) orelse
+                return false;
+            if (statements.len == 0) return false;
+            for (statements) |statement| {
+                if (!handlerPreventsCompletion(tree, statement, tags, datas)) return false;
+            }
+            return true;
+        },
+        .@"if", .if_simple => {
+            const full = tree.fullIf(@enumFromInt(node)) orelse return false;
+            const else_node = @intFromEnum(full.ast.else_expr.unwrap() orelse return false);
+            return handlerPreventsCompletion(tree, @intFromEnum(full.ast.then_expr), tags, datas) and
+                handlerPreventsCompletion(tree, else_node, tags, datas);
+        },
+        else => return false,
+    }
+}
+
+/// Does the resolved type of `node` exclude `null`? A type that could not be
+/// read, an optional, and a *still-wrapped* error union all prove nothing: a
+/// `try`/`catch` expression carries the payload of its error union, but its
+/// operand node is typed with the error union itself.
 fn typeInfoProvesNonNull(type_context: ?*TypeContext, node: u32) bool {
     const ctx = type_context orelse return false;
     const info = ctx.getExpressionTypeStrict(node) orelse return false;
@@ -1292,7 +1372,7 @@ const DeferredTiming = enum {
     scope_exited,
 };
 
-fn statementMayMutateStorage(
+pub fn statementMayMutateStorage(
     query: *const QueryContext,
     statement: u32,
     target: u32,
@@ -1494,6 +1574,9 @@ fn storageWriteMayAffect(query: *const QueryContext, lhs: u32, target: u32, bloc
     if (tags[lhs] == .identifier) return storageRootMatches(query, lhs, target);
     if (storageFieldsAreDisjoint(query, lhs, target, type_context)) return false;
     if (storageRootsMayAlias(query, lhs, target, type_context)) return true;
+    // A place that only rewrites the value one local slot holds reaches nothing
+    // else, so once the roots are known to be apart it cannot reach the target.
+    if (writeStaysInLocalSlot(query, lhs, target, type_context)) return false;
     return switch (tags[lhs]) {
         .deref, .address_of, .field_access, .array_access => !localSlotHasNoAliases(query, target, block, type_context),
         else => true,
@@ -1566,6 +1649,218 @@ fn localSlotHasNoAliases(query: *const QueryContext, target: u32, block: u32, ty
         }
     }
     return true;
+}
+
+/// Where the storage a place expression designates actually lives. A local
+/// slot owns the bytes of the value it holds; a pointer held in one only
+/// reaches memory the slot does not own.
+const SlotStorage = enum { in_slot, in_slot_array, behind_pointer, unknown };
+
+/// True when the write rewrites nothing but the value one function-local slot
+/// holds, and the guarded storage is not somewhere inside that slot. Two such
+/// slots never overlap, so once `storageRootsMayAlias` has ruled the roots
+/// apart the write cannot reach the target: `out.len` rewrites the header the
+/// parameter owns, and so does `sink.len` after `var sink = out;`. A place that
+/// leaves the slot keeps the conservative answer: `out[0]` reaches the memory
+/// the header points at, and `p.*` and `holder.state.value` dereference a
+/// pointer the slot only carries.
+fn writeStaysInLocalSlot(query: *const QueryContext, lhs: u32, target: u32, type_context: ?*TypeContext) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    var node = lhs;
+    for (0..16) |_| {
+        if (node >= tags.len) return false;
+        switch (tags[node]) {
+            .field_access => {
+                const base = @intFromEnum(datas[node].node_and_token[0]);
+                if (slotStorage(query, base, type_context) != .in_slot) return false;
+                node = base;
+            },
+            .array_access => {
+                // An element of an array is part of the slot that holds it; an
+                // element of a slice or through a pointer is not.
+                const base = @intFromEnum(datas[node].node_and_node[0]);
+                if (slotStorage(query, base, type_context) != .in_slot_array) return false;
+                node = base;
+            },
+            .identifier => return slotIsOutsideTarget(query, node, lhs, target, type_context),
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// The root has to be a slot of the guarded function itself: a container-level
+/// variable is shared storage every call can rewrite, and a binding of another
+/// function is not the storage this write reaches.
+fn rootIsFunctionLocalSlot(query: *const QueryContext, root: u32, target: u32) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    if (target >= tags.len) return false;
+    const binding = query.resolveIdentifierBinding(root) orelse return false;
+    if (binding == 0) return false;
+    const function = query.lexical.enclosingFunction(binding) orelse return false;
+    if (query.lexical.enclosingFunction(tree.nodeMainToken(@enumFromInt(target))) != function) return false;
+    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(tree.nodeMainToken(@enumFromInt(root))));
+    for (query.lexical.namedCandidates(name)) |candidate| {
+        if (candidate.name_token != binding or candidate.kind == .function) continue;
+        return !candidate.is_root;
+    }
+    return false;
+}
+
+/// The slot is only out of reach when the target does not read it back. A view
+/// taken from the slot before the write — `&cells[0]`, `cells[0..]`, a call
+/// that returns one, or a rebinding that names the slot — designates the very
+/// bytes this write rewrites, so reaching the target means going through the
+/// slot after all. A by-value copy of the slot's content is a different object
+/// and keeps the guard.
+fn slotIsOutsideTarget(
+    query: *const QueryContext,
+    root: u32,
+    lhs: u32,
+    target: u32,
+    type_context: ?*TypeContext,
+) bool {
+    if (!rootIsFunctionLocalSlot(query, root, target)) return false;
+    if (slotAddressEscapes(query, root, lhs)) return false;
+    const slot_binding = query.resolveIdentifierBinding(root) orelse return false;
+    const target_root = storageRootIdentifier(query, target) orelse return false;
+    return !bindingDerivedFrom(query, target_root, slot_binding, query.firstToken(lhs), type_context);
+}
+
+/// The slot has to be private to this function. Its address handed out before
+/// the write — `&copy` in any argument, or an `@asm` block, which can reach
+/// anything — leaves a pointer the checker never sees, and a callee that was
+/// given both the slot and the guarded storage can make the two the same
+/// object. A by-value copy of the slot is not an escape.
+fn slotAddressEscapes(query: *const QueryContext, root: u32, lhs: u32) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const binding = query.resolveIdentifierBinding(root) orelse return true;
+    const window_end = query.firstToken(lhs);
+    for (tags, 0..) |tag, index| {
+        switch (tag) {
+            .@"asm", .asm_simple, .address_of => {},
+            else => continue,
+        }
+        const node: std.zig.Ast.Node.Index = @enumFromInt(index);
+        const start = query.firstToken(@intCast(index));
+        if (start < binding or start >= window_end) continue;
+        if (tag == .address_of and
+            !expressionMentionsBinding(query, @intFromEnum(tree.nodeData(node).node), binding)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// The storage the value of `expr` occupies. A declaration written in the
+/// source decides it wherever one exists — a parameter, a typed `var`, or a
+/// member read from its owner's own declaration — and an inferred `var` takes
+/// the shape of the value it was initialised from.
+fn slotStorage(query: *const QueryContext, expr: u32, type_context: ?*TypeContext) SlotStorage {
+    return slotStorageWithin(query, expr, type_context, 0);
+}
+
+/// The same reading, following an initializer chain far enough to shape an
+/// inferred `var`. A resolved type settles only what the declaration leaves
+/// unread.
+fn slotStorageWithin(query: *const QueryContext, expr: u32, type_context: ?*TypeContext, depth: u8) SlotStorage {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    if (expr >= tags.len or depth > 4) return .unknown;
+    var written: SlotStorage = .unknown;
+    switch (tags[expr]) {
+        .identifier => {
+            if (bindingTypeExprNode(query, expr)) |type_node| {
+                written = typeNodeSlotStorage(tree, type_node);
+            } else if (bindingInitializerNode(query, expr)) |initializer| {
+                written = slotStorageWithin(query, initializer, type_context, depth + 1);
+            }
+        },
+        .field_access => {
+            if (fieldTypeNode(query, expr)) |type_node| written = typeNodeSlotStorage(tree, type_node);
+        },
+        else => {},
+    }
+    // A declaration written in the source is the storage's own spelling; a
+    // resolved type only settles what it leaves open.
+    if (written != .unknown) return written;
+    return resolvedSlotStorage(type_context, expr);
+}
+
+/// The value a `var` was initialised from, so an inferred type reads off the
+/// expression that gave the slot its shape.
+fn bindingInitializerNode(query: *const QueryContext, identifier: u32) ?u32 {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    if (identifier >= tags.len or tags[identifier] != .identifier) return null;
+    const binding = query.resolveIdentifierBinding(identifier) orelse return null;
+    const name = import_resolver.normalizeIdentifier(tree.tokenSlice(tree.nodeMainToken(@enumFromInt(identifier))));
+    for (query.lexical.namedCandidates(name)) |candidate| {
+        // A parameter is filled by its caller, never by an initializer here.
+        if (candidate.name_token != binding or candidate.kind != .variable) continue;
+        const full = tree.fullVarDecl(@enumFromInt(candidate.node)) orelse return null;
+        return @intFromEnum(full.ast.init_node.unwrap() orelse return null);
+    }
+    return null;
+}
+
+/// The storage a written type node carries. `*T` designates memory the slot
+/// does not own, `[]T` and `[N]T` own their bytes inside it, and a bare name
+/// reads as a value only when this file declares it as a container.
+fn typeNodeSlotStorage(tree: *const std.zig.Ast, type_node: u32) SlotStorage {
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    var node = type_node;
+    for (0..8) |_| {
+        if (node >= tags.len) return .unknown;
+        switch (tags[node]) {
+            .ptr_type, .ptr_type_aligned, .ptr_type_bit_range, .ptr_type_sentinel => {
+                const pointer = tree.fullPtrType(@enumFromInt(node)) orelse return .unknown;
+                return if (pointer.size == .slice) .in_slot else .behind_pointer;
+            },
+            .slice, .slice_open, .slice_sentinel => return .in_slot,
+            .array_type, .array_type_sentinel => return .in_slot_array,
+            .optional_type => node = @intFromEnum(datas[node].node),
+            .error_union => node = @intFromEnum(datas[node].node_and_node[1]),
+            .grouped_expression, .@"comptime" => node = @intFromEnum(datas[node].node),
+            .identifier => {
+                // A name the file never spells out as a container may still be
+                // an alias to a pointer, so it stays unknown.
+                if (containerDeclForTypeName(tree, node, tags, datas)) |_| return .in_slot;
+                return .unknown;
+            },
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            => return .in_slot,
+            else => return .unknown,
+        }
+    }
+    return .unknown;
+}
+
+fn resolvedSlotStorage(type_context: ?*TypeContext, expr: u32) SlotStorage {
+    const ctx = type_context orelse return .unknown;
+    const info = ctx.getExpressionTypeStrict(expr) orelse return .unknown;
+    return switch (info.kind) {
+        .pointer => .behind_pointer,
+        .slice => .in_slot,
+        .array => .in_slot_array,
+        .@"struct", .@"union", .@"enum" => .in_slot,
+        else => .unknown,
+    };
 }
 
 fn callMayMutateStorage(
@@ -2077,7 +2372,7 @@ fn scanBlockForMethodCallWithCatch(
             const operand = @intFromEnum(datas[stmt].node_and_node[0]);
             const handler = @intFromEnum(datas[stmt].node_and_node[1]);
 
-            if (isEarlyExitExpr(tree, handler, tags, datas) and
+            if (handlerPreventsCompletion(tree, handler, tags, datas) and
                 isMethodCallOnSelf(query, operand, tags, datas, ids.astIndex(fn_node)))
             {
                 if (methodAssignsToField(query, operand, field_name, fn_node, type_context)) {
@@ -2189,7 +2484,14 @@ fn methodAssignsToField(
         const candidate_type = resolver.resolveTypeNode(@intFromEnum(first_type_node)) orelse continue;
         if (!call_resolver.resolvedTypesEqual(receiver_type, candidate_type)) continue;
 
-        if (bodyAssignsToSelfField(query, @intCast(i), field_name, type_context, tags, datas)) {
+        if (methodProvesFieldAtSuccessfulExit(
+            query,
+            @intCast(i),
+            field_name,
+            type_context,
+            tags,
+            datas,
+        )) {
             return true;
         }
     }
@@ -2197,7 +2499,14 @@ fn methodAssignsToField(
     return false;
 }
 
-fn bodyAssignsToSelfField(
+/// Is `self.field` non-null at every exit of `fn_decl` that the caller can
+/// still be running after `self.method() catch ...`? A first assignment is not
+/// that proof: the field can be left null by a later write, by a branch that
+/// never assigns, by an early `return`, or by a `defer` body running while the
+/// method's own scope exits. The caller only reaches the unwrap when the call
+/// did not fail, so error-only exits — and the `errdefer` bodies that run on
+/// exactly those exits — are outside the proof.
+fn methodProvesFieldAtSuccessfulExit(
     query: *const QueryContext,
     fn_decl: u32,
     field_name: []const u8,
@@ -2205,83 +2514,506 @@ fn bodyAssignsToSelfField(
     tags: []const std.zig.Ast.Node.Tag,
     datas: []const std.zig.Ast.Node.Data,
 ) bool {
-    const tree = query.tree;
-    // Find the body node
     if (fn_decl >= tags.len) return false;
-    const fn_data = datas[fn_decl].node_and_node;
-    const body = @intFromEnum(fn_data[1]);
-    if (body == 0) return false;
 
-    // Traverse the body looking for assignments to self.field_name
-    var stack: [256]u32 = undefined;
-    var stack_len: usize = 0;
-    stack[stack_len] = body;
-    stack_len += 1;
+    const body = @intFromEnum(datas[fn_decl].node_and_node[1]);
+    if (body == 0 or body >= tags.len) return false;
 
-    while (stack_len > 0) {
-        stack_len -= 1;
-        const node = stack[stack_len];
-        if (node >= tags.len) continue;
+    const field_node = findSelfFieldAccess(query, body, field_name, fn_decl, tags, datas) orelse
+        return false;
 
-        if (tags[node] == .assign) {
-            const pair = datas[node].node_and_node;
-            const lhs = @intFromEnum(pair[0]);
-            const rhs = @intFromEnum(pair[1]);
-            if (isSelfFieldAccess(query, lhs, field_name, fn_decl, tags, datas) and
-                isDefinitelyNonNullExpression(tree, rhs, type_context, tags, datas))
-            {
-                return true;
+    const proof = MethodExitProof{
+        .query = query,
+        .fn_decl = fn_decl,
+        .field_name = field_name,
+        .field_node = field_node,
+        .type_context = type_context,
+        .tags = tags,
+        .datas = datas,
+    };
+    const result = proof.analyzeScope(body, false, false);
+    return result.returns_proven and (!result.falls_through or result.fall_fact);
+}
+
+/// One representative `self.field` access from a method body. The storage and
+/// identity helpers compare a root binding and a field name rather than node
+/// identity, so a single representative compares every statement against it.
+fn findSelfFieldAccess(
+    query: *const QueryContext,
+    root: u32,
+    field_name: []const u8,
+    fn_decl: u32,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+) ?u32 {
+    const Visitor = struct {
+        query: *const QueryContext,
+        field_name: []const u8,
+        fn_decl: u32,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        found: ?u32 = null,
+        stop: bool = false,
+
+        const Self = @This();
+
+        pub fn visit(self: *Self, _: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
+            if (tag != .field_access) return;
+            if (!isSelfFieldAccess(self.query, node, self.field_name, self.fn_decl, self.tags, self.datas)) {
+                return;
             }
+            self.found = node;
+            self.stop = true;
         }
+    };
 
-        // Push children based on node type
-        switch (tags[node]) {
-            .block, .block_semicolon => {
-                const extra = datas[node].extra_range;
-                const start: usize = @intFromEnum(extra.start);
-                const end: usize = @intFromEnum(extra.end);
-                for (start..end) |i| {
-                    const child = tree.extra_data[i];
-                    if (stack_len < stack.len) {
-                        stack[stack_len] = child;
-                        stack_len += 1;
-                    }
-                }
-            },
-            .block_two, .block_two_semicolon => {
-                const opt_nodes = datas[node].opt_node_and_opt_node;
-                if (opt_nodes[0].unwrap()) |n| {
-                    if (stack_len < stack.len) {
-                        stack[stack_len] = @intFromEnum(n);
-                        stack_len += 1;
-                    }
-                }
-                if (opt_nodes[1].unwrap()) |n| {
-                    if (stack_len < stack.len) {
-                        stack[stack_len] = @intFromEnum(n);
-                        stack_len += 1;
-                    }
-                }
+    var visitor = Visitor{
+        .query = query,
+        .field_name = field_name,
+        .fn_decl = fn_decl,
+        .tags = tags,
+        .datas = datas,
+    };
+    ast_walk.walk(Visitor, query.tree, root, &visitor) catch return null;
+    return visitor.found;
+}
+
+/// Flow-sensitive proof that `self.field` is non-null wherever the caller can
+/// still be running after the analysed method returned successfully. The entry
+/// fact is "unknown": the field is non-null at an exit only because a
+/// dominating write says so, never because of what it held when the method was
+/// entered.
+const MethodExitProof = struct {
+    query: *const QueryContext,
+    fn_decl: u32,
+    field_name: []const u8,
+    /// One representative `self.field` access from the body, used as the target
+    /// of every storage comparison.
+    field_node: u32,
+    type_context: ?*TypeContext,
+    tags: []const std.zig.Ast.Node.Tag,
+    datas: []const std.zig.Ast.Node.Data,
+
+    /// What a node hands back to the scope that encloses it. A method return
+    /// and a fallthrough into the next statement are different questions about
+    /// the field, which is why both are reported instead of one combined flag.
+    const ExitProof = struct {
+        /// Every reachable successful method return under this node carries a
+        /// proven non-null field. Vacuously true when the node contains no
+        /// reachable successful method return at all.
+        returns_proven: bool,
+        /// Control can reach the end of the node.
+        falls_through: bool,
+        /// The field is proven non-null where control reaches the end.
+        fall_fact: bool,
+
+        /// The reading of a node this analysis cannot decode: it proves nothing
+        /// and no fact reaches past it.
+        const unproven = ExitProof{
+            .returns_proven = false,
+            .falls_through = true,
+            .fall_fact = false,
+        };
+    };
+
+    /// `pending` records that a scope enclosing this one already registered a
+    /// `defer` body that may clobber the field. That body runs when control
+    /// leaves the enclosing scope, so it is charged to a method return taken
+    /// here and to nothing else: a nested scope that merely falls through does
+    /// not run it, so an intermediate fact must never be poisoned by it.
+    fn analyze(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        // The syntax tree is acyclic, so the descent always terminates. No
+        // depth cap stands in for a proof it cannot make.
+        if (node == 0 or node >= self.tags.len) return .unproven;
+
+        switch (self.tags[node]) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                return self.analyzeScope(node, entry_fact, pending);
             },
             .@"if", .if_simple => {
-                const full_if = tree.fullIf(@enumFromInt(node)) orelse continue;
-                if (stack_len < stack.len) {
-                    stack[stack_len] = @intFromEnum(full_if.ast.then_expr);
-                    stack_len += 1;
-                }
-                if (full_if.ast.else_expr.unwrap()) |else_node| {
-                    if (stack_len < stack.len) {
-                        stack[stack_len] = @intFromEnum(else_node);
-                        stack_len += 1;
-                    }
-                }
+                return self.analyzeIf(node, entry_fact, pending, scope);
+            },
+            .@"while", .while_simple, .while_cont => {
+                return self.analyzeWhile(node, entry_fact, pending, scope);
+            },
+            .@"for", .for_simple => {
+                return self.analyzeFor(node, entry_fact, pending, scope);
+            },
+            .@"switch", .switch_comma => {
+                return self.analyzeSwitch(node, entry_fact, pending, scope);
+            },
+            .@"return" => {
+                return self.analyzeReturn(node, entry_fact, pending, scope);
+            },
+            .@"break", .@"continue" => {
+                // A labeled transfer targets a scope this analysis does not
+                // track, so no fact survives it: `break :outer` can step over an
+                // initializer the rest of the method reads.
+                if (self.datas[node].opt_token_and_opt_node[0] != .none) return .unproven;
+                // A bare one leaves the innermost loop or switch, not the
+                // method. It is no method return, and it cannot fall through
+                // either, so it neither hides a mutation nor revives a fact.
+                return .{ .returns_proven = true, .falls_through = false, .fall_fact = false };
+            },
+            // `analyzeScope` owns the clobbering check for a `defer`/`errdefer`
+            // statement; neither body has run at this point.
+            .@"defer", .@"errdefer" => {
+                return .{ .returns_proven = true, .falls_through = true, .fall_fact = entry_fact };
             },
             else => {},
         }
+
+        // A direct write of a definitely non-null value is the only statement
+        // that establishes the fact. Anything else either leaves the field
+        // alone or destroys it, a write through an alias included.
+        if (self.tags[node] == .assign and self.assignsNonNullToField(node)) {
+            return .{ .returns_proven = true, .falls_through = true, .fall_fact = true };
+        }
+
+        const clobbers = statementMayMutateStorage(
+            self.query,
+            node,
+            self.field_node,
+            self.tags,
+            self.datas,
+            scope,
+            self.type_context,
+        );
+        const rest_fact = if (clobbers) false else entry_fact;
+        return .{
+            .returns_proven = self.payloadReturnsProven(node, rest_fact, pending, scope),
+            .falls_through = true,
+            .fall_fact = rest_fact,
+        };
     }
 
-    return false;
-}
+    /// Folds the statements of one scope. `local_clobbered` records the `defer`
+    /// bodies THIS scope registered: they run when it exits, so they are
+    /// charged here and to any method return taken inside, while an inherited
+    /// `pending` body belongs to an outer scope and is not.
+    fn analyzeScope(
+        self: *const MethodExitProof,
+        block: u32,
+        entry_fact: bool,
+        pending: bool,
+    ) ExitProof {
+        var inline_statements: [2]u32 = undefined;
+        const statements = ast_walk.getBlockStatements(self.query.tree, block, &inline_statements) orelse
+            return .unproven;
+
+        var fact = entry_fact;
+        var local_clobbered = false;
+        var returns_proven = true;
+
+        for (statements) |statement| {
+            if (statement >= self.tags.len) continue;
+
+            switch (self.tags[statement]) {
+                // A `defer` body runs when this scope exits, on every path that
+                // leaves it, so once such a body may clobber the field no fact
+                // this scope holds can reach the caller.
+                .@"defer" => {
+                    if (self.deferMayClobberField(statement, block)) local_clobbered = true;
+                    continue;
+                },
+                // An `errdefer` body runs only when the scope exits with an
+                // error, and no error exit reaches the caller's unwrap.
+                .@"errdefer" => continue,
+                else => {},
+            }
+
+            const proof = self.analyze(statement, fact, pending or local_clobbered, block);
+            if (!proof.returns_proven) returns_proven = false;
+            // A statement that cannot fall through leaves the scope outright,
+            // so no successor is reachable from this path.
+            if (!proof.falls_through) {
+                return .{
+                    .returns_proven = returns_proven,
+                    .falls_through = false,
+                    .fall_fact = false,
+                };
+            }
+            fact = proof.fall_fact;
+        }
+
+        return .{
+            .returns_proven = returns_proven,
+            .falls_through = true,
+            .fall_fact = fact and !local_clobbered,
+        };
+    }
+
+    fn analyzeIf(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        const full = self.query.tree.fullIf(@enumFromInt(node)) orelse return .unproven;
+        const cond = @intFromEnum(full.ast.cond_expr);
+
+        // The condition runs before either branch, so whatever it does to the
+        // field is charged before either branch's entry fact is derived.
+        var cond_fact = entry_fact;
+        if (self.mayMutateField(cond, scope)) cond_fact = false;
+        // A null check on the field itself hands the fact to the branch that
+        // does not see the null. That is what makes
+        // `if (self.f == null) { self.f = ...; }` a proof even though the
+        // field starts out unknown.
+        const then_fact = cond_fact or conditionImpliesNotNull(self.query, cond, self.field_node);
+        const else_fact = cond_fact or
+            conditionImpliesNullnessOnFalse(self.query, cond, self.field_node, false);
+
+        const then_proof = self.analyze(
+            @intFromEnum(full.ast.then_expr),
+            then_fact,
+            pending,
+            scope,
+        );
+        const else_proof = if (full.ast.else_expr.unwrap()) |else_node|
+            self.analyze(@intFromEnum(else_node), else_fact, pending, scope)
+        else
+            ExitProof{ .returns_proven = true, .falls_through = true, .fall_fact = else_fact };
+
+        return .{
+            .returns_proven = then_proof.returns_proven and else_proof.returns_proven,
+            .falls_through = then_proof.falls_through or else_proof.falls_through,
+            // A branch that does not fall through adds no requirement to the
+            // join, because it never reaches it.
+            .fall_fact = (!then_proof.falls_through or then_proof.fall_fact) and
+                (!else_proof.falls_through or else_proof.fall_fact),
+        };
+    }
+
+    /// A loop can only keep the fact, never establish it: its body runs zero or
+    /// more times, under a condition, a continuation and an `else` continuation
+    /// that may each write the field, and both the body and that `else`
+    /// continuation may leave the method as well.
+    fn analyzeWhile(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        const full = self.query.tree.fullWhile(@enumFromInt(node)) orelse return .unproven;
+        const body = self.analyze(@intFromEnum(full.ast.then_expr), entry_fact, pending, scope);
+
+        var returns_proven = body.returns_proven;
+        var preserved = entry_fact and body.falls_through and body.fall_fact;
+        if (self.mayMutateField(@intFromEnum(full.ast.cond_expr), scope)) preserved = false;
+        if (full.ast.cont_expr.unwrap()) |cont| {
+            if (self.mayMutateField(@intFromEnum(cont), scope)) preserved = false;
+        }
+        // The `else` continuation runs once the condition turns false, even when
+        // the body never ran at all, so it may both clobber and return.
+        if (full.ast.else_expr.unwrap()) |else_node| {
+            if (!self.analyze(@intFromEnum(else_node), entry_fact, pending, scope).returns_proven) {
+                returns_proven = false;
+            }
+            if (self.mayMutateField(@intFromEnum(else_node), scope)) preserved = false;
+        }
+
+        return .{
+            .returns_proven = returns_proven,
+            .falls_through = true,
+            .fall_fact = preserved,
+        };
+    }
+
+    fn analyzeFor(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        const full = self.query.tree.fullFor(@enumFromInt(node)) orelse return .unproven;
+        const body = self.analyze(@intFromEnum(full.ast.then_expr), entry_fact, pending, scope);
+
+        var returns_proven = body.returns_proven;
+        var preserved = entry_fact and body.falls_through and body.fall_fact;
+        for (full.ast.inputs) |input| {
+            if (self.mayMutateField(@intFromEnum(input), scope)) preserved = false;
+        }
+        // The `else` continuation runs once the inputs are exhausted, even when
+        // the body never ran at all, so it may both clobber and return.
+        if (full.ast.else_expr.unwrap()) |else_node| {
+            if (!self.analyze(@intFromEnum(else_node), entry_fact, pending, scope).returns_proven) {
+                returns_proven = false;
+            }
+            if (self.mayMutateField(@intFromEnum(else_node), scope)) preserved = false;
+        }
+
+        return .{
+            .returns_proven = returns_proven,
+            .falls_through = true,
+            .fall_fact = preserved,
+        };
+    }
+
+    /// A valid Zig switch is exhaustive. Join every reachable prong without
+    /// adding a fictitious path that skips all of them.
+    fn analyzeSwitch(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        const full = self.query.tree.switchFull(@enumFromInt(node));
+        if (full.ast.cases.len == 0) return .unproven;
+        var cond_fact = entry_fact;
+        if (self.mayMutateField(@intFromEnum(full.ast.condition), scope)) cond_fact = false;
+
+        var returns_proven = true;
+        var fall_fact = true;
+        var falls_through = false;
+
+        for (full.ast.cases) |case_node| {
+            const full_case = self.query.tree.fullSwitchCase(case_node) orelse return .unproven;
+            const proof = self.analyze(
+                @intFromEnum(full_case.ast.target_expr),
+                cond_fact,
+                pending,
+                scope,
+            );
+            if (!proof.returns_proven) returns_proven = false;
+            falls_through = falls_through or proof.falls_through;
+            if (proof.falls_through and !proof.fall_fact) fall_fact = false;
+        }
+
+        return .{
+            .returns_proven = returns_proven,
+            .falls_through = falls_through,
+            .fall_fact = fall_fact,
+        };
+    }
+
+    /// `return error.X` leaves the callee only through the caller's `catch`
+    /// handler, which cannot reach the guarded unwrap, so it is excluded from
+    /// the proof. Every other `return` is a successful exit the caller does
+    /// observe: it runs the `defer` bodies of every scope it leaves, and its
+    /// operand is evaluated first, so `return self.reset();` clears the field
+    /// before the caller ever sees it.
+    fn analyzeReturn(
+        self: *const MethodExitProof,
+        node: u32,
+        entry_fact: bool,
+        pending: bool,
+        scope: u32,
+    ) ExitProof {
+        const successful = ExitProof{
+            .returns_proven = entry_fact and !pending,
+            .falls_through = false,
+            .fall_fact = false,
+        };
+        const operand = self.datas[node].opt_node.unwrap() orelse return successful;
+        const value = @intFromEnum(operand);
+        if (value >= self.tags.len) return successful;
+        if (self.tags[value] == .error_value) {
+            return .{ .returns_proven = true, .falls_through = false, .fall_fact = false };
+        }
+        if (self.mayMutateField(value, scope)) {
+            return .{ .returns_proven = false, .falls_through = false, .fall_fact = false };
+        }
+        return successful;
+    }
+
+    /// A `catch`/`orelse` payload that leaves the method is a successful method
+    /// return the statement's own fallthrough fact does not describe, and it
+    /// hides inside any wrapper: `f() catch return;`,
+    /// `const n = f() orelse return;`, `x = f() catch return;`. The payload
+    /// runs once its operand has been evaluated, so its entry fact is whatever
+    /// state the operand left behind.
+    fn payloadReturnsProven(
+        self: *const MethodExitProof,
+        statement: u32,
+        fact: bool,
+        pending: bool,
+        scope: u32,
+    ) bool {
+        const Visitor = struct {
+            proof: *const MethodExitProof,
+            fact: bool,
+            pending: bool,
+            scope: u32,
+            returns_proven: bool = true,
+            stop: bool = false,
+
+            const Self = @This();
+
+            pub fn visit(collector: *Self, tree: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
+                if (tag != .@"catch" and tag != .@"orelse") return;
+                const payload = @intFromEnum(collector.proof.datas[node].node_and_node[1]);
+                if (payload == 0 or payload >= collector.proof.tags.len) return;
+                if (!isEarlyExitExpr(tree, payload, collector.proof.tags, collector.proof.datas)) return;
+                const proof = collector.proof.analyze(payload, collector.fact, collector.pending, collector.scope);
+                if (!proof.returns_proven) {
+                    collector.returns_proven = false;
+                    collector.stop = true;
+                }
+            }
+        };
+
+        var visitor = Visitor{ .proof = self, .fact = fact, .pending = pending, .scope = scope };
+        ast_walk.walk(Visitor, self.query.tree, statement, &visitor) catch return false;
+        return visitor.returns_proven;
+    }
+
+    fn mayMutateField(self: *const MethodExitProof, node: u32, scope: u32) bool {
+        if (node == 0 or node >= self.tags.len) return true;
+        return statementMayMutateStorage(
+            self.query,
+            node,
+            self.field_node,
+            self.tags,
+            self.datas,
+            scope,
+            self.type_context,
+        );
+    }
+
+    /// True when a `defer` body may clobber the field once the scope that
+    /// registered it exits.
+    fn deferMayClobberField(self: *const MethodExitProof, statement: u32, block: u32) bool {
+        return statementMayMutateStorageAfterScopeExit(
+            self.query,
+            statement,
+            self.field_node,
+            self.tags,
+            self.datas,
+            block,
+            self.type_context,
+        );
+    }
+
+    /// True for `self.field = <definitely non-null>`, the one write that
+    /// establishes the fact. A compound assignment keeps the old value and is
+    /// therefore only ever a possible clobber.
+    fn assignsNonNullToField(self: *const MethodExitProof, node: u32) bool {
+        const pair = self.datas[node].node_and_node;
+        const lhs = @intFromEnum(pair[0]);
+        if (!isSelfFieldAccess(self.query, lhs, self.field_name, self.fn_decl, self.tags, self.datas)) {
+            return false;
+        }
+        const rhs = @intFromEnum(pair[1]);
+        return isDefinitelyNonNullExpression(
+            self.query.tree,
+            rhs,
+            self.type_context,
+            self.tags,
+            self.datas,
+        );
+    }
+};
 
 fn isSelfFieldAccess(
     query: *const QueryContext,

@@ -10,13 +10,29 @@ pub const FileDiscoveryError = error{
     FileNotFound,
 };
 
+/// Directory names a recursive scan never descends into. The match is exact:
+/// no other name is skipped, and hidden directories are not skipped as a class,
+/// so first-party sources in a hidden directory are still analyzed. These names
+/// only filter children found during the walk; a path named by the caller is
+/// always selected, so a skipped directory - or a file inside one - can still be
+/// requested explicitly.
 const ignored_dirs = [_][]const u8{
     "zig-cache",
+    ".zig-cache",
+    ".zig-global-cache",
     "zig-out",
     ".zigmod",
     ".gyro",
+    "zig-pkg",
+    "third_party",
+    ".git",
+    ".jj",
 };
 
+/// Collects the `.zig` files selected by `paths`. A directory path is walked
+/// recursively, skipping the subdirectories named in `ignored_dirs`. A file path
+/// is selected as given, even when it lies inside a skipped directory. An empty
+/// `paths` scans the current directory.
 pub fn discoverFiles(
     io_context: *compat.Context,
     allocator: std.mem.Allocator,
@@ -157,22 +173,120 @@ pub fn freeDiscoveredFiles(allocator: std.mem.Allocator, files: []const []const 
     allocator.free(files);
 }
 
+/// The names `--help` and `docs/USAGE.md` list as skipped, repeated here so the
+/// discovery test states the documented contract independently of the table
+/// that implements it.
+const documented_ignored_dirs = [_][]const u8{
+    "zig-cache",
+    ".zig-cache",
+    ".zig-global-cache",
+    "zig-out",
+    ".zigmod",
+    ".gyro",
+    "zig-pkg",
+    "third_party",
+    ".git",
+    ".jj",
+};
+
+fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn expectDiscovered(actual: []const []const u8, expected: []const []const u8) !void {
+    // Directory iteration order is not defined, so compare as sets.
+    std.mem.sort([]const u8, actual, {}, pathLessThan);
+    std.mem.sort([]const u8, expected, {}, pathLessThan);
+
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (actual, expected) |found, want| {
+        try std.testing.expectEqualStrings(want, found);
+    }
+}
+
+test "discoverFiles: recursive scan skips only the documented directory names" {
+    const allocator = std.testing.allocator;
+    const io_context = compat.defaultContext();
+
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+
+    // Each ignored name holds a `.zig` file, so a scan that descends into one
+    // selects a file the assertions below reject. `.firstparty` holds the same
+    // file under a hidden name that is not ignored.
+    const scanned_dirs = [_][]const u8{ "src", ".firstparty" } ++ documented_ignored_dirs;
+    for (scanned_dirs) |dir_name| {
+        var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_path = try std.fmt.bufPrint(&dir_path_buffer, "{s}/{s}", .{ temp_dir.path(), dir_name });
+        try compat.makePath(io_context, dir_path);
+
+        const file_sub_path = try std.fmt.allocPrint(allocator, "{s}/item.zig", .{dir_name});
+        defer allocator.free(file_sub_path);
+        try temp_dir.writeFile(file_sub_path, "pub const marker: u8 = 0;\n");
+    }
+
+    var first_party_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const first_party_item = try std.fmt.bufPrint(&first_party_buffer, "{s}/.firstparty/item.zig", .{temp_dir.path()});
+    var src_item_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const src_item = try std.fmt.bufPrint(&src_item_buffer, "{s}/src/item.zig", .{temp_dir.path()});
+
+    // Walking the root keeps the first-party sources, hidden one included, and
+    // leaves out every documented directory name.
+    {
+        const paths = [_][]const u8{temp_dir.path()};
+        const files = try discoverFiles(io_context, allocator, &paths);
+        defer freeDiscoveredFiles(allocator, files);
+
+        const expected = [_][]const u8{ first_party_item, src_item };
+        try expectDiscovered(files, &expected);
+    }
+
+    // An ordinary directory selection is unaffected by the skip list.
+    {
+        var src_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const src_dir = try std.fmt.bufPrint(&src_dir_buffer, "{s}/src", .{temp_dir.path()});
+        const paths = [_][]const u8{src_dir};
+        const files = try discoverFiles(io_context, allocator, &paths);
+        defer freeDiscoveredFiles(allocator, files);
+
+        const expected = [_][]const u8{src_item};
+        try expectDiscovered(files, &expected);
+    }
+
+    // The skip list only filters children of a recursive walk: a skipped
+    // directory named directly is walked, and a file inside one is taken as
+    // given.
+    for (documented_ignored_dirs) |dir_name| {
+        var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_path = try std.fmt.bufPrint(&dir_path_buffer, "{s}/{s}", .{ temp_dir.path(), dir_name });
+        var item_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const item_path = try std.fmt.bufPrint(&item_path_buffer, "{s}/item.zig", .{dir_path});
+
+        {
+            const paths = [_][]const u8{dir_path};
+            const files = try discoverFiles(io_context, allocator, &paths);
+            defer freeDiscoveredFiles(allocator, files);
+
+            const expected = [_][]const u8{item_path};
+            try expectDiscovered(files, &expected);
+        }
+        {
+            const paths = [_][]const u8{item_path};
+            const files = try discoverFiles(io_context, allocator, &paths);
+            defer freeDiscoveredFiles(allocator, files);
+
+            const expected = [_][]const u8{item_path};
+            try expectDiscovered(files, &expected);
+        }
+    }
+}
+
 test "isZigFile" {
     try std.testing.expect(isZigFile("main.zig"));
     try std.testing.expect(isZigFile("path/to/file.zig"));
     try std.testing.expect(!isZigFile("main.c"));
     try std.testing.expect(!isZigFile("main.zig.bak"));
     try std.testing.expect(!isZigFile(""));
-}
-
-test "shouldIgnoreDir" {
-    try std.testing.expect(shouldIgnoreDir("zig-cache"));
-    try std.testing.expect(shouldIgnoreDir("zig-out"));
-    try std.testing.expect(shouldIgnoreDir(".zigmod"));
-    try std.testing.expect(shouldIgnoreDir(".gyro"));
-    try std.testing.expect(!shouldIgnoreDir("src"));
-    try std.testing.expect(!shouldIgnoreDir("zig-cache-extra"));
-    try std.testing.expect(!shouldIgnoreDir("notzig-cache"));
 }
 
 test "discoverFiles: explicit files" {

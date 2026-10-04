@@ -3,7 +3,6 @@ const Rule = @import("../rule.zig").Rule;
 const RuleError = @import("../rule.zig").RuleError;
 const Diagnostic = @import("../rule.zig").Diagnostic;
 const Source = @import("../source.zig").Source;
-const log = std.log.scoped(.dupe_import);
 
 /// Rule that detects duplicate @import statements in Zig code.
 /// Duplicate imports can indicate copy-paste errors or redundant code.
@@ -65,10 +64,7 @@ pub const DupeImportRule = struct {
                     const import_path = getStringLiteralContent(content, string_start);
 
                     // Build full import key including field access chain
-                    const full_key = buildImportKey(allocator, tree, token_tags, r_paren_idx, import_path) catch |err| {
-                        log.debug("failed to build import key for '{s}': {}", .{ import_path, err });
-                        continue;
-                    };
+                    const full_key = try buildImportKey(allocator, tree, token_tags, r_paren_idx, import_path);
                     const key_is_allocated = full_key.ptr != import_path.ptr;
 
                     if (seen_imports.get(full_key)) |_| {
@@ -79,7 +75,7 @@ pub const DupeImportRule = struct {
 
                         const range = try src.byteRangeToSourceRange(start, start + builtin_name.len);
 
-                        const diag = try Diagnostic.init(
+                        var diag = try Diagnostic.init(
                             allocator,
                             src.getFilePath(),
                             "dupe-import",
@@ -87,11 +83,15 @@ pub const DupeImportRule = struct {
                             "Duplicate import detected. This module has already been imported earlier in the file.",
                             range,
                         );
+                        errdefer diag.deinit(allocator);
                         try diagnostics.append(allocator, diag);
                     } else {
                         // New import - store it
                         if (key_is_allocated) {
-                            try allocated_keys.append(allocator, full_key);
+                            allocated_keys.append(allocator, full_key) catch |err| {
+                                allocator.free(full_key);
+                                return err;
+                            };
                         }
                         try seen_imports.put(full_key, .{
                             .byte_offset = start,
@@ -215,3 +215,27 @@ pub const DupeImportRule = struct {
         return content[content_start..end];
     }
 };
+
+test "dupe-import releases keys and diagnostic messages on every allocation failure" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var source = Source.init(allocator, "oom.zig",
+                \\const first = @import("direct.zig");
+                \\const second = @import("direct.zig");
+                \\const field = @import("fields.zig").item;
+                \\const duplicate_field = @import("fields.zig").item;
+            );
+            defer source.deinit();
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+                diagnostics.deinit(allocator);
+            }
+            try DupeImportRule.rule.check(&source, allocator, &diagnostics);
+            try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+            try std.testing.expectEqual(@as(usize, 2), diagnostics.items[0].range.start.line);
+            try std.testing.expectEqual(@as(usize, 4), diagnostics.items[1].range.start.line);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast_walk = @import("ast_walk.zig");
+const LexicalIndex = @import("analysis/lexical_index.zig").LexicalIndex;
 
 const AssertionKind = enum {
     boolean,
@@ -10,7 +11,24 @@ pub const AssertionScope = struct {
     std_aliases: std.ArrayList([]const u8),
     testing_aliases: std.ArrayList([]const u8),
     debug_aliases: std.ArrayList([]const u8),
+
+    /// Names bound to the real `std.debug.assert` function. A file that
+    /// writes `const assert = std.debug.assert;` calls that function through
+    /// an ordinary identifier, so the spelling of the callee no longer names
+    /// the namespace it came from. These aliases are recorded together with
+    /// the declaration they name, so a later local that shadows the alias,
+    /// a rebound variable, or a same-named user function keeps the spelling
+    /// without the assertion's effect.
+    debug_assert_aliases: std.ArrayList(DebugAssertAlias),
     allow_bare: bool,
+
+    pub const DebugAssertAlias = struct {
+        /// The alias's own name.
+        name: []const u8,
+        /// The var decl that binds the name. A reference matches an alias
+        /// only when it resolves to this very declaration, never by spelling.
+        declaration_node: u32,
+    };
 
     pub fn init(allocator: std.mem.Allocator) AssertionScope {
         _ = allocator;
@@ -18,6 +36,7 @@ pub const AssertionScope = struct {
             .std_aliases = .empty,
             .testing_aliases = .empty,
             .debug_aliases = .empty,
+            .debug_assert_aliases = .empty,
             .allow_bare = false,
         };
     }
@@ -26,6 +45,7 @@ pub const AssertionScope = struct {
         self.std_aliases.deinit(allocator);
         self.testing_aliases.deinit(allocator);
         self.debug_aliases.deinit(allocator);
+        self.debug_assert_aliases.deinit(allocator);
     }
 
     fn hasStdAlias(self: *const AssertionScope, name: []const u8) bool {
@@ -62,6 +82,39 @@ pub const AssertionScope = struct {
     fn addDebugAlias(self: *AssertionScope, allocator: std.mem.Allocator, name: []const u8) !void {
         if (self.hasDebugAlias(name)) return;
         try self.debug_aliases.append(allocator, name);
+    }
+
+    fn debugAssertAliasNames(self: *const AssertionScope, name: []const u8) bool {
+        for (self.debug_assert_aliases.items) |alias| {
+            if (std.mem.eql(u8, alias.name, name)) return true;
+        }
+        return false;
+    }
+
+    /// Does this reference name one of the recorded `std.debug.assert`
+    /// aliases? The declaration is compared by identity, so a local that
+    /// shadows the alias resolves to a different node and does not match.
+    fn referencesDebugAssertAlias(
+        self: *const AssertionScope,
+        declaration_node: u32,
+        name: []const u8,
+    ) bool {
+        if (!self.debugAssertAliasNames(name)) return false;
+        for (self.debug_assert_aliases.items) |alias| {
+            if (alias.declaration_node == declaration_node) return true;
+        }
+        return false;
+    }
+
+    fn addDebugAssertAlias(
+        self: *AssertionScope,
+        allocator: std.mem.Allocator,
+        alias: DebugAssertAlias,
+    ) !void {
+        for (self.debug_assert_aliases.items) |existing| {
+            if (existing.declaration_node == alias.declaration_node) return;
+        }
+        try self.debug_assert_aliases.append(allocator, alias);
     }
 };
 
@@ -148,16 +201,40 @@ pub fn resolveAssertionName(
     return null;
 }
 
+/// The name of the assertion whose call proves a null check, or null when the
+/// callee is not one. A `std.debug.assert` alias is accepted only when the
+/// callee resolves to the very declaration the alias registered, so a
+/// shadowing local, a rebound variable, and a same-named user function all
+/// keep the spelling without the effect.
 pub fn resolveDebugAssertionName(
     tree: *const std.zig.Ast,
     fn_expr: std.zig.Ast.Node.Index,
     scope: *const AssertionScope,
+    lexical: ?*const LexicalIndex,
 ) ?[]const u8 {
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
     const fn_node = @intFromEnum(fn_expr);
 
     if (fn_node >= tags.len) return null;
+
+    if (tags[fn_node] == .identifier) {
+        const index = lexical orelse return null;
+        const token = tree.nodes.items(.main_token)[fn_node];
+        if (token >= tree.tokens.len or tree.tokenTag(token) != .identifier) return null;
+        const binding = index.findBinding(tree.tokenSlice(token), token) orelse return null;
+        const declaration = binding.node;
+        if (declaration >= tags.len) return null;
+        if (!isVarDeclTag(tags[declaration])) return null;
+
+        const full = tree.fullVarDecl(@enumFromInt(declaration)) orelse return null;
+        const name_token = full.ast.mut_token + 1;
+        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) return null;
+        const name = tree.tokenSlice(name_token);
+        if (!scope.referencesDebugAssertAlias(declaration, name)) return null;
+        return name;
+    }
+
     if (tags[fn_node] != .field_access) return null;
 
     const field_data = datas[fn_node].node_and_token;
@@ -214,15 +291,46 @@ fn addAliasFromVarDecl(
     if (name_token >= token_tags.len or token_tags[name_token] != .identifier) return;
 
     const name = tree.tokenSlice(name_token);
-    if (full.ast.init_node.unwrap()) |init| {
-        if (resolveAliasKind(tree, @intFromEnum(init), scope)) |kind| {
-            switch (kind) {
-                .std => try scope.addStdAlias(allocator, name),
-                .testing => try scope.addTestingAlias(allocator, name),
-                .debug => try scope.addDebugAlias(allocator, name),
-            }
+    const init = full.ast.init_node.unwrap() orelse return;
+    const init_node = @intFromEnum(init);
+    if (resolveAliasKind(tree, init_node, scope)) |kind| {
+        switch (kind) {
+            .std => try scope.addStdAlias(allocator, name),
+            .testing => try scope.addTestingAlias(allocator, name),
+            .debug => try scope.addDebugAlias(allocator, name),
         }
+        return;
     }
+    // `const assert = std.debug.assert;` binds the assertion function, not
+    // the namespace that holds it, so it is recorded by the declaration it
+    // names rather than as a namespace alias. Only a `const` binding keeps
+    // that identity: a `var` may be rebound to another function before the
+    // call, so its spelling then proves nothing.
+    if (tree.tokenTag(full.ast.mut_token) != .keyword_const) return;
+    if (resolvesToDebugAssert(tree, init_node, scope)) {
+        try scope.addDebugAssertAlias(allocator, .{
+            .name = name,
+            .declaration_node = var_decl_node,
+        });
+    }
+}
+
+/// Does this initializer name the real `std.debug.assert` function? Only the
+/// direct `std.debug.assert` access and a namespace alias of `std.debug`
+/// count; an alias of a user `debug` namespace has no such identity.
+fn resolvesToDebugAssert(
+    tree: *const std.zig.Ast,
+    init_node: u32,
+    scope: *const AssertionScope,
+) bool {
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    if (init_node >= tags.len) return false;
+    if (tags[init_node] != .field_access) return false;
+
+    const field_data = datas[init_node].node_and_token;
+    if (!std.mem.eql(u8, tree.tokenSlice(field_data[1]), "assert")) return false;
+    return isDebugNamespace(tree, @intFromEnum(field_data[0]), scope);
 }
 
 fn resolveAliasKind(tree: *const std.zig.Ast, expr_node: u32, scope: *const AssertionScope) ?AliasKind {

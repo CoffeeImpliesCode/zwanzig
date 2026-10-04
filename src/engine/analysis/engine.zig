@@ -66,9 +66,6 @@ pub const AnalysisEngine = struct {
     /// Stores pointers to heap-allocated CFGs for stable addresses that survive
     /// hashmap rehashing.
     function_cfgs: std.AutoHashMap(AstNodeId, FunctionCfgEntry),
-    /// Owned predecessor counts, saturated at two, for immutable root and inline CFGs.
-    /// CFG pointers remain valid until engine teardown.
-    predecessor_counts: std.AutoHashMap(*const Cfg, []const u8),
     /// Map from function name to AST node index
     function_names: std.StringHashMap(AstNodeId),
     /// Cache of scope-aware variable resolvers per function
@@ -138,7 +135,6 @@ pub const AnalysisEngine = struct {
             .max_worklist_steps = default_max_worklist_steps,
             .source = null,
             .function_cfgs = std.AutoHashMap(AstNodeId, FunctionCfgEntry).init(allocator),
-            .predecessor_counts = std.AutoHashMap(*const Cfg, []const u8).init(allocator),
             .function_names = std.StringHashMap(AstNodeId).init(allocator),
             .var_resolvers = std.AutoHashMap(AstNodeId, *VarResolver).init(allocator),
             .assertion_scopes = std.AutoHashMap(AstNodeId, assertions.AssertionScope).init(allocator),
@@ -167,11 +163,6 @@ pub const AnalysisEngine = struct {
     pub fn deinit(self: *AnalysisEngine) void {
         self.graph.deinit();
         self.worklist.deinit(self.allocator);
-        var counts_iter = self.predecessor_counts.valueIterator();
-        while (counts_iter.next()) |counts| {
-            self.allocator.free(counts.*);
-        }
-        self.predecessor_counts.deinit();
         // Deinit and free all cached CFGs
         var iter = self.function_cfgs.valueIterator();
         while (iter.next()) |entry| {
@@ -560,10 +551,6 @@ pub const AnalysisEngine = struct {
                     break :blk 0;
                 } else 0;
 
-                const predecessor_counts: []const u8 = if (self.use_widening)
-                    try self.getPredecessorCounts(current_cfg)
-                else
-                    &.{};
                 for (current_cfg.edges.items) |edge| {
                     if (edge.from == point.node_index) {
                         const succ_point = ProgramPoint.initPre(edge.to, current_cfg);
@@ -622,27 +609,28 @@ pub const AnalysisEngine = struct {
                         if (path_pruned) continue;
 
                         // Determine if widening should be applied at this point.
-                        // Widening triggers on loop-back edges into loop headers and on other join points
-                        // when widening is enabled.
+                        // Widening forces convergence, so it belongs on the loop
+                        // header pre-state reached by a back edge - the only point
+                        // a state can be replaced after it was processed. Every
+                        // other join, including one that sits in front of a loop,
+                        // is entered a bounded number of times and keeps one node
+                        // per distinct state. Widening those destroyed exactly the
+                        // facts the checkers read there: a held resource became
+                        // `unknown` and was never reported as a leak, and two
+                        // concrete integer paths collapsed into a single `unknown`
+                        // that no longer showed a possible zero divisor. The
+                        // per-point state cap remains the bound for those joins.
                         const widening_options = blk: {
-                            if (self.use_widening) {
-                                const is_loop_header = blk_loop: {
-                                    if (edge.kind != .loop_back) break :blk_loop false;
-                                    if (current_cfg.getNode(edge.to)) |succ_cfg_node| {
-                                        break :blk_loop succ_cfg_node.ir_node.tag == .loop_header;
+                            if (self.use_widening and edge.kind == .loop_back) {
+                                if (current_cfg.getNode(edge.to)) |succ_cfg_node| {
+                                    if (succ_cfg_node.ir_node.tag == .loop_header) {
+                                        // succ_point is already a pre-state (from ProgramPoint.initPre above)
+                                        const widening_key = WideningKey.init(succ_point, &succ_state);
+                                        break :blk ExplodedGraph.WideningOptions{
+                                            .apply_widening = true,
+                                            .widening_key = widening_key,
+                                        };
                                     }
-                                    break :blk_loop false;
-                                };
-                                const successor = ids.cfgIndex(edge.to);
-                                const is_join = successor < predecessor_counts.len and predecessor_counts[successor] > 1;
-
-                                if (is_loop_header or is_join) {
-                                    // succ_point is already a pre-state (from ProgramPoint.initPre above)
-                                    const widening_key = WideningKey.init(succ_point, &succ_state);
-                                    break :blk ExplodedGraph.WideningOptions{
-                                        .apply_widening = true,
-                                        .widening_key = widening_key,
-                                    };
                                 }
                             }
                             break :blk ExplodedGraph.WideningOptions{};
@@ -848,22 +836,6 @@ pub const AnalysisEngine = struct {
         try self.graph.addEdge(exploded_node_index, result.index);
     }
 
-    fn getPredecessorCounts(self: *AnalysisEngine, cfg: *const Cfg) std.mem.Allocator.Error![]const u8 {
-        if (self.predecessor_counts.get(cfg)) |counts| return counts;
-
-        const counts = try self.allocator.alloc(u8, cfg.nodeCount());
-        errdefer self.allocator.free(counts);
-        @memset(counts, 0);
-        for (cfg.edges.items) |edge| {
-            const target = ids.cfgIndex(edge.to);
-            if (target < counts.len and counts[target] < 2) {
-                counts[target] += 1;
-            }
-        }
-        try self.predecessor_counts.put(cfg, counts);
-        return counts;
-    }
-
     /// Transfer function: compute the new state after executing a CFG node.
     /// Evaluates literals and assignments, updating the environment.
     /// For call nodes that couldn't be inlined, treats them as having unknown effects.
@@ -944,7 +916,15 @@ pub const AnalysisEngine = struct {
                         }
                     } else if (ir_node.operand2_node) |rhs_node| {
                         try Ownership.checkUseAfterFreeInExpr(self, &new_state, rhs_node, current_cfg);
-                        try Ownership.markEscapedInExpr(self, &new_state, rhs_node, current_cfg);
+                        // `aggregate[index] = payload` moves the payload's
+                        // contents into the aggregate; it does not make the
+                        // payload escape. The aggregate store settles that,
+                        // so escaping here first would discard the store's
+                        // proof and hide every leak it exists to report.
+                        const store_settles_payload = try Ownership.recordOwnershipFromAggregateStore(self, &new_state, lhs_node, rhs_node, current_cfg);
+                        if (!store_settles_payload) {
+                            try Ownership.markEscapedInExpr(self, &new_state, rhs_node, current_cfg);
+                        }
                         try Ownership.recordOwnershipFromFieldAssign(self, &new_state, lhs_node, rhs_node, current_cfg);
                         if (ResourceCalls.resolveResourceCall(self, rhs_node)) |call_info| {
                             switch (call_info.kind) {
@@ -1154,6 +1134,20 @@ pub const AnalysisEngine = struct {
 
         switch (tags[expr_node]) {
             .error_value => return true,
+            // `ErrorName.Member` is an error value whenever `ErrorName` names
+            // an error set. Reading a named error as an ordinary value left
+            // the path out of the error state, so the `errdefer` releases
+            // that belong to it never ran and everything still live on that
+            // path was reported as leaked.
+            .field_access => {
+                const datas = tree.nodes.items(.data);
+                const main_tokens = tree.nodes.items(.main_token);
+                const owner: u32 = @intFromEnum(datas[expr_node].node_and_token[0]);
+                if (owner >= tags.len or tags[owner] != .identifier) return false;
+                const owner_token = main_tokens[owner];
+                if (owner_token >= tree.tokens.len or tree.tokenTag(owner_token) != .identifier) return false;
+                return isErrorSetDeclNamed(tree, tree.tokenSlice(owner_token));
+            },
             .@"switch", .switch_comma => {
                 const full_switch = tree.switchFull(@enumFromInt(expr_node));
                 if (full_switch.ast.cases.len == 0) return false;
@@ -1175,6 +1169,34 @@ pub const AnalysisEngine = struct {
             },
             else => return false,
         }
+    }
+
+    /// True when a root declaration named `name` is an error set, either
+    /// declared directly or through a `const` binding. Anything this cannot
+    /// pin down - a local shadow, an unknown name, an enum or union of the
+    /// same name - is not treated as an error, so the path stays an ordinary
+    /// one.
+    fn isErrorSetDeclNamed(tree: *const std.zig.Ast, name: []const u8) bool {
+        const tags = tree.nodes.items(.tag);
+        const token_tags = tree.tokens.items(.tag);
+
+        for (tree.rootDecls()) |decl_node| {
+            const decl: u32 = @intFromEnum(decl_node);
+            if (decl >= tags.len) continue;
+            switch (tags[decl]) {
+                .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
+                    const full = tree.fullVarDecl(@enumFromInt(decl)) orelse continue;
+                    if (tree.tokenTag(full.ast.mut_token) != .keyword_const) continue;
+                    const init_node = full.ast.init_node.unwrap() orelse continue;
+                    if (tags[@intFromEnum(init_node)] != .error_set_decl) continue;
+                    const token = full.ast.mut_token + 1;
+                    if (token >= token_tags.len or token_tags[token] != .identifier) continue;
+                    if (std.mem.eql(u8, tree.tokenSlice(token), name)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn declErrorUnionInfo(tree: *const std.zig.Ast, decl_node: u32) DeclErrorUnionInfo {
@@ -1629,11 +1651,13 @@ test "AnalysisEngine transfer survives graph relocation and allocation failure" 
     var relocating = std.testing.FailingAllocator.init(std.testing.allocator, .{
         .resize_fail_index = 0,
     });
-    try testTraversalAllocationFailure(relocating.allocator(), true);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testTraversalAllocationFailure, .{false});
+    // Every resize/remap fails, so node-array growth allocates before freeing
+    // its old storage. Later allocations may reuse an earlier address.
+    try testTraversalAllocationFailure(relocating.allocator());
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testTraversalAllocationFailure, .{});
 }
 
-fn testTraversalAllocationFailure(allocator: std.mem.Allocator, expect_relocation: bool) !void {
+fn testTraversalAllocationFailure(allocator: std.mem.Allocator) !void {
     var cfg = Cfg.init(std.testing.allocator);
     defer cfg.deinit();
     const entry = try cfg.addNode(cfg_mod.IrNode.initWithAst(.var_decl, 100));
@@ -1664,11 +1688,7 @@ fn testTraversalAllocationFailure(allocator: std.mem.Allocator, expect_relocatio
         .pending_constraint = null,
         .cfg = &cfg,
     });
-    const nodes_address = @intFromPtr(engine.graph.nodes.items.ptr);
     try engine.run();
-    if (expect_relocation) {
-        try std.testing.expect(nodes_address != @intFromPtr(engine.graph.nodes.items.ptr));
-    }
 
     const original = engine.getStateAt(seeded.index) orelse return error.TestUnexpectedResult;
     const original_value = original.getVar(ids.varId(99)) orelse return error.TestUnexpectedResult;
@@ -1694,41 +1714,6 @@ fn testTraversalAllocationFailure(allocator: std.mem.Allocator, expect_relocatio
     try std.testing.expect(found_right);
 }
 
-test "AnalysisEngine predecessor cache owns root and inline CFG counts on allocation failure" {
-    var source = Source.init(std.testing.allocator, "cache-oom.zig", "fn callee() void {}");
-    defer source.deinit();
-    const tree = try source.ast();
-    const fn_node = for (tree.nodes.items(.tag), 0..) |tag, index| {
-        if (tag == .fn_decl) break ids.astId(@intCast(index));
-    } else return error.TestUnexpectedResult;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPredecessorCacheAllocationFailure, .{ &source, fn_node });
-}
-
-fn testPredecessorCacheAllocationFailure(allocator: std.mem.Allocator, source: *Source, fn_node: AstNodeId) !void {
-    var cfg = Cfg.init(std.testing.allocator);
-    defer cfg.deinit();
-    const entry = try cfg.addNode(cfg_mod.IrNode.init(.fn_entry));
-    const other = try cfg.addNode(cfg_mod.IrNode.init(.nop));
-    const exit = try cfg.addNode(cfg_mod.IrNode.init(.fn_exit));
-    cfg.entry = entry;
-    cfg.exit = exit;
-    try cfg.addEdge(entry, exit);
-    try cfg.addEdge(other, exit);
-
-    var engine = AnalysisEngine.initWithSource(allocator, &cfg, source);
-    defer engine.deinit();
-    const root_counts = try engine.getPredecessorCounts(&cfg);
-    const callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
-    const callee_counts = try engine.getPredecessorCounts(callee);
-    try std.testing.expectEqual(@as(u8, 2), root_counts[ids.cfgIndex(exit)]);
-    try std.testing.expectEqual(@as(u8, 1), callee_counts[ids.cfgIndex(callee.exit)]);
-    try std.testing.expectEqual(@as(u8, 0), callee_counts[ids.cfgIndex(callee.entry)]);
-    const cached_root = try engine.getPredecessorCounts(&cfg);
-    try std.testing.expectEqualSlices(u8, root_counts, cached_root);
-    const cached_callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(cached_callee == callee);
-}
-
 test "AnalysisEngine cached CFGs outlive the engine allocator" {
     var source = Source.init(std.testing.allocator, "artifact-allocator.zig", "fn callee() void {}");
     defer source.deinit();
@@ -1750,9 +1735,14 @@ fn testCachedCfgAllocatorOwnership(allocator: std.mem.Allocator, source: *Source
         var engine = AnalysisEngine.initWithSource(scratch.allocator(), &root, source);
         defer engine.deinit();
         engine.setCachedArtifacts(&artifacts);
-        const callee = (try engine.getOrBuildFunctionCfg(fn_node)) orelse return error.TestUnexpectedResult;
-        const counts = try engine.getPredecessorCounts(callee);
-        try std.testing.expectEqual(@as(u8, 1), counts[ids.cfgIndex(callee.exit)]);
+        // The CFG is built and published to the artifact cache while the engine's
+        // allocator is the scratch buffer, so the cached copy has to stay valid
+        // once that allocator is gone.
+        if (try engine.getOrBuildFunctionCfg(fn_node)) |callee| {
+            try std.testing.expectEqual(cfg_mod.IrTag.fn_exit, callee.getNode(callee.exit).?.ir_node.tag);
+        } else {
+            return error.TestUnexpectedResult;
+        }
     }
     const cached = artifacts.getCfg(ids.astIndex(fn_node)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("callee", cached.fn_name.?);
@@ -2816,5 +2806,69 @@ test "AnalysisEngine widening regression test with real loop code" {
 
         // Analysis should complete successfully - widening prevents state explosion
         try testing.expect(graph.nodeCount() > 0);
+    }
+}
+
+test "AnalysisEngine widening leaves a loop-free join precise" {
+    // The branch join below is entered once per arm and can never be revisited,
+    // so widening it merged both arms into one state whose resource was
+    // `unknown` and the leak recorded at the function exit was lost. The loop in
+    // front of it is the part that genuinely has to converge, and it still does:
+    // its header is the widening point. The loop has to come first, because a
+    // loop downstream of the join would merge the arms again at its own header
+    // and hide the difference this test is about.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn leaky(allocator: std.mem.Allocator, flag: bool) !void {
+        \\    var i: usize = 0;
+        \\    while (i < 4) : (i += 1) {
+        \\        i += 1;
+        \\    }
+        \\    var ptr = try allocator.alloc(u8, 1);
+        \\    if (flag) {
+        \\        allocator.free(ptr);
+        \\    }
+        \\    std.mem.doNotOptimizeAway(ptr.ptr[0..0]);
+        \\}
+    ;
+
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    const tree = source.ast() catch return;
+    var fn_node: ?AstNodeId = null;
+    for (tree.nodes.items(.tag), 0..) |tag, i| {
+        if (tag == .fn_decl) {
+            fn_node = ids.astId(@intCast(i));
+            break;
+        }
+    }
+    const fn_idx = fn_node orelse return;
+
+    var builder = CfgBuilder.init(allocator);
+    var cfg_opt = builder.buildFromFn(&source, fn_idx) catch return;
+
+    if (cfg_opt) |*cfg| {
+        defer cfg.deinit();
+
+        var engine = AnalysisEngine.initWithSource(allocator, cfg, &source);
+        defer engine.deinit();
+        engine.setUseWidening(true);
+
+        // Convergence control: the loop mutates its own induction variable, so a
+        // run that stops here means the loop header stopped being a widening point.
+        try engine.run();
+        try testing.expect(engine.getGraph().getTrackedWideningPointCount() >= 1);
+
+        var leak_reported = false;
+        for (engine.getGraph().nodes.items) |node| {
+            for (node.state.getStoreViolations()) |violation| {
+                if (violation.kind == .resource_leak) leak_reported = true;
+            }
+        }
+        try testing.expect(leak_reported);
     }
 }

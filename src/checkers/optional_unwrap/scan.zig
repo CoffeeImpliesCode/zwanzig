@@ -7,6 +7,7 @@ const CheckerError = checker_mod.CheckerError;
 const Source = @import("../../source.zig").Source;
 const ids = @import("../../ids.zig");
 const guards = @import("guards.zig");
+const constructor_facts = @import("constructor_facts.zig");
 const diagnostics = @import("diagnostics.zig");
 const engine_mod = @import("../../engine.zig");
 const AnalysisEngine = engine_mod.AnalysisEngine;
@@ -106,21 +107,57 @@ pub fn scanForUnsafeUnwraps(
         // proves a positive `items.len` proves `std.ArrayList.pop`'s payload.
         if (guards.isGuardedByContainerLength(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
+        // A field a constructor stores only under a `comptime` `bool`
+        // parameter is non-null where that parameter holds the guarded value.
+        if (constructor_facts.isProvenByConditionalConstruction(
+            &query,
+            ast_node,
+            unwrapped_node,
+            type_context,
+            &assertion_scope,
+        )) continue;
+
+        const message = if (isInsideForBody(tree, ast_node, parent_map))
+            "forced optional unwrap can panic at runtime; non-null proofs from a separate validation loop are not tracked, so check for null in this loop"
+        else
+            "forced optional unwrap can panic at runtime";
+
         // Find the CFG node containing this AST node
         const cfg_node_idx = findCfgNodeForAst(cfg, ast_node, tree);
         const node_idx = cfg_node_idx orelse {
             // AST node not in CFG (possibly unreachable code) - report conservatively
-            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts);
+            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message);
             try reported.put(ast_node, {});
             continue;
         };
 
         // Check if the variable is proven non-null at this point
         if (!isProvenNonNull(engine, node_idx, unwrapped_node, cfg, tree)) {
-            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts);
+            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message);
             try reported.put(ast_node, {});
         }
     }
+}
+
+/// This is diagnostic context, not a proof: a prior pass cannot exempt an
+/// unwrap, and a write inside the consuming loop must still be reported.
+fn isInsideForBody(tree: *const std.zig.Ast, unwrap_node: u32, parent_map: []const u32) bool {
+    const tags = tree.nodes.items(.tag);
+    var node = unwrap_node;
+    while (node < parent_map.len) {
+        const parent = parent_map[node];
+        if (parent == 0 or parent >= tags.len) return false;
+        switch (tags[parent]) {
+            .@"for", .for_simple => {
+                const loop = tree.fullFor(@enumFromInt(parent)) orelse return false;
+                if (@intFromEnum(loop.ast.then_expr) == node) return true;
+            },
+            .fn_decl => return false,
+            else => {},
+        }
+        node = parent;
+    }
+    return false;
 }
 
 fn collectUnwrapsInSubtree(

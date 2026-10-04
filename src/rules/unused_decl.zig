@@ -730,6 +730,11 @@ pub const UnusedDeclRule = struct {
             return resolver.files[owner.file_index].tree == self.tree and owner.container_node == self.owner_container;
         }
 
+        /// A reflection call only reaches the private members of its owner
+        /// container when the callee receiver is the real `std.testing`
+        /// namespace and the argument names that owner. A same-named user
+        /// declaration or a shadowed alias keeps the spelling without the
+        /// reflection effect.
         fn callReflectsOwner(self: *UsageScanner, node: u32) bool {
             if (!self.inside_owner_container) return false;
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
@@ -743,6 +748,11 @@ pub const UnusedDeclRule = struct {
             if (call.ast.params.len != 1) return false;
             const target = @intFromEnum(call.ast.params[0]);
             if (target >= self.tags.len) return false;
+            if (!self.reflectionTargetsOwner(target)) return false;
+            return self.isStdTestingNamespace(@intFromEnum(access[0]));
+        }
+
+        fn reflectionTargetsOwner(self: *UsageScanner, target: u32) bool {
             if (self.tags[target] == .builtin_call or
                 self.tags[target] == .builtin_call_comma or
                 self.tags[target] == .builtin_call_two or
@@ -759,6 +769,22 @@ pub const UnusedDeclRule = struct {
                 }
             }
             return false;
+        }
+
+        /// Verified `std.testing` identity: `@import("std")` provenance resolved
+        /// through lexical bindings, so namespace aliases stay trusted while a
+        /// user declaration spelled like the namespace does not.
+        fn isStdTestingNamespace(self: *UsageScanner, node: u32) bool {
+            const local_files = [_]import_resolver.File{.{
+                .path = "",
+                .tree = self.tree,
+                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
+            }};
+            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
+                .files = &local_files,
+                .file_index = 0,
+            };
+            return resolver.isStdTestingNamespaceExpr(node);
         }
 
         fn scanChildren(self: *UsageScanner, node: u32) RuleError!bool {
@@ -825,6 +851,7 @@ pub const UnusedDeclRule = struct {
                     } else {
                         return true;
                     }
+                    if (try self.comptimeTypeParameterAccess(node, receiver_node, field_token)) return true;
                 }
             }
             return self.scanNode(receiver_node);
@@ -856,6 +883,197 @@ pub const UnusedDeclRule = struct {
             if (expected_type.container_node != null) return false;
             const actual_type = resolver.resolveExprType(receiver_node) orelse return false;
             return call_resolver.resolvedTypesEqual(actual_type, expected_type);
+        }
+
+        /// A `comptime T: type` parameter reads the members of whatever the
+        /// caller instantiates it with, so the receiver spelling alone names no
+        /// member. Resolve the arguments call sites hand to that parameter and
+        /// require one of them to be this owner container and to really declare
+        /// the member: passing a container reads none of its members, so the
+        /// type argument alone is not a use.
+        fn comptimeTypeParameterAccess(
+            self: *UsageScanner,
+            access_node: u32,
+            receiver_node: u32,
+            field_token: u32,
+        ) RuleError!bool {
+            const owner = self.owner_container orelse return false;
+            if (receiver_node >= self.tags.len or self.tags[receiver_node] != .identifier) return false;
+            const function = self.enclosingFnDecl(access_node) orelse return false;
+            const proto_node = functionProtoNodeOf(self.tree, function) orelse return false;
+
+            const local_files = [_]import_resolver.File{.{
+                .path = "",
+                .tree = self.tree,
+                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
+            }};
+            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
+                .files = &local_files,
+                .file_index = 0,
+            };
+
+            const parameter = comptimeTypeParameterSlot(self.tree, proto_node, resolver, receiver_node) orelse return false;
+            const function_name = functionProtoNameOf(self.tree, proto_node) orelse return false;
+            const declared_parameters = functionProtoParamCount(self.tree, proto_node) orelse return false;
+
+            for (self.tags, 0..) |tag, node| {
+                if (!call_resolver.isCallNode(tag)) continue;
+                const call_node: u32 = @intCast(node);
+                var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+                const call = self.tree.fullCall(&call_buffer, @enumFromInt(node)) orelse continue;
+                const callee = @intFromEnum(call.ast.fn_expr);
+                if (callee >= self.tags.len) continue;
+
+                const visible = self.calleeDeclaration(resolver, callee, function_name, call_node);
+                if (visible == null or visible.? != function) continue;
+
+                // A method call hands its receiver over implicitly.
+                const implicit_self: usize = if (call.ast.params.len == declared_parameters)
+                    0
+                else if (call.ast.params.len + 1 == declared_parameters)
+                    1
+                else
+                    continue;
+                if (parameter < implicit_self) continue;
+                const argument_index = parameter - implicit_self;
+                if (argument_index >= call.ast.params.len) continue;
+
+                const resolved = resolver.resolveTypeNode(@intFromEnum(call.ast.params[argument_index])) orelse continue;
+                if (resolved.file_index >= resolver.files.len) continue;
+                if (resolver.files[resolved.file_index].tree != self.tree) continue;
+                if (resolved.container_node == null or resolved.container_node.? != owner) continue;
+                if (!self.containerDeclaresMember(resolved, field_token)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        /// Nearest enclosing function of `node`. A container reached first means
+        /// the reference lives at container scope, where no function owns it.
+        fn enclosingFnDecl(self: *UsageScanner, node: u32) ?u32 {
+            var depth: usize = 0;
+            while (self.scopeAncestor(node, depth) != 0) : (depth += 1) {
+                const ancestor = self.scopeAncestor(node, depth);
+                if (self.tags[ancestor] == .fn_decl) return ancestor;
+            }
+            return null;
+        }
+
+        /// The function a call site names. The declaration's own scope must
+        /// enclose the call site and the innermost such scope wins, so a
+        /// same-named declaration nested in a container shadows the outer one
+        /// instead of standing in for it.
+        fn visibleFunction(self: *UsageScanner, call_node: u32, name: []const u8) ?u32 {
+            const call_token = self.main_tokens[call_node];
+            var best: ?u32 = null;
+            var best_depth: usize = 0;
+            for (self.tags, 0..) |tag, node| {
+                if (tag != .fn_decl) continue;
+                const declaration: u32 = @intCast(node);
+                const candidate = functionProtoNameOf(self.tree, @intFromEnum(self.datas[node].node_and_node[0])) orelse continue;
+                if (!std.mem.eql(u8, candidate, name)) continue;
+                if (self.tree.firstToken(@enumFromInt(node)) > call_token) continue;
+
+                const depth = self.enclosingScopeDepth(declaration, call_node) orelse continue;
+                if (best == null or depth < best_depth) {
+                    best = declaration;
+                    best_depth = depth;
+                }
+            }
+            return best;
+        }
+
+        /// Depth of the declaration's own scope within the call site's chain of
+        /// enclosing scopes, or null when that scope does not enclose the call
+        /// site. A file-level declaration encloses every call site and so
+        /// sorts last; a declaration inside a container reaches every call
+        /// site nested in that container, however deep.
+        fn enclosingScopeDepth(self: *UsageScanner, declaration: u32, call_node: u32) ?usize {
+            const scope = self.scopeAncestor(declaration, 0);
+            if (scope == 0) return std.math.maxInt(usize);
+            var depth: usize = 0;
+            while (self.scopeAncestor(call_node, depth) != 0) : (depth += 1) {
+                if (self.scopeAncestor(call_node, depth) == scope) return depth;
+            }
+            return null;
+        }
+
+        /// Declaration a call site names, whether the call reaches it by its own
+        /// name or through a namespace. Both forms answer with the declaration
+        /// node, so the caller compares identity rather than spelling.
+        fn calleeDeclaration(
+            self: *UsageScanner,
+            resolver: call_resolver.ProjectTypeResolver,
+            callee: u32,
+            name: []const u8,
+            call_node: u32,
+        ) ?u32 {
+            switch (self.tags[callee]) {
+                .identifier => {
+                    // A value binding spelled like the function is not the function.
+                    if (resolver.resolveDeclarationNode(callee) != null) return null;
+                    if (!self.tokenMatchesSlice(self.main_tokens[callee], name)) return null;
+                    return self.visibleFunction(call_node, name);
+                },
+                .field_access => {
+                    const access = self.datas[callee].node_and_token;
+                    if (access[1] >= self.token_tags.len) return null;
+                    if (!self.tokenMatchesSlice(access[1], name)) return null;
+                    const owner = resolver.resolveExprType(@intFromEnum(access[0])) orelse return null;
+                    if (owner.file_index >= resolver.files.len) return null;
+                    // A declaration in another file carries its own node index.
+                    if (resolver.files[owner.file_index].tree != self.tree) return null;
+                    return namespaceFunctionDeclaration(resolver, owner, name);
+                },
+                else => return null,
+            }
+        }
+
+        /// The `depth`-th enclosing function or container of `node`, counting
+        /// from the innermost. Zero means the node has no such ancestor left.
+        fn scopeAncestor(self: *UsageScanner, node: u32, depth: usize) u32 {
+            if (node >= self.parent_map.len) return 0;
+            var current = self.parent_map[node];
+            var index: usize = 0;
+            while (current != 0 and current < self.tags.len) : (current = self.parent_map[current]) {
+                if (!isScopeTag(self.tags[current])) continue;
+                if (index == depth) return current;
+                index += 1;
+            }
+            return 0;
+        }
+
+        /// The container must really carry the member under test. A type that
+        /// shares the name but declares no such member is a different
+        /// declaration and must not count as a use.
+        fn containerDeclaresMember(
+            self: *UsageScanner,
+            owner: call_resolver.ResolvedType,
+            field_token: u32,
+        ) bool {
+            const container = owner.container_node orelse return false;
+            if (field_token >= self.token_tags.len) return false;
+            const name = normalizeIdentifier(self.tree.tokenSlice(field_token));
+            const local_files = [_]import_resolver.File{.{
+                .path = "",
+                .tree = self.tree,
+                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
+            }};
+            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
+                .files = &local_files,
+                .file_index = 0,
+            };
+            if (owner.file_index >= resolver.files.len) return false;
+            const target_tree = resolver.files[owner.file_index].tree;
+            var buffer: [2]std.zig.Ast.Node.Index = undefined;
+            const full = target_tree.fullContainerDecl(&buffer, @enumFromInt(container)) orelse return false;
+            for (full.ast.members) |member| {
+                const member_full = target_tree.fullVarDecl(member) orelse continue;
+                const name_token = member_full.ast.mut_token + 1;
+                if (name_token >= target_tree.tokens.len or target_tree.tokenTag(name_token) != .identifier) continue;
+                if (std.mem.eql(u8, normalizeIdentifier(target_tree.tokenSlice(name_token)), name)) return true;
+            }
+            return false;
         }
 
         fn scanVarDecl(self: *UsageScanner, node: u32) RuleError!bool {
@@ -1348,6 +1566,150 @@ pub const UnusedDeclRule = struct {
             return false;
         }
     };
+
+    /// Nodes that introduce a scope: a function definition, or a container whose
+    /// members are reached through its own name.
+    fn isScopeTag(tag: std.zig.Ast.Node.Tag) bool {
+        return tag == .fn_decl or isContainerTag(tag);
+    }
+
+    fn functionProtoNodeOf(tree: *const std.zig.Ast, node: u32) ?u32 {
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len) return null;
+        return switch (tags[node]) {
+            .fn_decl => @intFromEnum(tree.nodes.items(.data)[node].node_and_node[0]),
+            .fn_proto,
+            .fn_proto_simple,
+            .fn_proto_one,
+            .fn_proto_multi,
+            => node,
+            else => null,
+        };
+    }
+
+    /// Declaration of the named function inside a resolved type namespace. Only
+    /// definitions count, because a prototype alone cannot be the callee of a
+    /// call in the same file.
+    fn namespaceFunctionDeclaration(
+        resolver: call_resolver.ProjectTypeResolver,
+        owner: call_resolver.ResolvedType,
+        name: []const u8,
+    ) ?u32 {
+        if (owner.file_index >= resolver.files.len) return null;
+        const tree = resolver.files[owner.file_index].tree;
+        const tags = tree.nodes.items(.tag);
+        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const declarations: []const std.zig.Ast.Node.Index = if (owner.container_node) |container|
+            (tree.fullContainerDecl(&buffer, @enumFromInt(container)) orelse return null).ast.members
+        else
+            tree.rootDecls();
+        for (declarations) |declaration| {
+            const node: u32 = @intFromEnum(declaration);
+            if (node >= tags.len or tags[node] != .fn_decl) continue;
+            const proto_node = @intFromEnum(tree.nodes.items(.data)[node].node_and_node[0]);
+            const candidate = functionProtoNameOf(tree, proto_node) orelse continue;
+            if (std.mem.eql(u8, candidate, name)) return node;
+        }
+        return null;
+    }
+
+    fn functionProtoNameOf(tree: *const std.zig.Ast, proto_node: u32) ?[]const u8 {
+        const tags = tree.nodes.items(.tag);
+        if (proto_node >= tags.len) return null;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const name_token = switch (tags[proto_node]) {
+            .fn_proto => tree.fnProto(@enumFromInt(proto_node)).name_token,
+            .fn_proto_simple => tree.fnProtoSimple(&buffer, @enumFromInt(proto_node)).name_token,
+            .fn_proto_one => tree.fnProtoOne(&buffer, @enumFromInt(proto_node)).name_token,
+            .fn_proto_multi => tree.fnProtoMulti(@enumFromInt(proto_node)).name_token,
+            else => null,
+        } orelse return null;
+        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) return null;
+        return normalizeIdentifier(tree.tokenSlice(name_token));
+    }
+
+    fn functionProtoParamCount(tree: *const std.zig.Ast, proto_node: u32) ?usize {
+        const tags = tree.nodes.items(.tag);
+        if (proto_node >= tags.len) return null;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const params = switch (tags[proto_node]) {
+            .fn_proto => tree.fnProto(@enumFromInt(proto_node)).ast.params,
+            .fn_proto_simple => tree.fnProtoSimple(&buffer, @enumFromInt(proto_node)).ast.params,
+            .fn_proto_one => tree.fnProtoOne(&buffer, @enumFromInt(proto_node)).ast.params,
+            .fn_proto_multi => tree.fnProtoMulti(@enumFromInt(proto_node)).ast.params,
+            else => return null,
+        };
+        return params.len;
+    }
+
+    /// Positional index of the `comptime T: type` parameter the receiver names,
+    /// or null when it names anything else. A named parameter is its own type
+    /// expression unless the frontend keeps a var decl for it, so both shapes
+    /// are read, and the reference must bind to that exact parameter.
+    fn comptimeTypeParameterSlot(
+        tree: *const std.zig.Ast,
+        proto_node: u32,
+        resolver: call_resolver.ProjectTypeResolver,
+        receiver_node: u32,
+    ) ?usize {
+        const tags = tree.nodes.items(.tag);
+        if (proto_node >= tags.len) return null;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const proto = switch (tags[proto_node]) {
+            .fn_proto => tree.fnProto(@enumFromInt(proto_node)),
+            .fn_proto_simple => tree.fnProtoSimple(&buffer, @enumFromInt(proto_node)),
+            .fn_proto_one => tree.fnProtoOne(&buffer, @enumFromInt(proto_node)),
+            .fn_proto_multi => tree.fnProtoMulti(@enumFromInt(proto_node)),
+            else => return null,
+        };
+        const binding = resolver.resolveDeclarationNode(receiver_node) orelse return null;
+
+        var iterator = proto.iterate(tree);
+        var slot: usize = 0;
+        while (iterator.next()) |param| {
+            // `anytype` and `...` take no positional slot in a call.
+            if (param.anytype_ellipsis3 != null) continue;
+            const index = slot;
+            slot += 1;
+            const param_node = param.type_expr orelse continue;
+            if (@intFromEnum(param_node) != binding) continue;
+            const type_node = comptimeTypeParameterTypeNode(tree, param_node) orelse return null;
+            if (!isTypeKeywordNode(tree, type_node)) return null;
+            if (!parameterIsComptime(tree, param)) return null;
+            return index;
+        }
+        return null;
+    }
+
+    fn comptimeTypeParameterTypeNode(tree: *const std.zig.Ast, param_node: std.zig.Ast.Node.Index) ?u32 {
+        const tags = tree.nodes.items(.tag);
+        const parameter: u32 = @intFromEnum(param_node);
+        if (parameter >= tags.len) return null;
+        if (!import_resolver.isVarDeclTag(tags[parameter])) return parameter;
+        const full = tree.fullVarDecl(param_node) orelse return null;
+        return @intFromEnum(full.ast.type_node.unwrap() orelse return null);
+    }
+
+    fn parameterIsComptime(tree: *const std.zig.Ast, param: std.zig.Ast.full.FnProto.Param) bool {
+        if (param.comptime_noalias) |token| {
+            if (token >= tree.tokens.len) return false;
+            return tree.tokenTag(token) == .keyword_comptime;
+        }
+        const type_expr = param.type_expr orelse return false;
+        const tags = tree.nodes.items(.tag);
+        if (@intFromEnum(type_expr) >= tags.len) return false;
+        if (!import_resolver.isVarDeclTag(tags[@intFromEnum(type_expr)])) return false;
+        const full = tree.fullVarDecl(type_expr) orelse return false;
+        return full.comptime_token != null;
+    }
+
+    fn isTypeKeywordNode(tree: *const std.zig.Ast, node: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node >= tags.len or tags[node] != .identifier) return false;
+        const token = tree.nodes.items(.main_token)[node];
+        if (token >= tree.tokens.len or tree.tokenTag(token) != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(token), "type");
+    }
 
     fn collectContainerNames(
         tree: *const std.zig.Ast,
@@ -1886,4 +2248,315 @@ test "anonymous struct namespace reference counts as used" {
     }
     try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "untrusted reflection spelling cannot hide a typed private method" {
+    const code: [:0]const u8 =
+        \\const std = struct {
+        \\    const testing = struct {
+        \\        pub fn refAllDecls(comptime T: type) void { _ = T; }
+        \\    };
+        \\};
+        \\pub const Holder = struct {
+        \\    fn genuinelyUnused() void {}
+        \\    pub fn reflect() void { std.testing.refAllDecls(@This()); }
+        \\};
+        \\pub fn main() void { Holder.reflect(); }
+    ;
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "untrusted-reflection.zig", code);
+    defer source.deinit();
+    _ = try source.requireZirBridge();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, "genuinelyUnused") != null);
+}
+
+fn expectUnusedDeclNames(code: [:0]const u8, expected_names: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "reflection-identity.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+    try std.testing.expectEqual(expected_names.len, diagnostics.items.len);
+    for (expected_names) |expected_name| {
+        var found = false;
+        for (diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, expected_name) != null) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+/// Exact set of unused declaration names, compared by name rather than by
+/// substring: two declarations can share a name, and only the name the rule
+/// actually reported says which one it found.
+fn expectUnusedDeclSet(code: [:0]const u8, expected_names: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "generic-parameter-ownership.zig", code);
+    defer source.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+
+    try UnusedDeclRule.rule.check(&source, allocator, &diagnostics);
+
+    var reported: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (reported.items) |name| allocator.free(name);
+        reported.deinit(allocator);
+    }
+    for (diagnostics.items) |diagnostic| {
+        try reported.append(allocator, try unusedDeclName(allocator, diagnostic.message));
+    }
+
+    var expected: std.ArrayList([]const u8) = .empty;
+    defer expected.deinit(allocator);
+    try expected.appendSlice(allocator, expected_names);
+    std.mem.sort([]const u8, expected.items, {}, nameLessThan);
+    std.mem.sort([]const u8, reported.items, {}, nameLessThan);
+
+    try std.testing.expectEqual(expected.items.len, reported.items.len);
+    for (expected.items, reported.items) |wanted, actual| {
+        try std.testing.expectEqualStrings(wanted, actual);
+    }
+}
+
+/// The declaration a diagnostic names, read back from the quoted name in
+/// `KIND 'name' is never used`.
+fn unusedDeclName(allocator: std.mem.Allocator, message: []const u8) ![]const u8 {
+    const start = std.mem.indexOfScalar(u8, message, '\'') orelse return error.MalformedUnusedDeclMessage;
+    const rest = message[start + 1 ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\'') orelse return error.MalformedUnusedDeclMessage;
+    return allocator.dupe(u8, rest[0..end]);
+}
+
+fn nameLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
+test "unverified reflection identities cannot hide typed private methods" {
+    const code: [:0]const u8 =
+        \\const std = struct {
+        \\    const testing = struct {
+        \\        pub fn refAllDecls(_: type) void {}
+        \\    };
+        \\};
+        \\const faked = struct {
+        \\    const testing = struct {
+        \\        pub fn refAllDecls(_: type) void {}
+        \\    };
+        \\};
+        \\pub const FakeNamespace = struct {
+        \\    fn hiddenByFakeStd() void {}
+        \\    pub fn reflect() void { std.testing.refAllDecls(@This()); }
+        \\};
+        \\pub const FakeModule = struct {
+        \\    fn hiddenByFakeModule() void {}
+        \\    pub fn reflect() void { faked.testing.refAllDeclsRecursive(@This()); }
+        \\};
+        \\pub const ShadowedAlias = struct {
+        \\    fn hiddenByShadowedAlias() void {}
+        \\    pub fn reflect() void {
+        \\        const testing = struct {
+        \\            pub fn refAllDecls(_: type) void {}
+        \\        };
+        \\        testing.refAllDecls(@This());
+        \\    }
+        \\};
+        \\pub const ParameterReceiver = struct {
+        \\    fn hiddenByParameterReceiver() void {}
+        \\    pub fn reflect(namespace: @This()) void {
+        \\        namespace.refAllDecls(@This());
+        \\    }
+        \\};
+    ;
+
+    try expectUnusedDeclNames(code, &.{
+        "hiddenByFakeStd",
+        "hiddenByFakeModule",
+        "hiddenByShadowedAlias",
+        "hiddenByParameterReceiver",
+    });
+}
+
+test "verified std.testing aliases keep reaching typed private methods" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const testing_namespace = std.testing;
+        \\const std_module = std;
+        \\pub const Reflected = struct {
+        \\    fn reachedByNamespaceAlias() void {}
+        \\    fn reachedByModuleAlias() void {}
+        \\    fn reachedByDirectImport() void {}
+        \\    test { comptime { testing_namespace.refAllDecls(@This()); } }
+        \\    test { comptime { std_module.testing.refAllDeclsRecursive(@This()); } }
+        \\    test { comptime { @import("std").testing.refAllDecls(@This()); } }
+        \\};
+    ;
+
+    try expectUnusedDeclNames(code, &.{});
+}
+
+test "mutable reflection namespace and module aliases have no initializer identity" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const FakeTesting = struct {
+        \\    pub fn refAllDecls(comptime T: type) void { _ = T; }
+        \\};
+        \\pub const NamespaceRebound = struct {
+        \\    fn hiddenByReboundNamespace() void {}
+        \\    test {
+        \\        comptime {
+        \\            var testing: type = std.testing;
+        \\            testing = FakeTesting;
+        \\            testing.refAllDecls(@This());
+        \\        }
+        \\    }
+        \\};
+        \\pub const ModuleRebound = struct {
+        \\    fn hiddenByReboundModule() void {}
+        \\    test {
+        \\        comptime {
+        \\            var module: type = std;
+        \\            module = struct { pub const testing = FakeTesting; };
+        \\            module.testing.refAllDecls(@This());
+        \\        }
+        \\    }
+        \\};
+    ;
+    try expectUnusedDeclNames(code, &.{ "hiddenByReboundNamespace", "hiddenByReboundModule" });
+}
+
+test "generic type parameters reach the members of the containers call sites pass" {
+    const code: [:0]const u8 =
+        \\const Resident = struct {
+        \\    const fixture = "resident";
+        \\};
+        \\const Stream = struct {
+        \\    const fixture = "stream";
+        \\};
+        \\const helpers = struct {
+        \\    fn expect(comptime Format: type) void {
+        \\        _ = Format.fixture;
+        \\    }
+        \\};
+        \\fn expectLifecycle(comptime Format: type, input: []const u8) void {
+        \\    _ = Format.fixture;
+        \\    _ = input;
+        \\}
+        \\test {
+        \\    expectLifecycle(Resident, "resident");
+        \\    helpers.expect(Stream);
+        \\}
+    ;
+    try expectUnusedDeclNames(code, &.{});
+}
+
+test "a generic type parameter reads only the member its body names" {
+    const code: [:0]const u8 =
+        \\const Passed = struct {
+        \\    const read_member = 1;
+        \\    const unread_member = 2;
+        \\};
+        \\const Unpassed = struct {
+        \\    const read_member = 3;
+        \\    const unpassed_member = 4;
+        \\};
+        \\fn expect(comptime Format: type) void {
+        \\    _ = Format.read_member;
+        \\}
+        \\test {
+        \\    expect(Passed);
+        \\}
+    ;
+    // The parameter read reaches the member of the container the call site
+    // passed and nothing else: the sibling member of that container, and the
+    // whole of the container nobody passed, stay unused.
+    try expectUnusedDeclSet(code, &.{ "Unpassed", "read_member", "unread_member", "unpassed_member" });
+}
+
+test "each comptime type parameter reaches the container in its own argument slot" {
+    const code: [:0]const u8 =
+        \\const First = struct {
+        \\    const first_member = 1;
+        \\    const first_unread_member = 2;
+        \\};
+        \\const Second = struct {
+        \\    const second_member = 3;
+        \\};
+        \\fn expect(comptime A: type, comptime B: type) void {
+        \\    _ = A.first_member;
+        \\    _ = B.second_member;
+        \\}
+        \\test {
+        \\    expect(First, Second);
+        \\}
+    ;
+    // `A` is bound to the first argument and `B` to the second, so neither
+    // read credits the container in the other's slot.
+    try expectUnusedDeclSet(code, &.{"first_unread_member"});
+}
+
+test "a nested declaration shadows the same-named generic function" {
+    const code: [:0]const u8 =
+        \\const Held = struct {
+        \\    const fixture = "held";
+        \\};
+        \\fn expect(comptime Format: type) void {
+        \\    _ = Format.fixture;
+        \\}
+        \\const Shadow = struct {
+        \\    fn expect(comptime Format: type) void {
+        \\        _ = Format;
+        \\    }
+        \\    pub fn run() void {
+        \\        expect(Held);
+        \\    }
+        \\};
+        \\test {
+        \\    Shadow.run();
+        \\}
+    ;
+    // The unqualified call names `Shadow.expect`, so it cannot stand in for the
+    // file-level generic function. Nothing ever calls that file-level function,
+    // and it is the only reader of `fixture`.
+    try expectUnusedDeclSet(code, &.{ "expect", "fixture" });
+}
+
+test "a shadowing local reads its own member and never the type parameter's" {
+    const code: [:0]const u8 =
+        \\const Held = struct {
+        \\    const parameter_member = 1;
+        \\};
+        \\fn expect(comptime Format: type) void {
+        \\    const Held = struct {
+        \\        const local_member = 2;
+        \\        const local_unread_member = 3;
+        \\    };
+        \\    _ = Held.local_member;
+        \\    _ = Format.parameter_member;
+        \\}
+        \\test {
+        \\    expect(Held);
+        \\}
+    ;
+    // The local binds its own `Held`, so the direct read counts as a read of
+    // `local_member` alone, and the parameter still reaches `Held` at the call
+    // site the way the reader expects.
+    try expectUnusedDeclSet(code, &.{"local_unread_member"});
 }

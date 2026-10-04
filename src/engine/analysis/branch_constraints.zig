@@ -303,9 +303,10 @@ pub fn Mixin(comptime _Engine: type) type {
             } orelse return null;
 
             const scope = (try getAssertionScope(self, current_cfg)) orelse return null;
+            const lexical = src.lexicalIndex() catch return null;
             var assertion_name = assertions.resolveAssertionName(tree, full_call.ast.fn_expr, scope);
             if (assertion_name == null) {
-                assertion_name = assertions.resolveDebugAssertionName(tree, full_call.ast.fn_expr, scope);
+                assertion_name = assertions.resolveDebugAssertionName(tree, full_call.ast.fn_expr, scope, lexical);
             }
             const resolved_name = assertion_name orelse return null;
             const assertion_kind = assertions.constraintKindForName(resolved_name) orelse return null;

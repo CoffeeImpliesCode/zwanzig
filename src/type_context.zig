@@ -820,6 +820,14 @@ pub const TypeContext = struct {
         const left = self.getExpressionTypeInternal(success_node, use_known_methods, use_cache) orelse return null;
         const success = if (left.kind == .error_union) self.getPayloadType(left) else return null;
         const fallback_node = @intFromEnum(pair[1]);
+        switch (tree.nodes.items(.tag)[fallback_node]) {
+            .@"return", .unreachable_literal => return success,
+            .@"break", .@"continue" => {
+                if (tree.nodes.items(.data)[fallback_node].opt_token_and_opt_node[0] == .none)
+                    return success;
+            },
+            else => {},
+        }
         // Synthetic Future results lack AST type nodes.  This branch proves only
         // their non-null value family, never generic nominal type identity.
         if (success.kind == .@"struct" and

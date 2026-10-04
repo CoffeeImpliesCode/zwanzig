@@ -32,6 +32,28 @@ pub const CfgBuilder = struct {
     /// Optional directory to dump CFG DOT files for visualization.
     dump_cfg_dir: ?[]const u8 = null,
     io_context: *compat.Context = compat.defaultContext(),
+    /// Innermost block scope currently open, chained through the scopes it
+    /// was entered from. Set for the duration of a block body walk only.
+    current_scope: ?*const Scope = null,
+    /// Scope that owns the deferred body currently being inlined, if any. A
+    /// transfer that targets it or anything above it escapes the body.
+    defer_boundary: ?*const Scope = null,
+    /// One block-shaped scope entered on the way down into a function body. The
+    /// parent link points at the calling `processBlock`'s own `Scope` local, so
+    /// the chain borrows stack frames: entering a block costs no allocation,
+    /// copies nothing, and has no depth limit to outgrow.
+    pub const Scope = struct {
+        parent: ?*const Scope,
+        /// AST node of the block that owns this scope.
+        ast_node: u32,
+        /// Token index of the block's label identifier, 0 when it has none.
+        label_token: u32,
+        /// Where `break :label` targeting this scope lands. Only labeled blocks
+        /// have one, and it exists before the body is walked so a break inside
+        /// the body can jump to it directly.
+        merge_node: ?CfgNodeId,
+    };
+
     pub const TypeAnnotation = builder_type_annotation.Mixin(@This());
     pub const Statements = builder_statements.Mixin(@This());
     pub const ControlFlow = builder_control_flow.Mixin(@This());
@@ -78,6 +100,11 @@ pub const CfgBuilder = struct {
     /// Build CFG for a function body starting at the given AST node.
     /// Returns null if the node is not a function or cannot be processed.
     pub fn buildFromFn(self: *CfgBuilder, source: *Source, fn_node: AstNodeId) !?Cfg {
+        // Scopes belong to one function body and a builder is reused across
+        // functions, so start with no scope open.
+        self.current_scope = null;
+        self.defer_boundary = null;
+
         const tree = try source.ast();
         const tags = tree.nodes.items(.tag);
         const fn_index = ids.astIndex(fn_node);
@@ -201,6 +228,7 @@ pub const CfgBuilder = struct {
             .@"errdefer" => try ErrorFlow.processErrdefer(self, cfg, source, ast_node, prev_node),
             .@"try" => try ErrorFlow.processTry(self, cfg, source, ast_node, prev_node),
             .@"catch" => try ErrorFlow.processCatch(self, cfg, source, ast_node, prev_node),
+            .@"break" => try Statements.processBreak(self, cfg, source, ast_node, prev_node),
             .@"switch", .switch_comma => try SwitchFlow.processSwitch(self, cfg, source, ast_node, prev_node),
             .unreachable_literal => try Statements.processUnreachable(self, cfg, source, ast_node, prev_node),
             else => try Statements.processGenericExpr(self, cfg, source, ast_node, prev_node),

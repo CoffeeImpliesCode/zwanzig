@@ -16,8 +16,8 @@ const TypeInfo = zir_bridge.TypeInfo;
 const magic: [4]u8 = .{ 'Z', 'W', 'C', 'A' };
 
 /// Current format version for cached artifacts.
-/// Increment when the serialization format changes.
-const format_version: u32 = 1;
+/// Increment when the serialized format or cached CFG construction changes.
+const format_version: u32 = 2;
 
 /// Cached intermediate artifacts for a source file.
 /// Contains CFGs for all functions and any other precomputed analysis data.
