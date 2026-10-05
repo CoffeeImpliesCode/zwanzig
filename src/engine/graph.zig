@@ -5,13 +5,14 @@ const Cfg = cfg_mod.Cfg;
 const IrNode = cfg_mod.IrNode;
 const EngineError = @import("base.zig").EngineError;
 const state_mod = @import("state.zig");
+const store_mod = @import("store.zig");
 const ProgramPoint = state_mod.ProgramPoint;
 const ProgramState = state_mod.ProgramState;
 const WideningKey = state_mod.WideningKey;
 
 /// Default maximum number of unique states per program point.
 /// Beyond this, new states at the same point are widened into an existing node
-/// with the same calling context, or analysis stops if no such node exists.
+/// with the same convergence context, or analysis stops if none exists.
 const default_max_states_per_point: u32 = 50;
 
 /// A node in the exploded graph, keyed by (ProgramPoint, ProgramState).
@@ -174,6 +175,17 @@ pub const ExplodedGraph = struct {
         return null;
     }
 
+    /// Whether two states reached a widening point from the same context.
+    ///
+    /// The pending `catch` arms are part of that answer: two paths that have
+    /// entered different arms of the same expression name different
+    /// acquisitions for the bindings below them, so widening one into the
+    /// other would drop whichever arm they disagree on and leave that binding
+    /// unable to say which call produced its value. `WideningKey` keeps such
+    /// paths in separate chains, so this normally holds and turns a state that
+    /// genuinely came from elsewhere into the limit it is.
+    /// Executed ownership must agree too: a transfer from a backedge cannot
+    /// be intersected with a zero-pass state, nor copied onto that state.
     fn sameContext(a: *const ProgramState, b: *const ProgramState) bool {
         if (a.inline_depth != b.inline_depth) return false;
         if (a.call_stack.items.len != b.call_stack.items.len) return false;
@@ -185,7 +197,8 @@ pub const ExplodedGraph = struct {
                 return false;
             }
         }
-        return true;
+        if (!a.catch_arms.eql(&b.catch_arms)) return false;
+        return a.store.ownershipEql(&b.store);
     }
 
     fn widenOnCap(self: *ExplodedGraph, point_key: u64, state: *ProgramState) EngineError!CapWideningResult {
@@ -245,12 +258,16 @@ pub const ExplodedGraph = struct {
     /// Get or create a node for the given point and state, with optional widening support.
     ///
     /// Flow:
-    /// 1. Apply optional widening at the current program point.
+    /// 1. Apply optional widening at the current program point. The key
+    ///    partitions pending `catch` provenance and executed ownership edges,
+    ///    so disagreeing paths widen in separate chains.
     /// 2. Deduplicate by (point, state) hash as usual.
     /// 3. Drop states subsumed by an existing node at this point. Subsumption
     ///    continues from the existing node, so it may only absorb a state that
     ///    adds no fact the checkers read; see `Store.subsumes`.
-    /// 4. At the state cap, widen in the same context or return AnalysisLimitExceeded.
+    /// 4. At the state cap, widen into a state with the same calling context,
+    ///    pending `catch` provenance, and ownership edges, or return
+    ///    AnalysisLimitExceeded without admitting another state.
     /// 5. Otherwise, create a new node.
     /// On error, the caller retains ownership of the input state.
     pub fn getOrCreateNodeWithWidening(
@@ -793,9 +810,16 @@ test "ExplodedGraph widen-on-cap updates existing node" {
     try testing.expect(result.widening_applied);
     try testing.expect(result.state_updated);
 
-    const node = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
-    const val = node.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
-    try testing.expect(val.isUnknown());
+    // The cap widened `10` and `30` into one integer interval: the lower bound
+    // did not move and is kept, the upper one did and is thrown to the end of
+    // the `i64` domain. The loop condition can still read it.
+    const widened_node = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
+    const widened_counter = widened_node.state.getVar(ids.varId(1)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(widened_counter.eql(.{ .int_range = .{
+        .min = 10,
+        .max = std.math.maxInt(i64),
+    } }));
 
     state3.deinit();
 }
@@ -905,6 +929,8 @@ fn testCapAllocationFailure(allocator: std.mem.Allocator) !void {
     defer graph.deinit();
     graph.setMaxStatesPerPoint(1);
     const point = ProgramPoint.initPre(entry, &cfg);
+    const bytes = ids.varId(30);
+    const out = ids.varId(31);
 
     var first = ProgramState.init(allocator);
     var owns_first = true;
@@ -912,6 +938,14 @@ fn testCapAllocationFailure(allocator: std.mem.Allocator) !void {
     try first.setVar(ids.varId(1), .{ .concrete_int = 10 });
     first.incrementInlineDepth();
     try first.pushCallSite(.{ .call_node = entry, .caller_cfg = &cfg, .return_node = exit });
+    // What the checkers below the loop read: the transfer the aggregate store
+    // executed, and a handler chain deeper than the inline facts hold.
+    try first.trackAllocation(bytes);
+    try first.trackOwnership(bytes, out);
+    var arm_node: u32 = 1;
+    while (arm_node <= 6) : (arm_node += 1) {
+        try first.pushCatchArm(arm_node, .success);
+    }
     const initial = try graph.getOrCreateNode(point, &first);
     owns_first = initial.caller_should_deinit;
 
@@ -925,8 +959,15 @@ fn testCapAllocationFailure(allocator: std.mem.Allocator) !void {
         const unchanged_value = unchanged.state.getVar(ids.varId(1)) orelse
             return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(i64, 10), unchanged_value.concrete_int);
+        // The transfer and the spilled arms stayed with the state the graph had
+        // already stored, and the failed call changed nothing on either side.
+        try std.testing.expect(unchanged.state.hasOwnedResources(out));
+        try std.testing.expectEqual(@as(usize, 6), unchanged.state.catch_arms.len());
+        try std.testing.expect(unchanged.state.catch_arms.spilled != null);
         const incoming_value = incoming.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(i64, 20), incoming_value.concrete_int);
+        try std.testing.expect(incoming.hasOwnedResources(out));
+        try std.testing.expectEqual(@as(usize, 6), incoming.catch_arms.len());
         return err;
     };
     try std.testing.expect(result.widening_applied);
@@ -935,10 +976,21 @@ fn testCapAllocationFailure(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(initial.index, result.index);
     try std.testing.expectEqual(@as(usize, 1), graph.nodeCount());
     const widened = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
-    const widened_value = widened.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(widened_value.isUnknown());
+    const widened_counter = widened.state.getVar(ids.varId(1)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(widened_counter.eql(.{ .int_range = .{
+        .min = 10,
+        .max = std.math.maxInt(i64),
+    } }));
     try std.testing.expectEqual(@as(u32, 1), widened.state.getInlineDepth());
     try std.testing.expectEqual(entry, widened.state.call_stack.items[0].call_node);
+    try std.testing.expect(widened.state.hasOwnedResources(out));
+    try std.testing.expectEqual(@as(usize, 6), widened.state.catch_arms.len());
+    try std.testing.expect(widened.state.catch_arms.spilled != null);
+    var widened_arm: u32 = 1;
+    while (widened_arm <= 6) : (widened_arm += 1) {
+        try std.testing.expectEqual(state_mod.CatchArm.success, widened.state.getCatchArm(widened_arm).?);
+    }
 }
 
 test "ExplodedGraph insertion preserves ownership on allocation failure" {
@@ -952,19 +1004,527 @@ fn testInsertionAllocationFailure(allocator: std.mem.Allocator) !void {
     var graph = ExplodedGraph.init(allocator, &cfg);
     defer graph.deinit();
     const point = ProgramPoint.initPre(node, &cfg);
+    const bytes = ids.varId(30);
+    const out = ids.varId(31);
 
     for (0..3) |value| {
         var state = ProgramState.init(std.testing.allocator);
         var owns_state = true;
         defer if (owns_state) state.deinit();
         try state.setVar(ids.varId(1), .{ .concrete_int = @intCast(value) });
-        const result = try graph.getOrCreateNodeWithWidening(point, &state, .{
+        // Every insert here carries the same transfer and the same spilled arm
+        // chain, so a failure has to leave both on one side or the other,
+        // never half on each.
+        try state.trackAllocation(bytes);
+        try state.trackOwnership(bytes, out);
+        var arm_node: u32 = 1;
+        while (arm_node <= 6) : (arm_node += 1) {
+            try state.pushCatchArm(arm_node, if (arm_node % 2 == 0) .success else .failure);
+        }
+
+        const before = graph.nodeCount();
+        const result = graph.getOrCreateNodeWithWidening(point, &state, .{
             .apply_widening = true,
             .widening_key = WideningKey.init(point, &state),
-        });
+        }) catch |err| {
+            // The graph kept the nodes it had, and the caller's state still
+            // carries everything it brought.
+            try std.testing.expectEqual(before, graph.nodeCount());
+            try std.testing.expect(state.hasOwnedResources(out));
+            try std.testing.expectEqual(@as(usize, 6), state.catch_arms.len());
+            return err;
+        };
         owns_state = result.caller_should_deinit;
         const stored = graph.getNode(result.index) orelse return error.TestUnexpectedResult;
         const observed = stored.state.getVar(ids.varId(1)) orelse return error.TestUnexpectedResult;
         try std.testing.expect(observed.subsumes(.{ .concrete_int = @intCast(value) }));
+        // The stored state holds the transfer and the whole arm chain, spilled
+        // decisions included.
+        try std.testing.expect(stored.state.hasOwnedResources(out));
+        try std.testing.expectEqual(@as(usize, 6), stored.state.catch_arms.len());
+        try std.testing.expect(stored.state.catch_arms.spilled != null);
+        var stored_arm: u32 = 1;
+        while (stored_arm <= 6) : (stored_arm += 1) {
+            const arm: state_mod.CatchArm = if (stored_arm % 2 == 0) .success else .failure;
+            try std.testing.expectEqual(arm, stored.state.getCatchArm(stored_arm).?);
+        }
     }
+}
+
+test "ExplodedGraph keeps an executed ownership transfer out of the owner-free header" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const bytes = ids.varId(10);
+    const out = ids.varId(11);
+    const counter = ids.varId(12);
+
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    _ = try cfg.addNode(IrNode.init(.loop_header));
+
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(4);
+
+    const point = ProgramPoint.initPre(ids.cfgId(0), &cfg);
+
+    // The header entry state holds the allocation but has not stored the
+    // payload into the aggregate yet, and it says nothing about the cursor.
+    var header = ProgramState.init(allocator);
+    var owns_header = true;
+    defer if (owns_header) header.deinit();
+    try header.setVar(counter, .unknown);
+    try header.trackAllocation(bytes);
+    const header_result = try graph.getOrCreateNodeWithWidening(point, &header, .{
+        .apply_widening = true,
+        .widening_key = WideningKey.init(point, &header),
+    });
+    owns_header = header_result.caller_should_deinit;
+    try testing.expect(header_result.is_new);
+
+    // The backedge state is the same allocation once `aggregate[i] = payload`
+    // has handed the payload's resources over and the cursor has advanced.
+    var backedge = ProgramState.init(allocator);
+    var owns_backedge = true;
+    defer if (owns_backedge) backedge.deinit();
+    try backedge.setVar(counter, .{ .concrete_int = 1 });
+    try backedge.trackAllocation(bytes);
+    try backedge.trackOwnership(bytes, out);
+    const backedge_result = try graph.getOrCreateNodeWithWidening(point, &backedge, .{
+        .apply_widening = true,
+        .widening_key = WideningKey.init(point, &backedge),
+    });
+    owns_backedge = backedge_result.caller_should_deinit;
+
+    // The header state is at least as general as the backedge state in every
+    // other respect, so absorbing the backedge there is exactly the merge that
+    // loses the transfer.
+    try testing.expect(backedge_result.is_new);
+    try testing.expect(backedge_result.index != header_result.index);
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+
+    // The aggregate takes the payload's resources with it at the exit, so the
+    // owned node reports nothing.
+    const owned_node = graph.getNode(backedge_result.index) orelse return error.TestUnexpectedResult;
+    var owned_exit = try owned_node.state.clone(allocator);
+    defer owned_exit.deinit();
+    try owned_exit.trackEscapeOwned(out);
+    try owned_exit.trackLeaks();
+    try testing.expectEqual(@as(usize, 0), owned_exit.getStoreViolations().len);
+
+    // The header node never made the transfer, so the same exit leaks the
+    // payload it was still holding.
+    const header_node = graph.getNode(header_result.index) orelse return error.TestUnexpectedResult;
+    var header_exit = try header_node.state.clone(allocator);
+    defer header_exit.deinit();
+    try header_exit.trackEscapeOwned(out);
+    try header_exit.trackLeaks();
+    try testing.expectEqual(@as(usize, 1), header_exit.getStoreViolations().len);
+    try testing.expectEqual(store_mod.StoreViolationKind.resource_leak, header_exit.getStoreViolations()[0].kind);
+    try testing.expectEqual(bytes, header_exit.getStoreViolations()[0].region);
+
+    // The next pass has no cursor left to say, so the chain widens: the value
+    // goes, the transfer stays.
+    var repeat = try owned_node.state.clone(allocator);
+    var owns_repeat = true;
+    defer if (owns_repeat) repeat.deinit();
+    try repeat.setVar(counter, .unknown);
+    const repeat_result = try graph.getOrCreateNodeWithWidening(point, &repeat, .{
+        .apply_widening = true,
+        .widening_key = WideningKey.init(point, &repeat),
+    });
+    owns_repeat = repeat_result.caller_should_deinit;
+    try testing.expect(repeat_result.is_new);
+    try testing.expect(repeat_result.widening_applied);
+    try testing.expect(!repeat_result.converged);
+    try testing.expectEqual(@as(usize, 3), graph.nodeCount());
+
+    const widened_node = graph.getNode(repeat_result.index) orelse return error.TestUnexpectedResult;
+    const widened_counter = widened_node.state.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expect(widened_counter.eql(.unknown));
+    try testing.expect(widened_node.state.hasOwnedResources(out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, widened_node.state.getRegionState(bytes).?);
+
+    // An equal repeat converges onto the same node, which still holds the
+    // transfer, so nothing about the aggregate is lost at convergence.
+    var again = try widened_node.state.clone(allocator);
+    var owns_again = true;
+    defer if (owns_again) again.deinit();
+    const again_result = try graph.getOrCreateNodeWithWidening(point, &again, .{
+        .apply_widening = true,
+        .widening_key = WideningKey.init(point, &again),
+    });
+    owns_again = again_result.caller_should_deinit;
+    try testing.expect(!again_result.is_new);
+    try testing.expect(again_result.converged);
+    try testing.expectEqual(repeat_result.index, again_result.index);
+    try testing.expectEqual(@as(usize, 3), graph.nodeCount());
+    try testing.expectEqual(@as(u32, 1), graph.getWideningConvergedCount());
+
+    const converged_node = graph.getNode(again_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(converged_node.state.hasOwnedResources(out));
+    var converged_exit = try converged_node.state.clone(allocator);
+    defer converged_exit.deinit();
+    try converged_exit.trackEscapeOwned(out);
+    try converged_exit.trackLeaks();
+    try testing.expectEqual(@as(usize, 0), converged_exit.getStoreViolations().len);
+}
+
+test "ExplodedGraph cap one refuses an ownership difference without moving either state" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const bytes = ids.varId(20);
+    const out = ids.varId(21);
+    const counter = ids.varId(22);
+
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    _ = try cfg.addNode(IrNode.init(.loop_header));
+
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(1);
+
+    const point = ProgramPoint.initPre(ids.cfgId(0), &cfg);
+
+    var initial = ProgramState.init(allocator);
+    var owns_initial = true;
+    defer if (owns_initial) initial.deinit();
+    try initial.setVar(counter, .{ .concrete_int = 1 });
+    try initial.trackAllocation(bytes);
+    const initial_result = try graph.getOrCreateNode(point, &initial);
+    owns_initial = initial_result.caller_should_deinit;
+
+    // Same point, same context, same allocation, but the payload is in the
+    // aggregate by now: widening the stored state with this one would drop the
+    // transfer instead of reporting it.
+    var incoming = ProgramState.init(allocator);
+    defer incoming.deinit();
+    try incoming.setVar(counter, .{ .concrete_int = 2 });
+    try incoming.trackAllocation(bytes);
+    try incoming.trackOwnership(bytes, out);
+
+    try testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &incoming, .{}));
+
+    // Neither side moved: the limit is reported before anything is widened.
+    try testing.expectEqual(@as(usize, 1), graph.nodeCount());
+    const stored = graph.getNode(initial_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(!stored.state.hasOwnedResources(out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, stored.state.getRegionState(bytes).?);
+    const stored_counter = stored.state.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), stored_counter.concrete_int);
+    try testing.expect(incoming.hasOwnedResources(out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, incoming.getRegionState(bytes).?);
+    const incoming_counter = incoming.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 2), incoming_counter.concrete_int);
+}
+
+test "ExplodedGraph cap one refuses to widen an owner-free state into an owned one" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const bytes = ids.varId(20);
+    const out = ids.varId(21);
+    const counter = ids.varId(22);
+
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    _ = try cfg.addNode(IrNode.init(.loop_header));
+
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(1);
+
+    const point = ProgramPoint.initPre(ids.cfgId(0), &cfg);
+
+    var initial = ProgramState.init(allocator);
+    var owns_initial = true;
+    defer if (owns_initial) initial.deinit();
+    try initial.setVar(counter, .{ .concrete_int = 1 });
+    try initial.trackAllocation(bytes);
+    try initial.trackOwnership(bytes, out);
+    const initial_result = try graph.getOrCreateNode(point, &initial);
+    owns_initial = initial_result.caller_should_deinit;
+
+    // The path that never made the transfer is the mirror image of the one
+    // above: widening this into the stored state would erase the stored
+    // transfer, and absorbing it would erase this path's payload at the exit.
+    var incoming = ProgramState.init(allocator);
+    defer incoming.deinit();
+    try incoming.setVar(counter, .{ .concrete_int = 2 });
+    try incoming.trackAllocation(bytes);
+
+    try testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &incoming, .{}));
+
+    try testing.expectEqual(@as(usize, 1), graph.nodeCount());
+    const stored = graph.getNode(initial_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(stored.state.hasOwnedResources(out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, stored.state.getRegionState(bytes).?);
+    const stored_counter = stored.state.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), stored_counter.concrete_int);
+    try testing.expect(!incoming.hasOwnedResources(out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, incoming.getRegionState(bytes).?);
+}
+
+test "ExplodedGraph cap widening picks the node whose ownership matches" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const bytes = ids.varId(20);
+    const out_a = ids.varId(21);
+    const out_b = ids.varId(22);
+    const counter = ids.varId(23);
+
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    _ = try cfg.addNode(IrNode.init(.loop_header));
+
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(2);
+
+    const point = ProgramPoint.initPre(ids.cfgId(0), &cfg);
+
+    // Two paths reach the header with the same allocation handed to two
+    // different aggregates, so the transfer is the only thing telling them
+    // apart and both have to be kept.
+    var first = ProgramState.init(allocator);
+    var owns_first = true;
+    defer if (owns_first) first.deinit();
+    try first.setVar(counter, .{ .concrete_int = 1 });
+    try first.trackAllocation(bytes);
+    try first.trackOwnership(bytes, out_a);
+    const first_result = try graph.getOrCreateNode(point, &first);
+    owns_first = first_result.caller_should_deinit;
+    try testing.expect(first_result.is_new);
+
+    var second = ProgramState.init(allocator);
+    var owns_second = true;
+    defer if (owns_second) second.deinit();
+    try second.setVar(counter, .{ .concrete_int = 2 });
+    try second.trackAllocation(bytes);
+    try second.trackOwnership(bytes, out_b);
+    const second_result = try graph.getOrCreateNode(point, &second);
+    owns_second = second_result.caller_should_deinit;
+    try testing.expect(second_result.is_new);
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+
+    // At the cap a state may only widen into the node that holds the same
+    // transfer, never into the first candidate that merely looks alike.
+    var incoming = ProgramState.init(allocator);
+    var owns_incoming = true;
+    defer if (owns_incoming) incoming.deinit();
+    try incoming.setVar(counter, .{ .concrete_int = 3 });
+    try incoming.trackAllocation(bytes);
+    try incoming.trackOwnership(bytes, out_b);
+    const result = try graph.getOrCreateNodeWithWidening(point, &incoming, .{});
+    owns_incoming = result.caller_should_deinit;
+    try testing.expect(!result.is_new);
+    try testing.expect(result.widening_applied);
+    try testing.expect(result.state_updated);
+    try testing.expectEqual(second_result.index, result.index);
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+
+    const widened = graph.getNode(second_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(widened.state.hasOwnedResources(out_b));
+    try testing.expect(!widened.state.hasOwnedResources(out_a));
+    try testing.expectEqual(store_mod.ResourceState.allocated, widened.state.getRegionState(bytes).?);
+
+    const untouched = graph.getNode(first_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(untouched.state.hasOwnedResources(out_a));
+    try testing.expect(!untouched.state.hasOwnedResources(out_b));
+    const untouched_counter = untouched.state.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), untouched_counter.concrete_int);
+
+    // Releasing the aggregate this path did not hand the payload to still
+    // leaks it; releasing the one it did carries the payload away.
+    var wrong_aggregate = try widened.state.clone(allocator);
+    defer wrong_aggregate.deinit();
+    try wrong_aggregate.trackEscapeOwned(out_a);
+    try wrong_aggregate.trackLeaks();
+    try testing.expectEqual(@as(usize, 1), wrong_aggregate.getStoreViolations().len);
+    try testing.expectEqual(store_mod.StoreViolationKind.resource_leak, wrong_aggregate.getStoreViolations()[0].kind);
+    try testing.expectEqual(bytes, wrong_aggregate.getStoreViolations()[0].region);
+
+    var right_aggregate = try widened.state.clone(allocator);
+    defer right_aggregate.deinit();
+    try right_aggregate.trackEscapeOwned(out_b);
+    try right_aggregate.trackLeaks();
+    try testing.expectEqual(@as(usize, 0), right_aggregate.getStoreViolations().len);
+}
+
+test "ExplodedGraph keeps the spilled catch-arm partition beside the ownership one" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const bytes = ids.varId(30);
+    const out = ids.varId(31);
+    const other_out = ids.varId(32);
+    const counter = ids.varId(33);
+
+    var cfg = Cfg.init(allocator);
+    defer cfg.deinit();
+    _ = try cfg.addNode(IrNode.init(.loop_header));
+
+    var graph = ExplodedGraph.init(allocator, &cfg);
+    defer graph.deinit();
+    graph.setMaxStatesPerPoint(2);
+
+    const point = ProgramPoint.initPre(ids.cfgId(0), &cfg);
+
+    // A handler chain deeper than a state holds inline: arms 5 to 7 spill.
+    // Both states below carry that chain, and they differ only in whether the
+    // payload reached the aggregate.
+    var header = ProgramState.init(allocator);
+    var owns_header = true;
+    defer if (owns_header) header.deinit();
+    try header.setVar(counter, .{ .concrete_int = 1 });
+    try header.trackAllocation(bytes);
+    var arm_node: u32 = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        try header.pushCatchArm(arm_node, if (arm_node % 2 == 0) .success else .failure);
+    }
+    try testing.expect(header.catch_arms.spilled != null);
+    const header_result = try graph.getOrCreateNode(point, &header);
+    owns_header = header_result.caller_should_deinit;
+    try testing.expect(header_result.is_new);
+
+    var owned = ProgramState.init(allocator);
+    var owns_owned = true;
+    defer if (owns_owned) owned.deinit();
+    try owned.setVar(counter, .{ .concrete_int = 1 });
+    try owned.trackAllocation(bytes);
+    try owned.trackOwnership(bytes, out);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        try owned.pushCatchArm(arm_node, if (arm_node % 2 == 0) .success else .failure);
+    }
+    const owned_result = try graph.getOrCreateNode(point, &owned);
+    owns_owned = owned_result.caller_should_deinit;
+
+    // Same arm chain, same cursor, same allocation: only the transfer tells
+    // them apart, so the owner-free state may not absorb the owned one.
+    try testing.expect(owned_result.is_new);
+    try testing.expect(owned_result.index != header_result.index);
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+
+    // The cap holds both partitions: a spilled arm that disagrees is still a
+    // different arm chain, and no merge happens even though the two states
+    // own the payload identically.
+    var flipped_arm = ProgramState.init(allocator);
+    defer flipped_arm.deinit();
+    try flipped_arm.setVar(counter, .{ .concrete_int = 1 });
+    try flipped_arm.trackAllocation(bytes);
+    try flipped_arm.trackOwnership(bytes, out);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        const arm: state_mod.CatchArm = if (arm_node == 7)
+            .success
+        else if (arm_node % 2 == 0) .success else .failure;
+        try flipped_arm.pushCatchArm(arm_node, arm);
+    }
+    try testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &flipped_arm, .{}));
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+    try testing.expectEqual(@as(usize, 7), flipped_arm.catch_arms.len());
+    try testing.expectEqual(state_mod.CatchArm.success, flipped_arm.getCatchArm(7).?);
+    try testing.expect(flipped_arm.hasOwnedResources(out));
+
+    // The same chain with the payload in a different aggregate is a different
+    // transfer, so it is a limit rather than a merge.
+    var other_owner = ProgramState.init(allocator);
+    defer other_owner.deinit();
+    try other_owner.setVar(counter, .{ .concrete_int = 1 });
+    try other_owner.trackAllocation(bytes);
+    try other_owner.trackOwnership(bytes, other_out);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        try other_owner.pushCatchArm(arm_node, if (arm_node % 2 == 0) .success else .failure);
+    }
+    try testing.expectError(error.AnalysisLimitExceeded, graph.getOrCreateNodeWithWidening(point, &other_owner, .{}));
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+    try testing.expect(other_owner.hasOwnedResources(other_out));
+    try testing.expectEqual(@as(usize, 7), other_owner.catch_arms.len());
+
+    // Neither rejected state cost the graph an arm: both stored nodes still
+    // carry the whole chain, inline and spilled alike.
+    const header_node = graph.getNode(header_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(!header_node.state.hasOwnedResources(out));
+    try testing.expectEqual(@as(usize, 7), header_node.state.catch_arms.len());
+    try testing.expect(header_node.state.catch_arms.spilled != null);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        const arm: state_mod.CatchArm = if (arm_node % 2 == 0) .success else .failure;
+        try testing.expectEqual(arm, header_node.state.getCatchArm(arm_node).?);
+    }
+
+    const owned_node = graph.getNode(owned_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(owned_node.state.hasOwnedResources(out));
+    try testing.expectEqual(@as(usize, 7), owned_node.state.catch_arms.len());
+    try testing.expect(owned_node.state.catch_arms.spilled != null);
+
+    // A state that agrees on both partitions widens into the owned node, and
+    // the widened node keeps every arm and the transfer.
+    var widen_in = ProgramState.init(allocator);
+    var owns_widen_in = true;
+    defer if (owns_widen_in) widen_in.deinit();
+    try widen_in.setVar(counter, .{ .concrete_int = 2 });
+    try widen_in.trackAllocation(bytes);
+    try widen_in.trackOwnership(bytes, out);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        try widen_in.pushCatchArm(arm_node, if (arm_node % 2 == 0) .success else .failure);
+    }
+    const widen_result = try graph.getOrCreateNodeWithWidening(point, &widen_in, .{});
+    owns_widen_in = widen_result.caller_should_deinit;
+    try testing.expect(!widen_result.is_new);
+    try testing.expect(widen_result.widening_applied);
+    try testing.expect(widen_result.state_updated);
+    try testing.expectEqual(owned_result.index, widen_result.index);
+    try testing.expectEqual(@as(usize, 2), graph.nodeCount());
+
+    const widened = graph.getNode(widen_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(widened.state.hasOwnedResources(out));
+    try testing.expect(!widened.state.hasOwnedResources(other_out));
+    try testing.expectEqual(store_mod.ResourceState.allocated, widened.state.getRegionState(bytes).?);
+    try testing.expectEqual(@as(usize, 7), widened.state.catch_arms.len());
+    try testing.expect(widened.state.catch_arms.spilled != null);
+    arm_node = 1;
+    while (arm_node <= 7) : (arm_node += 1) {
+        const arm: state_mod.CatchArm = if (arm_node % 2 == 0) .success else .failure;
+        try testing.expectEqual(arm, widened.state.getCatchArm(arm_node).?);
+    }
+
+    // The header node was not the widening target, so it still owns nothing.
+    const kept_header = graph.getNode(header_result.index) orelse return error.TestUnexpectedResult;
+    try testing.expect(!kept_header.state.hasOwnedResources(out));
+    const kept_header_counter = kept_header.state.getVar(counter) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(i64, 1), kept_header_counter.concrete_int);
+    try testing.expectEqual(@as(usize, 7), kept_header.state.catch_arms.len());
+
+    // The exit check still reads the transfer the widened node kept: releasing
+    // the aggregate it named carries the payload away, releasing the other one
+    // leaves it leaked, and the owner-free header keeps leaking it either way.
+    var owned_exit = try widened.state.clone(allocator);
+    defer owned_exit.deinit();
+    try owned_exit.trackEscapeOwned(out);
+    try owned_exit.trackLeaks();
+    try testing.expectEqual(@as(usize, 0), owned_exit.getStoreViolations().len);
+
+    var other_aggregate = try widened.state.clone(allocator);
+    defer other_aggregate.deinit();
+    try other_aggregate.trackEscapeOwned(other_out);
+    try other_aggregate.trackLeaks();
+    try testing.expectEqual(@as(usize, 1), other_aggregate.getStoreViolations().len);
+    try testing.expectEqual(store_mod.StoreViolationKind.resource_leak, other_aggregate.getStoreViolations()[0].kind);
+    try testing.expectEqual(bytes, other_aggregate.getStoreViolations()[0].region);
+
+    var header_exit = try kept_header.state.clone(allocator);
+    defer header_exit.deinit();
+    try header_exit.trackEscapeOwned(out);
+    try header_exit.trackLeaks();
+    try testing.expectEqual(@as(usize, 1), header_exit.getStoreViolations().len);
+    try testing.expectEqual(store_mod.StoreViolationKind.resource_leak, header_exit.getStoreViolations()[0].kind);
+    try testing.expectEqual(bytes, header_exit.getStoreViolations()[0].region);
 }

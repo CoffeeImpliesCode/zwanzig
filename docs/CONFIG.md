@@ -56,12 +56,26 @@ Widening is on by default. Use `--use-widening` to force it on from the CLI (ove
 - `max_worklist_steps`: Maximum worklist steps per engine run (positive integer)
 - `max_states_per_point`: Maximum unique states per CFG point (positive integer)
 - `use_widening`: Enable loop-header widening for convergence (boolean, default: true)
+- `optional_unwrap_test_severity`: Severity for `optional-unwrap` in test bodies: `"hint"`, `"warning"`, or `"error"` (default: `"warning"`)
 - `resource_models`: Array of custom resource model definitions (see below)
 - `escape_models`: Array of escape model definitions for `stack-escape-engine` (see below)
 - `escape_max_depth`: Max helper-call depth for stack escape tracking (positive integer, default: 3)
 - `enabled_rules` and `disabled_rules` are mutually exclusive - only one can be present
 
 Sample config: [docs/zwanzig.sample.json](zwanzig.sample.json)
+
+## Optional unwraps in tests
+
+Set `optional_unwrap_test_severity` to change the severity of forced unwraps in `test` bodies:
+
+```json
+{
+  "optional_unwrap_test_severity": "hint"
+}
+```
+
+Nested function and method bodies keep `warning`, as do production bodies. Other rules keep their own severities. The setting does not disable the check: `"off"` is invalid, and a hint still makes the CLI exit with code 1.
+
 
 ## Custom resource models
 

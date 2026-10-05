@@ -64,9 +64,16 @@ fn maybeReset(state: *State, take: bool) void {
 test "an aliased assert is invalidated like the direct spelling" {
     var state = State.init();
     state.write(1);
-    _ = state.takeAfterReset();
-    _ = state.takeAfterOptionalWrite(null);
-    _ = state.takeThroughAlias();
+
+    // These three clear the guarded field before they unwrap it, which is the
+    // behaviour under test: the alias stopped proving at the write, exactly as
+    // the direct spelling does, so the unwrap traps. A trap cannot be caught
+    // from a test, so they are named here rather than called.
+    _ = &State.takeAfterReset;
+    _ = &State.takeAfterOptionalWrite;
+    _ = &State.takeThroughAlias;
+
+    // These two unwrap a field that no write cleared.
     _ = state.takeDisjoint();
 
     var other = State.init();

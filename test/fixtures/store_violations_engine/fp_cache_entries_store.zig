@@ -18,7 +18,7 @@ fn buildCache(allocator: std.mem.Allocator, count: usize) !Cache {
     const entries = try allocator.alloc(Entry, count);
     errdefer allocator.free(entries);
 
-    var cache = Cache{
+    const cache = Cache{
         .entries = entries,
         .allocator = allocator,
     };

@@ -12,6 +12,7 @@ const ids = @import("../ids.zig");
 const engine_mod = @import("../engine.zig");
 const store_mod = @import("../engine/store.zig");
 const import_resolver = @import("../analysis/import_resolver.zig");
+const BuildMetadata = @import("../build_metadata.zig").BuildMetadata;
 const StoreViolation = store_mod.StoreViolation;
 
 /// Engine-based checker that reports store violations (double-free, free without alloc).
@@ -1142,6 +1143,119 @@ test "a wrapper proven to close its argument releases the caller's resource" {
     try testing.expectEqual(@as(usize, 6), diagnostics.items.len);
 }
 
+test "with its declared resource models the CLI-shaped path pins the same findings as the fixture gate" {
+    // The fixture gate hands the checker a bare type context, no project and
+    // no build metadata, and leaves widening off. The CLI hands it a resolved
+    // compilation root, project metadata and widening on, and a callee the
+    // wider resolution can now inline. A finding only the narrow path produces
+    // is one the shipped binary never reports, so both shapes run here through
+    // the wider context instead.
+    //
+    // These fixtures declare their resource models in an inline `// CONFIG:`
+    // line that the fixture gate parses. The CLI does not read that line: it is
+    // configured from a config file, so the parity check here supplies the same
+    // models through the context the way a CLI run configured with them does.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const metadata = BuildMetadata.init(.{ .arch = .x86_64, .os = .linux, .abi = null }, .release_fast);
+
+    // Both sources are the fixture verbatim, so the pinned line is the line the
+    // fixture pins, and each case carries the models its own `// CONFIG:` line
+    // declares.
+    const cases = [_]struct {
+        path: []const u8,
+        code: [:0]const u8,
+        models: []const ResourceModel,
+        line: usize,
+        message: []const u8,
+    }{
+        .{
+            .path = "errdefer-over-free-owned-release.zig",
+            .code =
+            \\const std = @import("std");
+            \\
+            \\const ThreadContext = struct {
+            \\    allocator: std.mem.Allocator,
+            \\    url: []u8,
+            \\
+            \\    pub fn deinit(self: *ThreadContext) void {
+            \\        self.allocator.free(self.url);
+            \\    }
+            \\};
+            \\
+            \\fn foo(allocator: std.mem.Allocator, url: []const u8) !void {
+            \\    const ctx = allocator.create(ThreadContext) catch return error.OutOfMemory;
+            \\    errdefer allocator.destroy(ctx);
+            \\
+            \\    ctx.allocator = allocator;
+            \\    ctx.url = allocator.dupe(u8, url) catch return error.OutOfMemory;
+            \\    errdefer allocator.free(ctx.url);
+            \\
+            \\    ctx.deinit();
+            \\    return error.OutOfMemory;
+            \\}
+            ,
+            .models = &.{.{ .kind = .free_owned, .method_name = "deinit" }},
+            .line = 18,
+            .message = "double-free",
+        },
+        .{
+            .path = "acquisition-through-field-access-receiver.zig",
+            .code =
+            \\const std = @import("std");
+            \\// zwanzig-disable: unused-decl
+            \\
+            \\const MyPool = struct {
+            \\    fn acquire(_: *MyPool) i32 {
+            \\        return 1;
+            \\    }
+            \\};
+            \\
+            \\const Context = struct {
+            \\    pool: MyPool,
+            \\};
+            \\
+            \\fn leakFromFieldAccess() void {
+            \\    var ctx = Context{ .pool = MyPool{} };
+            \\    const handle = ctx.pool.acquire();
+            \\    _ = handle;
+            \\}
+            ,
+            .models = &.{.{ .kind = .open, .method_name = "acquire", .receiver_type = "MyPool" }},
+            .line = 16,
+            .message = "resource leak",
+        },
+    };
+
+    for (cases) |case| {
+        var source = Source.init(allocator, case.path, case.code);
+        defer source.deinit();
+        var types = TypeContext.init(allocator, &source);
+        defer types.deinit();
+        const files = [_]import_resolver.File{.{ .path = source.getFilePath(), .tree = try source.ast() }};
+        types.project_resolver = .{ .files = &files, .file_index = 0 };
+
+        const config: Config = .{ .rule_filter = .none, .resource_models = case.models };
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try StoreViolationsEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = &metadata,
+            .type_context = &types,
+            .config = &config,
+            .analysis_limits = .{ .use_widening = true },
+        });
+
+        try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+        try testing.expectEqualStrings("store-violations-engine", diagnostics.items[0].rule_id);
+        try testing.expectEqual(checker_mod.Severity.err, diagnostics.items[0].severity);
+        try testing.expectEqual(case.line, diagnostics.items[0].range.start.line);
+        try testing.expect(std.mem.indexOf(u8, diagnostics.items[0].message, case.message) != null);
+    }
+}
+
 test "a returned aggregate carries the payload resources it holds" {
     // Each case runs as its own Source. Combined into one file the
     // field-allocated resources all report against the same out-of-range
@@ -1250,4 +1364,77 @@ test "a returned aggregate carries the payload resources it holds" {
         \\}
     ;
     try expectStoreDiagnostics(dropped_payload, 1, "resource leak");
+}
+
+test "an arena binding written over before an allocation owns nothing on the project path" {
+    // The source the `undischarged_local_arena_leaks` fixture pins, run with a
+    // project file list attached - the shape a project run hands the type
+    // context and a bare fixture never does. With a resolver in place the
+    // declared type of `arena` resolves, and a declared type is what the
+    // binding was declared with: it says nothing about the value the binding
+    // holds after the write below it. So the second frame's `deinit` disposes
+    // the arena the write put there, while the constructor the binding was
+    // declared with proves nothing about the value the allocation runs
+    // through, and the block stays the frame's own.
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\
+        \\const verified_std = @import("std");
+        \\
+        \\fn undrainedArenaLeaks(gpa: std.mem.Allocator) !void {
+        \\    var arena = verified_std.heap.ArenaAllocator.init(gpa);
+        \\    const allocator = arena.allocator();
+        \\    const buf = try allocator.alloc(u8, 8);
+        \\    buf[0] = 'a';
+        \\}
+        \\
+        \\fn reassignedArenaProvesNothing(gpa: std.mem.Allocator) !void {
+        \\    var arena = verified_std.heap.ArenaAllocator.init(gpa);
+        \\    defer arena.deinit();
+        \\    arena = verified_std.heap.ArenaAllocator.init(gpa);
+        \\    const allocator = arena.allocator();
+        \\    const buf = try allocator.alloc(u8, 8);
+        \\    buf[0] = 'b';
+        \\}
+    ;
+
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "arena-reassigned.zig", code);
+    defer source.deinit();
+    var type_ctx = TypeContext.init(allocator, &source);
+    defer type_ctx.deinit();
+
+    const files = [_]import_resolver.File{
+        .{ .path = source.getFilePath(), .tree = try source.ast() },
+    };
+    type_ctx.project_resolver = .{ .files = &files, .file_index = 0 };
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        diagnostics.deinit(allocator);
+    }
+    try StoreViolationsEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+        .build_metadata = null,
+        .type_context = &type_ctx,
+    });
+
+    // Both frames keep the block they made: the one that disposes nothing,
+    // and the one whose disposal covers only the arena its own write put in
+    // place. The lines below are the two allocations of the source above.
+    const pinned = [_]usize{ 8, 17 };
+    var lines: [pinned.len]usize = undefined;
+    for (diagnostics.items, 0..) |diagnostic, index| {
+        try std.testing.expect(index < lines.len);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "resource leak") != null);
+        lines[index] = diagnostic.range.start.line;
+    }
+    try std.testing.expectEqual(lines.len, diagnostics.items.len);
+    for (lines) |line| {
+        var found = false;
+        for (pinned) |expected| {
+            if (line == expected) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }

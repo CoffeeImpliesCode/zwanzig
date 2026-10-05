@@ -15,7 +15,7 @@ const Pty = struct {
 };
 
 fn spawn() !void {
-    var pty = try Pty.open();
+    const pty = try Pty.open();
     defer {
         _ = posix.close(pty.master);
         _ = posix.close(pty.slave);

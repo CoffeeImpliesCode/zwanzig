@@ -31,7 +31,7 @@ pub fn writesSlotBehindPointerView() u32 {
 
 pub fn writesSlotBehindCopiedView() u32 {
     var cells: [2]Cell = .{ .{ .value = 1 }, .{ .value = 2 } };
-    var view: []Cell = cells[0..];
+    const view: []Cell = cells[0..];
     const copy: []Cell = view;
     std.debug.assert(copy[0].value != null);
     cells[0].value = null;

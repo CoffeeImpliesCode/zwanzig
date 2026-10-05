@@ -1,3 +1,4 @@
+const std = @import("std");
 const source_range = @import("source_range.zig");
 const graph = @import("../graph.zig");
 const ids = @import("../../ids.zig");
@@ -11,6 +12,76 @@ const TypeInfo = type_context_mod.TypeInfo;
 
 pub fn Mixin(comptime _Builder: type) type {
     return struct {
+        /// The `catch` expression at `node`, looking through the parentheses
+        /// it may be written in, or null when there is none.
+        ///
+        /// The parentheses are not a different expression: `a() catch (b()
+        /// catch c())` decides the inner one's arms exactly as it does
+        /// unwritten, so the control flow has to split them either way.
+        ///
+        /// Every step is a parenthesis handing over the one expression it
+        /// holds, so the walk only ever moves further into the tree and ends.
+        /// A depth written past is read like any other, because a `catch`
+        /// buried under enough parentheses is still the expression that has
+        /// to be split.
+        fn nestedCatchNode(tree: *const std.zig.Ast, node: u32) ?u32 {
+            const tags = tree.nodes.items(.tag);
+            const datas = tree.nodes.items(.data);
+            var current = node;
+            while (current != 0 and current < tags.len) {
+                switch (tags[current]) {
+                    .@"catch" => return current,
+                    .grouped_expression => current = @intFromEnum(datas[current].node_and_token[0]),
+                    else => return null,
+                }
+            }
+            return null;
+        }
+
+        /// Build the guarded operand of the `catch` expression at `catch_ast`
+        /// when that operand is a `catch` of its own, and report the node the
+        /// outer expression hangs off.
+        ///
+        /// `catch` is left-associative, so `a() catch b() catch c()` is
+        /// `(a() catch b()) catch c()` and the inner expression is the outer
+        /// one's operand rather than its handler. Left unbuilt it is no node of
+        /// its own: no path records which of its two arms ran, and the binding
+        /// that takes the value is resolved off the primary whatever the path
+        /// did. Building its node first records that decision, and the two arms
+        /// leave it on edges of their own - but both then run on to its merge
+        /// node, and that merge is the node the outer expression hangs off. So
+        /// the outer expression sees one place the operand leaves from, and both
+        /// of the operand's arms reach its success edge; a handler that
+        /// terminates the path is the one that never reaches that merge.
+        ///
+        /// Returns null when there is no operand `catch`, and the caller then
+        /// attaches its node to the node it was given as before.
+        fn buildOperandCatch(
+            self: *_Builder,
+            cfg: *Cfg,
+            source: *Source,
+            catch_ast: u32,
+            prev_node: CfgNodeId,
+        ) !?CfgNodeId {
+            const tree = try source.ast();
+            const operand = @intFromEnum(tree.nodes.items(.data)[catch_ast].node_and_node[0]);
+            const operand_catch = nestedCatchNode(tree, operand) orelse return null;
+            const result = try self.processNode(cfg, source, operand_catch, prev_node);
+            return result.last orelse null;
+        }
+
+        /// The handler of the `catch` expression at `catch_ast` as the control
+        /// flow has to build it: the handler itself, or the `catch` inside the
+        /// parentheses it is written in.
+        ///
+        /// A handler that is itself a `catch` decides its own arms, so it gets
+        /// its own node and the edges out of it say which of its two calls
+        /// ran. Building the parentheses instead leaves that expression with a
+        /// single node and no decision at all.
+        fn handlerNodeToBuild(tree: *const std.zig.Ast, handler_ast: u32) u32 {
+            return nestedCatchNode(tree, handler_ast) orelse handler_ast;
+        }
+
         pub fn processReturnWithTry(
             self: *_Builder,
             cfg: *Cfg,
@@ -55,11 +126,15 @@ pub fn Mixin(comptime _Builder: type) type {
             const catch_range = try source_range.getSourceRange(source, catch_expr_node);
             const data = tree.nodes.items(.data);
 
-            // Return with catch expression
+            // Return with catch expression. A guarded operand that is a
+            // `catch` of its own is built first, so the arm it ran is
+            // recorded on a node of its own; both of its arms reach that
+            // expression's merge, which is the node this one hangs off.
+            const operand_end = try buildOperandCatch(self, cfg, source, catch_expr_node, prev_node);
             var catch_ir = IrNode.initFull(.catch_expr, catch_expr_node, catch_range);
             catch_ir = catch_ir.withType(TypeInfo.initErrorUnion());
             const catch_node = try cfg.addNode(catch_ir);
-            try cfg.addEdge(prev_node, catch_node);
+            try cfg.addEdge(operand_end orelse prev_node, catch_node);
 
             // Get the handler from catch node
             const catch_data = data[catch_expr_node].node_and_node;
@@ -73,7 +148,7 @@ pub fn Mixin(comptime _Builder: type) type {
 
             // Error path: process handler if present, then go to return
             if (handler_ast != 0) {
-                const handler_result = try self.processNode(cfg, source, handler_ast, catch_node);
+                const handler_result = try self.processNode(cfg, source, handlerNodeToBuild(tree, handler_ast), catch_node);
 
                 if (handler_result.last) |handler_end| {
                     // Handler produced nodes - mark edge from catch to handler as error edge
@@ -142,11 +217,16 @@ pub fn Mixin(comptime _Builder: type) type {
             // Catch expression in var decl initializer:
             //   prev -> catch_node -> var_decl_node
             //   catch_node has success and error paths that both lead to var_decl
+            //   A guarded operand that is a `catch` of its own is built first,
+            //   so the arm it ran is recorded on a node of its own; both of
+            //   its arms reach that expression's merge, which is the node
+            //   catch_node hangs off.
+            const operand_end = try buildOperandCatch(self, cfg, source, catch_init_node, prev_node);
             var catch_ir = IrNode.initFull(.catch_expr, catch_init_node, catch_range);
             // Catch expressions handle error unions
             catch_ir = catch_ir.withType(TypeInfo.initErrorUnion());
             const catch_node = try cfg.addNode(catch_ir);
-            try cfg.addEdge(prev_node, catch_node);
+            try cfg.addEdge(operand_end orelse prev_node, catch_node);
 
             // Get the RHS (catch handler body) from the catch node
             // For catch nodes, data is node_and_node where [0] is LHS (operand), [1] is RHS (handler)
@@ -164,7 +244,7 @@ pub fn Mixin(comptime _Builder: type) type {
 
             // Error path: process handler if present, then go to var decl
             if (handler_ast != 0) {
-                const handler_result = try self.processNode(cfg, source, handler_ast, catch_node);
+                const handler_result = try self.processNode(cfg, source, handlerNodeToBuild(tree, handler_ast), catch_node);
 
                 if (handler_result.last) |handler_end| {
                     // Handler produced nodes - mark edge from catch to handler as error edge
@@ -230,11 +310,15 @@ pub fn Mixin(comptime _Builder: type) type {
             const catch_range = try source_range.getSourceRange(source, catch_expr_node);
             const data = tree.nodes.items(.data);
 
-            // Assignment with catch expression
+            // Assignment with catch expression. A guarded operand that is a
+            // `catch` of its own is built first, so the arm it ran is
+            // recorded on a node of its own; both of its arms reach that
+            // expression's merge, which is the node this one hangs off.
+            const operand_end = try buildOperandCatch(self, cfg, source, catch_expr_node, prev_node);
             var catch_ir = IrNode.initFull(.catch_expr, catch_expr_node, catch_range);
             catch_ir = catch_ir.withType(TypeInfo.initErrorUnion());
             const catch_node = try cfg.addNode(catch_ir);
-            try cfg.addEdge(prev_node, catch_node);
+            try cfg.addEdge(operand_end orelse prev_node, catch_node);
 
             // Get the handler from catch node
             const catch_data = data[catch_expr_node].node_and_node;
@@ -248,7 +332,7 @@ pub fn Mixin(comptime _Builder: type) type {
 
             // Error path: process handler if present, then go to assign
             if (handler_ast != 0) {
-                const handler_result = try self.processNode(cfg, source, handler_ast, catch_node);
+                const handler_result = try self.processNode(cfg, source, handlerNodeToBuild(tree, handler_ast), catch_node);
 
                 if (handler_result.last) |handler_end| {
                     // Handler produced nodes - mark edge from catch to handler as error edge
@@ -317,11 +401,16 @@ pub fn Mixin(comptime _Builder: type) type {
             //   prev_node -> catch_node
             //   catch_node --[catch_success]--> merge_node (value is unwrapped)
             //   catch_node --[catch_error]--> handler_body -> merge_node
+            //   A guarded operand that is a `catch` of its own is built first,
+            //   so the arm it ran is recorded on a node of its own; both of
+            //   its arms reach that expression's merge, which is the node
+            //   catch_node hangs off.
+            const operand_end = try buildOperandCatch(self, cfg, source, ast_node, prev_node);
             var catch_ir = IrNode.initFull(.catch_expr, ast_node, range);
             // Catch expressions handle error unions
             catch_ir = catch_ir.withType(TypeInfo.initErrorUnion());
             const catch_node = try cfg.addNode(catch_ir);
-            try cfg.addEdge(prev_node, catch_node);
+            try cfg.addEdge(operand_end orelse prev_node, catch_node);
 
             // Get the RHS (catch handler body) from the catch node
             // For catch nodes, data is node_and_node where [0] is LHS (operand), [1] is RHS (handler)
@@ -336,7 +425,7 @@ pub fn Mixin(comptime _Builder: type) type {
 
             // Error path: go to handler, then to merge
             if (handler_ast != 0) {
-                const handler_result = try self.processNode(cfg, source, handler_ast, catch_node);
+                const handler_result = try self.processNode(cfg, source, handlerNodeToBuild(tree, handler_ast), catch_node);
 
                 if (handler_result.last) |handler_end| {
                     // Handler produced nodes - mark edge from catch to handler as error edge

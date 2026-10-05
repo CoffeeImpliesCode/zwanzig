@@ -14,7 +14,6 @@ fn example() !void {
     const buf = try allocator.alloc(u8, 1);
     var owner = Owner{ .allocator = allocator, .buf = buf };
     defer owner.deinit(allocator);
-    _ = owner;
 }
 
 // CONFIG: {"resource_models":[{"kind":"free_owned","method_name":"deinit"}]}

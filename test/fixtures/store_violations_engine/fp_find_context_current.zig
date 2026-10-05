@@ -11,7 +11,7 @@ const Context = struct {
 };
 
 fn findContext(allocator: std.mem.Allocator, start: []const u8) !?Context {
-    var current = try allocator.dupe(u8, start);
+    const current = try allocator.dupe(u8, start);
     errdefer allocator.free(current);
 
     if (current.len == 0) {

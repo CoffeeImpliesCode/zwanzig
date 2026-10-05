@@ -29,10 +29,19 @@ const ignored_dirs = [_][]const u8{
     ".jj",
 };
 
+/// Upper bound on how deep the recursive walk descends. A directory can never
+/// contain itself, so a cycle can only enter through a symlink, and the compat
+/// layer reports a symlink with the same `.other` as an untyped entry - see
+/// `resolveUnknownKind`. This bound ends such a cycle instead of walking it
+/// forever; no real source tree comes anywhere near it.
+const max_walk_depth = 64;
+
 /// Collects the `.zig` files selected by `paths`. A directory path is walked
-/// recursively, skipping the subdirectories named in `ignored_dirs`. A file path
-/// is selected as given, even when it lies inside a skipped directory. An empty
-/// `paths` scans the current directory.
+/// recursively, skipping the subdirectories named in `ignored_dirs`. An entry
+/// whose kind the filesystem did not report is resolved with a stat instead of
+/// skipped, so a filesystem that answers `DT_UNKNOWN` still yields every file
+/// (`resolveUnknownKind`). A file path is selected as given, even when it lies
+/// inside a skipped directory. An empty `paths` scans the current directory.
 pub fn discoverFiles(
     io_context: *compat.Context,
     allocator: std.mem.Allocator,
@@ -79,7 +88,7 @@ fn walkDirectory(
     files: *std.ArrayList([]const u8),
     base_path: []const u8,
 ) FileDiscoveryError!void {
-    try walkDirectoryRecursive(io_context, allocator, files, base_path, null);
+    try walkDirectoryRecursive(io_context, allocator, files, base_path, null, 0);
 }
 
 fn walkDirectoryRecursive(
@@ -88,6 +97,7 @@ fn walkDirectoryRecursive(
     files: *std.ArrayList([]const u8),
     base_path: []const u8,
     relative_path: ?[]const u8,
+    depth: usize,
 ) FileDiscoveryError!void {
     const open_path = if (relative_path) |rel|
         std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, rel }) catch return FileDiscoveryError.OutOfMemory
@@ -109,9 +119,22 @@ fn walkDirectoryRecursive(
     while (true) {
         const entry = compat.nextDir(io_context, &dir) catch return FileDiscoveryError.AccessDenied;
         if (entry) |e| {
-            if (e.kind == .directory) {
+            // An entry the filesystem declined to type is resolved rather
+            // than skipped: `resolveUnknownKind` says why that is not a loss
+            // of coverage.
+            var kind = e.kind;
+            if (kind == .other) {
+                const resolved = try resolveUnknownKind(io_context, allocator, base_path, relative_path, e.name);
+                kind = resolved orelse continue;
+            }
+
+            if (kind == .directory) {
                 if (shouldIgnoreDir(e.name)) {
                     log.debug("walk: skip dir {s}", .{e.name});
+                    continue;
+                }
+                if (depth >= max_walk_depth) {
+                    log.debug("walk: depth {d} reached, not entering {s}/{s}", .{ max_walk_depth, dir_to_open, e.name });
                     continue;
                 }
                 const new_relative = if (relative_path) |rel|
@@ -121,12 +144,9 @@ fn walkDirectoryRecursive(
                 defer allocator.free(new_relative);
 
                 log.debug("walk: enter dir {s}", .{new_relative});
-                try walkDirectoryRecursive(io_context, allocator, files, base_path, new_relative);
-            } else if (e.kind == .file and isZigFile(e.name)) {
-                const full_path = if (relative_path) |rel|
-                    std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ base_path, rel, e.name }) catch return FileDiscoveryError.OutOfMemory
-                else
-                    std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, e.name }) catch return FileDiscoveryError.OutOfMemory;
+                try walkDirectoryRecursive(io_context, allocator, files, base_path, new_relative, depth + 1);
+            } else if (kind == .file and isZigFile(e.name)) {
+                const full_path = try entryPath(allocator, base_path, relative_path, e.name);
 
                 if (std.mem.eql(u8, base_path, ".")) {
                     allocator.free(full_path);
@@ -151,6 +171,65 @@ fn walkDirectoryRecursive(
             break;
         }
     }
+}
+
+/// The path of `name` as the walk reaches it, built the same way whether or
+/// not the walk has descended below `base_path` yet.
+fn entryPath(
+    allocator: std.mem.Allocator,
+    base_path: []const u8,
+    relative_path: ?[]const u8,
+    name: []const u8,
+) FileDiscoveryError![]u8 {
+    const printed = if (relative_path) |rel|
+        std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ base_path, rel, name })
+    else
+        std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, name });
+    return printed catch return FileDiscoveryError.OutOfMemory;
+}
+
+/// Resolves the kind of an entry whose type the filesystem did not report, and
+/// returns null when the entry cannot be classified at all.
+///
+/// Not every filesystem fills in an entry's type while it reads a directory:
+/// NFS and other network mounts answer `DT_UNKNOWN`, and the compat layer hands
+/// every kind that is neither a file nor a directory over as `.other`. Skipping
+/// those entries is not a conservative choice but a silent loss of coverage -
+/// on this repository 31 of the 111 sources under `src/` were never opened, the
+/// cross-file references only they held went missing, and that surfaced as
+/// findings against live declarations. Resolving the kind is what makes those
+/// entries visible again, so "simplifying" this back into skipping `.other`
+/// reintroduces the under-analysis.
+///
+/// The compat layer maps `DT_LNK` to `.other` just as it maps `DT_UNKNOWN`, and
+/// `compat.stat` follows symlinks, so a resolved `.directory` may be a symlink
+/// to one. Telling the two apart needs a no-follow stat the compat layer does
+/// not expose, so `max_walk_depth` is what keeps a symlink cycle finite.
+///
+/// A stat that fails is not an error: the entry is skipped and the walk
+/// continues, so an entry that cannot be classified never turns into a failure
+/// the CLI reports against a file.
+fn resolveUnknownKind(
+    io_context: *compat.Context,
+    allocator: std.mem.Allocator,
+    base_path: []const u8,
+    relative_path: ?[]const u8,
+    name: []const u8,
+) FileDiscoveryError!?compat.EntryKind {
+    const path = try entryPath(allocator, base_path, relative_path, name);
+    defer allocator.free(path);
+
+    const kind = compat.stat(io_context, path) catch |err| {
+        log.debug("walk: cannot classify {s}: {s}", .{ path, @errorName(err) });
+        return null;
+    };
+
+    // A stat that resolves to neither a file nor a directory - a device, a
+    // socket, a dangling link - holds nothing to analyse.
+    return switch (kind) {
+        .file, .directory => kind,
+        .other => null,
+    };
 }
 
 fn shouldIgnoreDir(name: []const u8) bool {
@@ -287,6 +366,63 @@ test "isZigFile" {
     try std.testing.expect(!isZigFile("main.c"));
     try std.testing.expect(!isZigFile("main.zig.bak"));
     try std.testing.expect(!isZigFile(""));
+}
+
+// The unknown-kind path cannot be provoked from a test without a fake
+// filesystem: the kind comes from the host's own `d_type`, so on a filesystem
+// that reports types every entry arrives already typed and the resolution
+// never runs. What can be tested directly is the resolution itself, which is
+// where the coverage belongs - these assertions fail if the stat stops
+// resolving, if it resolves to the wrong kind, or if a failed stat starts
+// aborting the walk instead of skipping the entry.
+test "resolveUnknownKind: a stat decides the kind, and a stat that fails skips" {
+    const allocator = std.testing.allocator;
+    const io_context = compat.defaultContext();
+
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+
+    try temp_dir.writeFile("item.zig", "pub const marker: u8 = 0;\n");
+    try temp_dir.writeFile("notes.txt", "not a source\n");
+    var nested_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const nested_path = try std.fmt.bufPrint(&nested_buffer, "{s}/nested", .{temp_dir.path()});
+    try compat.makePath(io_context, nested_path);
+    try temp_dir.writeFile("nested/item.zig", "pub const nested_marker: u8 = 1;\n");
+
+    const root = temp_dir.path();
+
+    // A directory and a regular file both resolve, from the top of the walk
+    // and from below it.
+    try std.testing.expectEqual(
+        compat.EntryKind.directory,
+        (try resolveUnknownKind(io_context, allocator, root, null, "nested")).?,
+    );
+    try std.testing.expectEqual(
+        compat.EntryKind.file,
+        (try resolveUnknownKind(io_context, allocator, root, null, "item.zig")).?,
+    );
+    try std.testing.expectEqual(
+        compat.EntryKind.file,
+        (try resolveUnknownKind(io_context, allocator, root, "nested", "item.zig")).?,
+    );
+
+    // Resolution reports the entry's kind, not whether it is a source: the
+    // `.zig` filter stays with the walk.
+    try std.testing.expectEqual(
+        compat.EntryKind.file,
+        (try resolveUnknownKind(io_context, allocator, root, null, "notes.txt")).?,
+    );
+
+    // An entry that cannot be stat'd is skipped, never reported as an error
+    // the CLI would blame on a file.
+    try std.testing.expectEqual(
+        @as(?compat.EntryKind, null),
+        try resolveUnknownKind(io_context, allocator, root, null, "absent.zig"),
+    );
+    try std.testing.expectEqual(
+        @as(?compat.EntryKind, null),
+        try resolveUnknownKind(io_context, allocator, root, null, "nested/absent/deeper.zig"),
+    );
 }
 
 test "discoverFiles: explicit files" {

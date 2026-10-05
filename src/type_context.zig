@@ -4,6 +4,7 @@ const Source = @import("source.zig").Source;
 const zir_bridge_mod = @import("zir_bridge.zig");
 const call_resolver = @import("analysis/call_resolver.zig");
 const import_resolver = @import("analysis/import_resolver.zig");
+const LexicalIndex = @import("analysis/lexical_index.zig").LexicalIndex;
 
 pub const TypeInfo = zir_bridge_mod.TypeInfo;
 pub const DeclInfo = zir_bridge_mod.DeclInfo;
@@ -211,6 +212,9 @@ pub const TypeContext = struct {
             .call, .call_comma, .call_one, .call_one_comma => self.getCallExpressionType(tree, ast_node, use_known_methods, use_cache),
             .@"try" => self.getTryExpressionType(tree, ast_node, use_known_methods, use_cache),
             .@"catch" => self.getCatchExpressionType(tree, ast_node, use_known_methods, use_cache),
+            // Preserve the handle type through parenthesized catch handlers
+            // so deferred cleanup can identify the receiver.
+            .grouped_expression => self.getExpressionTypeInternal(@intFromEnum(tree.nodes.items(.data)[ast_node].node_and_token[0]), use_known_methods, use_cache),
             .@"orelse" => self.getOrelseExpressionType(tree, ast_node, use_known_methods, use_cache),
             .@"switch", .switch_comma => self.getSwitchExpressionType(tree, ast_node, use_known_methods, use_cache),
             .error_value => TypeInfo.initErrorUnion(),
@@ -332,12 +336,60 @@ pub const TypeContext = struct {
         return call_resolver.resolvedTypesEqual(left_resolved, right_resolved);
     }
 
+    /// What a `catch` binds when its failure arm completes with a value.
+    ///
+    /// An arm that hands back the success value itself binds that value, and
+    /// an optional binds the optional: `?T` is the arm saying "nothing
+    /// happened here", which is a fact about the arm and not about `T`.
+    ///
+    /// A fallible arm binds its whole error union. `a catch b` where `b` is
+    /// `E2!T` and `a`'s payload is `T` is `E2!T` - the success value is
+    /// coerced into the failure arm's union, not substituted for it - and
+    /// that wrapper is what the next `catch` in the chain opens. That is what
+    /// `A catch B catch return` turns on: the nesting is left-associative, so
+    /// the inner catch is the outer one's success arm, and the outer catch
+    /// must find a union there to open.
+    ///
+    /// A fallible arm whose payload is anything else does not bind.
+    /// `E1!File catch E2!Dir` peer-resolves to a type with no name here, and
+    /// an unresolved peer keeps the binding unknown rather than picking one
+    /// of the two payloads.
     fn catchResultType(self: *TypeContext, success: TypeInfo, fallback: TypeInfo) ?TypeInfo {
-        if (self.sameTypeIdentity(success, fallback)) return success;
-        if (fallback.kind == .optional and self.sameTypeIdentity(success, self.getPayloadType(fallback))) {
+        if (self.sameCatchArmType(success, fallback)) return success;
+        if (fallback.kind == .optional and self.sameCatchArmType(success, self.getPayloadType(fallback))) {
+            return fallback;
+        }
+        if (fallback.kind == .error_union and self.sameCatchArmType(success, self.getPayloadType(fallback))) {
             return fallback;
         }
         return null;
+    }
+
+    /// Agreement between what a `catch` binds and what its failure arm hands back.
+    ///
+    /// Declared identity first: two arms that name a real declaration are
+    /// compared by it, and nothing here weakens that. When neither side has a
+    /// declaration the only evidence left is the name a verified `std`
+    /// signature model gave the type, so two arms whose types carry the same
+    /// kind and the same modeled name name one nominal type. This is where a
+    /// modeled handle and the same handle modelled again meet - both opens of
+    /// `open() catch other()`, and the payload of an open against a fallible
+    /// arm whose own payload is that same modeled open.
+    ///
+    /// An `.unknown` kind answers false: it is a name with no type behind it,
+    /// and two of them agreeing is not evidence. So does a type with an AST
+    /// node behind it on either side: real identity was available, it
+    /// disagreed, and two distinct declarations routinely share a spelling.
+    /// A type with no name at all carries nothing to compare.
+    fn sameCatchArmType(self: *TypeContext, left: TypeInfo, right: TypeInfo) bool {
+        if (self.sameTypeIdentity(left, right)) return true;
+        if (left.kind == .unknown or right.kind == .unknown) return false;
+        if (left.kind != right.kind) return false;
+        if (left.type_node != null or right.type_node != null) return false;
+        if (left.type_ast != null or right.type_ast != null) return false;
+        const left_name = left.type_str orelse return false;
+        const right_name = right.type_str orelse return false;
+        return std.mem.eql(u8, left_name, right_name);
     }
 
     /// Verified std.Io Future methods have no source type node, so compare their
@@ -746,6 +798,12 @@ pub const TypeContext = struct {
     }
 
     /// Get return type for known standard library methods.
+    ///
+    /// A modeled handle names a concrete `std` type, so it carries that
+    /// type's kind as its payload instead of leaving the payload unknown.
+    /// `ZirBridge.extractTypeFromAstNode` already answers these very names
+    /// with these kinds, and an open that unwraps to something else than a
+    /// written `std.fs.File` annotation unwraps to is not the same type.
     fn getKnownMethodReturnType(self: *TypeContext, method_name: []const u8) ?TypeInfo {
         _ = self;
 
@@ -753,17 +811,17 @@ pub const TypeContext = struct {
         if (std.mem.eql(u8, method_name, "openFile") or
             std.mem.eql(u8, method_name, "createFile"))
         {
-            return .{ .kind = .error_union, .type_str = "std.fs.File" };
+            return .{ .kind = .error_union, .type_str = "std.fs.File", .payload_kind = .@"struct" };
         }
 
         // Directory opening methods - return std.fs.Dir
         if (std.mem.eql(u8, method_name, "openDir")) {
-            return .{ .kind = .error_union, .type_str = "std.fs.Dir" };
+            return .{ .kind = .error_union, .type_str = "std.fs.Dir", .payload_kind = .@"struct" };
         }
 
         // Iterable directory methods
         if (std.mem.eql(u8, method_name, "openIterableDir")) {
-            return .{ .kind = .error_union, .type_str = "std.fs.IterableDir" };
+            return .{ .kind = .error_union, .type_str = "std.fs.IterableDir", .payload_kind = .@"struct" };
         }
 
         // Known methods that return error unions without specific type info
@@ -807,7 +865,14 @@ pub const TypeContext = struct {
     }
 
     /// Get the type of a catch expression.
-    /// Both the successful value and the fallback must have a compatible type.
+    ///
+    /// The failure arm decides what the binding holds. An arm that cannot
+    /// complete hands it nothing, so the result is the success arm's value;
+    /// `null` hands it an optional; anything else has to be that value, an
+    /// optional of it, or a fallible arm whose own payload is it - and such
+    /// an arm hands over its error union whole rather than the payload
+    /// inside, which is the union the next `catch` in the chain opens.
+    /// `catchResultType` is where that choice is made and bounded.
     fn getCatchExpressionType(
         self: *TypeContext,
         tree: *const std.zig.Ast,
@@ -817,17 +882,26 @@ pub const TypeContext = struct {
     ) ?TypeInfo {
         const pair = tree.nodes.items(.data)[catch_node].node_and_node;
         const success_node = @intFromEnum(pair[0]);
-        const left = self.getExpressionTypeInternal(success_node, use_known_methods, use_cache) orelse return null;
-        const success = if (left.kind == .error_union) self.getPayloadType(left) else return null;
         const fallback_node = @intFromEnum(pair[1]);
-        switch (tree.nodes.items(.tag)[fallback_node]) {
-            .@"return", .unreachable_literal => return success,
-            .@"break", .@"continue" => {
-                if (tree.nodes.items(.data)[fallback_node].opt_token_and_opt_node[0] == .none)
-                    return success;
-            },
-            else => {},
+        const left = self.getExpressionTypeInternal(success_node, use_known_methods, use_cache) orelse return null;
+        // A `catch` is written over an error union and yields its payload, so
+        // opening the operand's union is the whole of what the success arm
+        // contributes. `A catch B` where `B` is `E2!T` is `E2!T` (see
+        // `catchResultType`), so the operand of the next `catch` in a chain
+        // arrives wrapped and is opened here. An operand that is not a union
+        // is not something a `catch` can be written over; answering none
+        // leaves the binding untyped rather than reading a bare value as if it
+        // had arrived inside one.
+        const success = if (left.kind == .error_union) self.getPayloadType(left) else return null;
+        if (isNullLiteral(tree, fallback_node)) {
+            // `E!T catch null` binds an optional. The failure arm holds no
+            // handle at all, and the optional is how the binding says so;
+            // leaving it unknown makes every `if (maybe) |file|` guard read
+            // as untyped, and the close written inside such a guard looks
+            // like no release at all.
+            return optionalOf(success);
         }
+        if (catchFailureSuppliesNoValue(tree, fallback_node, catch_failure_walk_frames)) return success;
         // Synthetic Future results lack AST type nodes.  This branch proves only
         // their non-null value family, never generic nominal type identity.
         if (success.kind == .@"struct" and
@@ -850,6 +924,87 @@ pub const TypeContext = struct {
             if (self.catchResultType(success, fallback)) |result| return result;
         }
         return null;
+    }
+
+    /// Bound on the handler walk: deep enough for the nested blocks a catch
+    /// failure arm is written with, and no deeper. A chain past it answers
+    /// false rather than guessing.
+    pub const catch_failure_walk_frames: u8 = 32;
+
+    /// True when a `catch` failure arm cannot hand the binding a value.
+    ///
+    /// `catch |err| { log(); return err; }` returns before the binding
+    /// exists: the open it guards failed, so this path produces the
+    /// handler's exit and nothing else, and only the success arm's value
+    /// reaches the code after the expression. A handler that supplies a
+    /// value of its own - `catch null`, `catch 0`, `break :blk other` - is
+    /// not this one and keeps its own type. The walk is bounded; a chain
+    /// past the budget answers false and leaves the arm to be typed on its
+    /// own terms.
+    ///
+    /// The engine asks the same question about resources rather than types:
+    /// a failure arm that hands back a handle has acquired one, so its
+    /// obligation has to be recorded.
+    pub fn catchFailureSuppliesNoValue(tree: *const std.zig.Ast, node: u32, depth: u8) bool {
+        if (depth == 0) return false;
+        // Parentheses are not a different arm: `catch (return)` supplies
+        // nothing exactly as `catch return` does.
+        const arm = unwrapGroupedArm(tree, node);
+        if (arm >= tree.nodes.len) return false;
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        return switch (tags[arm]) {
+            .@"return", .unreachable_literal => true,
+            .@"break", .@"continue" => datas[arm].opt_token_and_opt_node[0] == .none,
+            // A block hands on its last statement's value, so a handler whose
+            // body ends without one cannot complete and supplies nothing.
+            .block, .block_semicolon, .block_two, .block_two_semicolon => blk: {
+                var inline_statements: [2]u32 = undefined;
+                const statements = ast_walk.getBlockStatements(tree, arm, &inline_statements) orelse break :blk false;
+                if (statements.len == 0) break :blk false;
+                break :blk catchFailureSuppliesNoValue(tree, statements[statements.len - 1], depth - 1);
+            },
+            else => false,
+        };
+    }
+
+    /// Skip parentheses without consuming the catch-handler depth budget.
+    fn unwrapGroupedArm(tree: *const std.zig.Ast, node: u32) u32 {
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        var arm = node;
+        while (arm < tags.len and tags[arm] == .grouped_expression) {
+            arm = @intFromEnum(datas[arm].node_and_token[0]);
+        }
+        return arm;
+    }
+
+    /// True when a node is the `null` literal.
+    ///
+    /// `null` has no node tag of its own: the parser files it under
+    /// `.identifier`, so the token spelling is what separates the literal
+    /// from an ordinary identifier sharing that node shape. `catch (null)`
+    /// binds the optional that `catch null` binds.
+    fn isNullLiteral(tree: *const std.zig.Ast, node: u32) bool {
+        const literal = unwrapGroupedArm(tree, node);
+        const tags = tree.nodes.items(.tag);
+        if (literal >= tags.len or tags[literal] != .identifier) return false;
+        const token = tree.nodes.items(.main_token)[literal];
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(token), "null");
+    }
+
+    /// `?T` over an already-resolved `T`.
+    ///
+    /// The payload stays reachable through `payload_node`/`payload_kind` and
+    /// keeps the inner spelling, so `getPayloadType` still recovers `T` and a
+    /// guard written over the optional still knows what it holds.
+    fn optionalOf(inner: TypeInfo) TypeInfo {
+        var optional = inner;
+        optional.kind = .optional;
+        optional.payload_kind = inner.kind;
+        return optional;
     }
 
     /// Get the type of an identifier by looking up its declaration.
@@ -1003,6 +1158,17 @@ pub const TypeContext = struct {
         return self.getTypeFromTree(tree, ast_node, 0);
     }
 
+    /// Immutable syntax facts for `tree` when it is this source's own AST.
+    /// Ownership stays with the source, so the answer borrows and must not
+    /// outlive it. Null keeps the unindexed resolution behavior: a foreign tree,
+    /// a source that cannot parse, and a syntax index that cannot be built all
+    /// answer conservatively instead of failing a type query.
+    pub fn lexicalIndexForTree(self: *TypeContext, tree: *const std.zig.Ast) ?*const LexicalIndex {
+        const source_tree = self.source.ast() catch return null;
+        if (tree != source_tree) return null;
+        return self.source.lexicalIndex() catch null;
+    }
+
     fn resolverForTree(self: *TypeContext, tree: *const std.zig.Ast, local: *[1]import_resolver.File) ?call_resolver.ProjectTypeResolver {
         if (self.project_resolver) |project| {
             if (project.files[project.file_index].tree == tree) return project;
@@ -1012,7 +1178,11 @@ pub const TypeContext = struct {
             return null;
         }
         if (tree != (self.source.ast() catch return null)) return null;
-        local.* = .{.{ .path = self.source.file_path, .tree = tree }};
+        local.* = .{.{
+            .path = self.source.file_path,
+            .tree = tree,
+            .lexical_index = self.lexicalIndexForTree(tree),
+        }};
         return .{ .files = local, .file_index = 0 };
     }
 
@@ -1735,4 +1905,147 @@ test "strict expression queries remain independent of heuristic results" {
         return;
     }
     return error.MissingCall;
+}
+
+test "a syntax index that cannot be built keeps unindexed answers" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Value = struct {
+        \\    self: @This() = .{},
+        \\    pub fn make() Value { return .{}; }
+        \\};
+        \\fn run() void {
+        \\    const value: Value = .make();
+        \\    _ = value;
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    // A borrowed AST leaves index construction as the first allocation the
+    // source makes, so failing it must leave resolution working from the AST.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    var source = Source.initParsed(failing.allocator(), "index-oom.zig", &tree);
+    defer source.deinit();
+    var context = TypeContext.init(allocator, &source);
+    defer context.deinit();
+    var files: [1]import_resolver.File = undefined;
+    const resolver = context.resolverForTree(&tree, &files) orelse return error.MissingResolver;
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    const indexed_files = [_]import_resolver.File{.{ .path = source.file_path, .tree = &tree, .lexical_index = &index }};
+    const indexed: call_resolver.ProjectTypeResolver = .{ .files = &indexed_files, .file_index = 0 };
+    // The expected container is the one the `Value` declaration creates, so the
+    // fallback is judged on the answer rather than on the metadata it used.
+    var value_container: ?u32 = null;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (!import_resolver.isVarDeclTag(tag)) continue;
+        const full = tree.fullVarDecl(@enumFromInt(node)) orelse continue;
+        const name_token = full.ast.mut_token + 1;
+        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) continue;
+        if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), "Value")) continue;
+        value_container = @intFromEnum(full.ast.init_node.unwrap() orelse return error.MissingContainerInitializer);
+        break;
+    }
+    const expected_container = value_container orelse return error.MissingValueContainer;
+    var this_nodes: usize = 0;
+    var value_names: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (std.mem.eql(u8, tree.tokenSlice(tree.nodes.items(.main_token)[node]), "@This")) {
+            const resolved = resolver.resolveTypeNode(node) orelse return error.MissingThisType;
+            try std.testing.expectEqual(@as(usize, 0), resolved.file_index);
+            try std.testing.expectEqual(@as(?u32, expected_container), resolved.container_node);
+            try std.testing.expectEqualDeep(indexed.resolveTypeNode(node), resolved);
+            this_nodes += 1;
+            continue;
+        }
+        if (tag != .identifier) continue;
+        if (!std.mem.eql(u8, import_resolver.identifierName(&tree, node) orelse continue, "value")) continue;
+        const resolved_type = resolver.resolveExprType(node) orelse return error.MissingValueType;
+        try std.testing.expectEqualStrings("Value", resolved_type.type_name orelse return error.MissingTypeName);
+        try std.testing.expectEqual(@as(usize, 0), resolved_type.file_index);
+        try std.testing.expectEqual(@as(?u32, expected_container), resolved_type.container_node);
+        try std.testing.expectEqualDeep(indexed.resolveExprType(node), resolved_type);
+        value_names += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), this_nodes);
+    try std.testing.expectEqual(@as(usize, 1), value_names);
+}
+
+test "single-file resolution matches plain project resolution" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Other = struct { value: u8 };
+        \\const Wrapped = struct {
+        \\    const inner = Other;
+        \\    fn init() Wrapped { return .{}; }
+        \\    fn use() void {
+        \\        const inner: u8 = 1;
+        \\        _ = inner.value;
+        \\        _ = inner.outer();
+        \\    }
+        \\    fn shallow() void {
+        \\        _ = inner.outer();
+        \\    }
+        \\};
+        \\fn run() void {
+        \\    const wrapped: Wrapped = .init();
+        \\    const aliased: Wrapped = wrapped;
+        \\    _ = aliased;
+        \\}
+    ;
+    var source = Source.init(allocator, "parity.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    const files = [_]import_resolver.File{.{ .path = source.file_path, .tree = tree }};
+    // One context resolves from the source's syntax index, the other from the
+    // same tree through a project file that carries none.
+    var indexed = TypeContext.init(allocator, &source);
+    defer indexed.deinit();
+    var plain = TypeContext.init(allocator, &source);
+    defer plain.deinit();
+    plain.project_resolver = .{ .files = &files, .file_index = 0 };
+    var resolved_names: usize = 0;
+    const Compare = struct {
+        fn types(expected_type: ?TypeInfo, actual_type: ?TypeInfo) !void {
+            try std.testing.expectEqual(expected_type != null, actual_type != null);
+            if (expected_type) |expected_info| {
+                const actual_info = actual_type orelse return error.MissingActualType;
+                try std.testing.expectEqual(expected_info.kind, actual_info.kind);
+                try std.testing.expectEqual(expected_info.size_bits, actual_info.size_bits);
+                try std.testing.expectEqual(expected_info.is_signed, actual_info.is_signed);
+                try std.testing.expectEqual(expected_info.is_comptime, actual_info.is_comptime);
+                try std.testing.expectEqualDeep(expected_info.type_str, actual_info.type_str);
+                try std.testing.expectEqualDeep(expected_info.sentinel, actual_info.sentinel);
+                try std.testing.expectEqual(expected_info.payload_kind, actual_info.payload_kind);
+                try std.testing.expectEqual(expected_info.type_node, actual_info.type_node);
+                try std.testing.expectEqual(expected_info.payload_node, actual_info.payload_node);
+                // Type nodes identify declarations within their owning AST.
+                try std.testing.expectEqual(expected_info.type_ast, actual_info.type_ast);
+            }
+        }
+    };
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (tag != .identifier) continue;
+        const identifier: u32 = @intCast(node);
+        const name = import_resolver.identifierName(tree, node) orelse continue;
+        const heuristic = indexed.getExpressionType(identifier);
+        try Compare.types(
+            plain.getExpressionType(identifier),
+            heuristic,
+        );
+        try Compare.types(
+            plain.getExpressionTypeStrict(identifier),
+            indexed.getExpressionTypeStrict(identifier),
+        );
+        // Parity alone would also pass if both paths answered nothing, so the
+        // named locals must resolve to their declared container type.
+        const is_container_local = std.mem.eql(u8, name, "wrapped") or std.mem.eql(u8, name, "aliased");
+        if (is_container_local) {
+            const info = heuristic orelse return error.MissingType;
+            try std.testing.expectEqual(TypeInfo.TypeKind.@"struct", info.kind);
+            resolved_names += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), resolved_names);
 }

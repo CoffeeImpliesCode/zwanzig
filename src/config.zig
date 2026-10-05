@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const RuleFilter = @import("rule_filter.zig").RuleFilter;
+const Severity = @import("diagnostic.zig").Severity;
 
 /// Resource model kind matching store.zig ResourceKind
 pub const ResourceModelKind = enum {
@@ -53,6 +54,8 @@ pub const Config = struct {
     use_widening: ?bool = null,
     /// Max helper-call depth for stack escape tracking
     escape_max_depth: ?u32 = null,
+    /// Severity of optional-unwrap reports in test declarations; never suppresses them.
+    optional_unwrap_test_severity: ?Severity = null,
     /// Custom resource models for resource tracking
     resource_models: []const ResourceModel = &.{},
     /// Custom escape models for stack escape detection
@@ -75,28 +78,9 @@ pub const Config = struct {
             .none => {},
         }
 
-        // Free resource model strings
-        for (self.resource_models) |model| {
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.return_type) |ty| allocator.free(ty);
-            if (model.fqn) |name| allocator.free(name);
-        }
-        if (self.resource_models.len > 0) {
-            allocator.free(self.resource_models);
-        }
-
-        for (self.escape_models) |model| {
-            if (model.fqn) |name| allocator.free(name);
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.param_indices.len > 0) {
-                allocator.free(model.param_indices);
-            }
-        }
-        if (self.escape_models.len > 0) {
-            allocator.free(self.escape_models);
-        }
+        // Model fields first, then the slices that hold them.
+        freeResourceModels(allocator, self.resource_models);
+        freeEscapeModels(allocator, self.escape_models);
     }
 
     /// Match a call against resource models.
@@ -187,6 +171,56 @@ pub const Config = struct {
         return null;
     }
 };
+
+/// Release every allocation one escape model owns and leave it owning nothing.
+///
+/// A model is only ever released as a whole, so this is the one place that
+/// knows what one costs. `Config.deinit` and both `parseConfig` errdefers go
+/// through `freeEscapeModels`, and the errdefers in `parseEscapeModel` and
+/// `parseEscapeModels` call it directly. `freeMergedConfig` in
+/// src/cli/config_merge.zig owns models without owning a `Config` and reaches
+/// it through the same `freeEscapeModels`, so a field added to `EscapeModel` is
+/// released wherever one is owned.
+fn freeEscapeModel(allocator: std.mem.Allocator, model: *EscapeModel) void {
+    if (model.fqn) |name| allocator.free(name);
+    if (model.method_name) |name| allocator.free(name);
+    if (model.receiver_type) |ty| allocator.free(ty);
+    if (model.param_indices.len > 0) {
+        allocator.free(model.param_indices);
+    }
+    model.* = .{ .captures_into = .@"return" };
+}
+
+/// Release every allocation one resource model owns.
+///
+/// Same contract as `freeEscapeModel`: every path that owns a model reaches it,
+/// `freeMergedConfig` in src/cli/config_merge.zig included.
+fn freeResourceModel(allocator: std.mem.Allocator, model: *ResourceModel) void {
+    if (model.method_name) |name| allocator.free(name);
+    if (model.receiver_type) |ty| allocator.free(ty);
+    if (model.return_type) |ty| allocator.free(ty);
+    if (model.fqn) |name| allocator.free(name);
+}
+
+/// Release every model a parsed list owns, and the list itself. An empty list
+/// is the shared empty literal rather than an allocation.
+///
+/// A release path outside this file must call this rather than free the
+/// fields by hand, or a field added to `EscapeModel` leaks on that path.
+pub fn freeEscapeModels(allocator: std.mem.Allocator, models: []const EscapeModel) void {
+    for (models) |model| freeEscapeModel(allocator, @constCast(&model));
+    if (models.len > 0) allocator.free(models);
+}
+
+/// Release every model a parsed list owns, and the list itself. An empty list
+/// is the shared empty literal rather than an allocation.
+///
+/// A release path outside this file must call this rather than free the
+/// fields by hand, or a field added to `ResourceModel` leaks on that path.
+pub fn freeResourceModels(allocator: std.mem.Allocator, models: []const ResourceModel) void {
+    for (models) |model| freeResourceModel(allocator, @constCast(&model));
+    if (models.len > 0) allocator.free(models);
+}
 
 pub const ConfigError = error{
     FileNotFound,
@@ -282,42 +316,33 @@ pub fn parseConfig(allocator: std.mem.Allocator, content: []const u8) ConfigErro
         escape_max_depth = std.math.cast(u32, value.integer) orelse return ConfigError.InvalidConfigFormat;
     }
 
+    var optional_unwrap_test_severity: ?Severity = null;
+    if (obj.get("optional_unwrap_test_severity")) |value| {
+        if (value != .string) return ConfigError.InvalidConfigFormat;
+        optional_unwrap_test_severity = if (std.mem.eql(u8, value.string, "hint"))
+            .hint
+        else if (std.mem.eql(u8, value.string, "warning"))
+            .warning
+        else if (std.mem.eql(u8, value.string, "error"))
+            .err
+        else
+            return ConfigError.InvalidConfigFormat;
+    }
+
     // Parse resource_models first so all return paths can include it
     const resource_models_value = obj.get("resource_models");
     var resource_models: []ResourceModel = &.{};
     if (resource_models_value) |rm_value| {
         resource_models = try parseResourceModels(allocator, rm_value);
     }
-    errdefer {
-        for (resource_models) |model| {
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.return_type) |ty| allocator.free(ty);
-            if (model.fqn) |name| allocator.free(name);
-        }
-        if (resource_models.len > 0) {
-            allocator.free(resource_models);
-        }
-    }
+    errdefer freeResourceModels(allocator, resource_models);
 
     const escape_models_value = obj.get("escape_models");
     var escape_models: []EscapeModel = &.{};
     if (escape_models_value) |em_value| {
         escape_models = try parseEscapeModels(allocator, em_value);
     }
-    errdefer {
-        for (escape_models) |model| {
-            if (model.fqn) |name| allocator.free(name);
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.param_indices.len > 0) {
-                allocator.free(model.param_indices);
-            }
-        }
-        if (escape_models.len > 0) {
-            allocator.free(escape_models);
-        }
-    }
+    errdefer freeEscapeModels(allocator, escape_models);
 
     if (enabled_rules) |rules_value| {
         if (rules_value != .array) {
@@ -344,6 +369,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, content: []const u8) ConfigErro
             .max_states_per_point = max_states_per_point,
             .use_widening = use_widening,
             .escape_max_depth = escape_max_depth,
+            .optional_unwrap_test_severity = optional_unwrap_test_severity,
             .resource_models = resource_models,
             .escape_models = escape_models,
         };
@@ -374,6 +400,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, content: []const u8) ConfigErro
             .max_states_per_point = max_states_per_point,
             .use_widening = use_widening,
             .escape_max_depth = escape_max_depth,
+            .optional_unwrap_test_severity = optional_unwrap_test_severity,
             .resource_models = resource_models,
             .escape_models = escape_models,
         };
@@ -385,9 +412,93 @@ pub fn parseConfig(allocator: std.mem.Allocator, content: []const u8) ConfigErro
         .max_states_per_point = max_states_per_point,
         .use_widening = use_widening,
         .escape_max_depth = escape_max_depth,
+        .optional_unwrap_test_severity = optional_unwrap_test_severity,
         .resource_models = resource_models,
         .escape_models = escape_models,
     };
+}
+
+/// The capture target one escape model names.
+fn escapeCaptureFrom(value: []const u8) ConfigError!EscapeCapture {
+    if (std.mem.eql(u8, value, "return")) return .@"return";
+    if (std.mem.eql(u8, value, "receiver")) return .receiver;
+    if (std.mem.eql(u8, value, "global")) return .global;
+    if (std.mem.eql(u8, value, "thread")) return .thread;
+    return ConfigError.InvalidConfigFormat;
+}
+
+/// The argument indices one escape model captures.
+fn parseEscapeParamIndices(allocator: std.mem.Allocator, param_array: std.json.Array) ConfigError![]u32 {
+    var indices = try allocator.alloc(u32, param_array.items.len);
+    // Keep indices locally owned until the completed model is appended.
+    errdefer allocator.free(indices);
+    for (param_array.items, 0..) |param_item, i| {
+        if (param_item != .integer) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        if (param_item.integer < 0) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        indices[i] = std.math.cast(u32, param_item.integer) orelse {
+            return ConfigError.InvalidConfigFormat;
+        };
+    }
+    return indices;
+}
+
+/// Parse one entry of `escape_models`, owning everything it allocates.
+fn parseEscapeModel(allocator: std.mem.Allocator, item: std.json.Value) ConfigError!EscapeModel {
+    if (item != .object) {
+        return ConfigError.InvalidConfigFormat;
+    }
+    const model_obj = item.object;
+
+    const captures_value = model_obj.get("captures_into") orelse return ConfigError.InvalidConfigFormat;
+    if (captures_value != .string) return ConfigError.InvalidConfigFormat;
+    const captures_into = try escapeCaptureFrom(captures_value.string);
+
+    const param_value = model_obj.get("param_indices") orelse return ConfigError.InvalidConfigFormat;
+    if (param_value != .array) return ConfigError.InvalidConfigFormat;
+    const param_array = param_value.array;
+    if (param_array.items.len == 0) return ConfigError.InvalidConfigFormat;
+
+    const indices = try parseEscapeParamIndices(allocator, param_array);
+
+    var model = EscapeModel{
+        .param_indices = indices,
+        .captures_into = captures_into,
+    };
+    // `model` owns every field from here on, so the one errdefer releases
+    // whatever the fields after it do not hand back themselves.
+    errdefer freeEscapeModel(allocator, &model);
+
+    if (model_obj.get("fqn")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.fqn = try allocator.dupe(u8, v.string);
+    }
+
+    if (model_obj.get("method_name")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.method_name = try allocator.dupe(u8, v.string);
+    }
+
+    if (model_obj.get("receiver_type")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.receiver_type = try allocator.dupe(u8, v.string);
+    }
+
+    const has_match = model.fqn != null or model.method_name != null or model.receiver_type != null;
+    if (!has_match) {
+        return ConfigError.InvalidConfigFormat;
+    }
+
+    return model;
 }
 
 fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) ConfigError![]EscapeModel {
@@ -405,99 +516,72 @@ fn parseEscapeModels(allocator: std.mem.Allocator, value: std.json.Value) Config
 
     errdefer {
         for (models[0..valid_count]) |model| {
-            if (model.fqn) |name| allocator.free(name);
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.param_indices.len > 0) {
-                allocator.free(model.param_indices);
-            }
+            freeEscapeModel(allocator, @constCast(&model));
         }
         allocator.free(models);
     }
 
     for (array.items) |item| {
-        if (item != .object) {
-            return ConfigError.InvalidConfigFormat;
-        }
-
-        const model_obj = item.object;
-
-        const captures_value = model_obj.get("captures_into") orelse return ConfigError.InvalidConfigFormat;
-        if (captures_value != .string) return ConfigError.InvalidConfigFormat;
-        const captures_str = captures_value.string;
-        const captures_into: EscapeCapture = if (std.mem.eql(u8, captures_str, "return"))
-            .@"return"
-        else if (std.mem.eql(u8, captures_str, "receiver"))
-            .receiver
-        else if (std.mem.eql(u8, captures_str, "global"))
-            .global
-        else if (std.mem.eql(u8, captures_str, "thread"))
-            .thread
-        else
-            return ConfigError.InvalidConfigFormat;
-
-        const param_value = model_obj.get("param_indices") orelse return ConfigError.InvalidConfigFormat;
-        if (param_value != .array) return ConfigError.InvalidConfigFormat;
-        const param_array = param_value.array;
-        if (param_array.items.len == 0) return ConfigError.InvalidConfigFormat;
-
-        var indices = try allocator.alloc(u32, param_array.items.len);
-        // Keep indices locally owned until the completed model is appended.
-        errdefer allocator.free(indices);
-        for (param_array.items, 0..) |param_item, i| {
-            if (param_item != .integer) {
-                return ConfigError.InvalidConfigFormat;
-            }
-            if (param_item.integer < 0) {
-                return ConfigError.InvalidConfigFormat;
-            }
-            indices[i] = std.math.cast(u32, param_item.integer) orelse {
-                return ConfigError.InvalidConfigFormat;
-            };
-        }
-
-        var model = EscapeModel{
-            .param_indices = indices,
-            .captures_into = captures_into,
-        };
-
-        if (model_obj.get("fqn")) |v| {
-            if (v != .string) {
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.fqn = try allocator.dupe(u8, v.string);
-        }
-
-        if (model_obj.get("method_name")) |v| {
-            if (v != .string) {
-                if (model.fqn) |name| allocator.free(name);
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.method_name = try allocator.dupe(u8, v.string);
-        }
-
-        if (model_obj.get("receiver_type")) |v| {
-            if (v != .string) {
-                if (model.fqn) |name| allocator.free(name);
-                if (model.method_name) |name| allocator.free(name);
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.receiver_type = try allocator.dupe(u8, v.string);
-        }
-
-        const has_match = model.fqn != null or model.method_name != null or model.receiver_type != null;
-        if (!has_match) {
-            if (model.fqn) |name| allocator.free(name);
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            return ConfigError.InvalidConfigFormat;
-        }
-
-        models[valid_count] = model;
+        models[valid_count] = try parseEscapeModel(allocator, item);
         valid_count += 1;
     }
 
     return models;
+}
+
+/// The operation one resource model names.
+fn resourceModelKindFrom(value: []const u8) ConfigError!ResourceModelKind {
+    if (std.mem.eql(u8, value, "alloc")) return .alloc;
+    if (std.mem.eql(u8, value, "free")) return .free;
+    if (std.mem.eql(u8, value, "free_owned")) return .free_owned;
+    if (std.mem.eql(u8, value, "open")) return .open;
+    if (std.mem.eql(u8, value, "close")) return .close;
+    return ConfigError.InvalidConfigFormat;
+}
+
+/// Parse one entry of `resource_models`, owning everything it allocates.
+fn parseResourceModel(allocator: std.mem.Allocator, item: std.json.Value) ConfigError!ResourceModel {
+    if (item != .object) {
+        return ConfigError.InvalidConfigFormat;
+    }
+
+    const model_obj = item.object;
+    const kind_value = model_obj.get("kind") orelse return ConfigError.InvalidConfigFormat;
+    if (kind_value != .string) return ConfigError.InvalidConfigFormat;
+    const kind = try resourceModelKindFrom(kind_value.string);
+
+    var model = ResourceModel{ .kind = kind };
+    // `model` owns every field from here on, so the one errdefer releases
+    // whatever the fields after it do not hand back themselves.
+    errdefer freeResourceModel(allocator, &model);
+
+    if (model_obj.get("method_name")) |v| {
+        if (v != .string) return ConfigError.InvalidConfigFormat;
+        model.method_name = try allocator.dupe(u8, v.string);
+    }
+
+    if (model_obj.get("receiver_type")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.receiver_type = try allocator.dupe(u8, v.string);
+    }
+
+    if (model_obj.get("return_type")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.return_type = try allocator.dupe(u8, v.string);
+    }
+
+    if (model_obj.get("fqn")) |v| {
+        if (v != .string) {
+            return ConfigError.InvalidConfigFormat;
+        }
+        model.fqn = try allocator.dupe(u8, v.string);
+    }
+
+    return model;
 }
 
 fn parseResourceModels(allocator: std.mem.Allocator, value: std.json.Value) ConfigError![]ResourceModel {
@@ -516,72 +600,13 @@ fn parseResourceModels(allocator: std.mem.Allocator, value: std.json.Value) Conf
     errdefer {
         // Free any successfully parsed models on error
         for (models[0..valid_count]) |model| {
-            if (model.method_name) |name| allocator.free(name);
-            if (model.receiver_type) |ty| allocator.free(ty);
-            if (model.return_type) |ty| allocator.free(ty);
-            if (model.fqn) |name| allocator.free(name);
+            freeResourceModel(allocator, @constCast(&model));
         }
         allocator.free(models);
     }
 
     for (array.items) |item| {
-        if (item != .object) {
-            return ConfigError.InvalidConfigFormat;
-        }
-
-        const model_obj = item.object;
-        const kind_value = model_obj.get("kind") orelse return ConfigError.InvalidConfigFormat;
-        if (kind_value != .string) return ConfigError.InvalidConfigFormat;
-
-        const kind_str = kind_value.string;
-        const kind: ResourceModelKind = if (std.mem.eql(u8, kind_str, "alloc"))
-            .alloc
-        else if (std.mem.eql(u8, kind_str, "free"))
-            .free
-        else if (std.mem.eql(u8, kind_str, "free_owned"))
-            .free_owned
-        else if (std.mem.eql(u8, kind_str, "open"))
-            .open
-        else if (std.mem.eql(u8, kind_str, "close"))
-            .close
-        else
-            return ConfigError.InvalidConfigFormat;
-
-        var model = ResourceModel{ .kind = kind };
-
-        if (model_obj.get("method_name")) |v| {
-            if (v != .string) return ConfigError.InvalidConfigFormat;
-            model.method_name = try allocator.dupe(u8, v.string);
-        }
-
-        if (model_obj.get("receiver_type")) |v| {
-            if (v != .string) {
-                if (model.method_name) |name| allocator.free(name);
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.receiver_type = try allocator.dupe(u8, v.string);
-        }
-
-        if (model_obj.get("return_type")) |v| {
-            if (v != .string) {
-                if (model.method_name) |name| allocator.free(name);
-                if (model.receiver_type) |ty| allocator.free(ty);
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.return_type = try allocator.dupe(u8, v.string);
-        }
-
-        if (model_obj.get("fqn")) |v| {
-            if (v != .string) {
-                if (model.method_name) |name| allocator.free(name);
-                if (model.receiver_type) |ty| allocator.free(ty);
-                if (model.return_type) |ty| allocator.free(ty);
-                return ConfigError.InvalidConfigFormat;
-            }
-            model.fqn = try allocator.dupe(u8, v.string);
-        }
-
-        models[valid_count] = model;
+        models[valid_count] = try parseResourceModel(allocator, item);
         valid_count += 1;
     }
 
@@ -802,6 +827,22 @@ test "parseConfig: invalid escape models release partially parsed indices and na
     }
 }
 
+test "parseConfig: a later failure releases the models already parsed" {
+    // Both errdefers are armed before either rule-filter branch runs, so one
+    // failure per branch exercises the paths `Config.deinit` shares with them;
+    // std.testing.allocator fails this test on any model field or model slice
+    // either errdefer leaves behind.
+    const inputs = [_][]const u8{
+        \\{"resource_models":[{"kind":"open","method_name":"MyPool.open","return_type":"MyResource"}],"escape_models":[{"fqn":"std.process.Child.init","param_indices":[0],"captures_into":"return"}],"enabled_rules":["empty-catch",42]}
+        ,
+        \\{"resource_models":[{"kind":"close","receiver_type":"MyResource"}],"escape_models":[{"method_name":"append","receiver_type":"std.ArrayList","param_indices":[0],"captures_into":"receiver"}],"disabled_rules":["todo",42]}
+        ,
+    };
+    for (inputs) |content| {
+        try std.testing.expectError(ConfigError.InvalidConfigFormat, parseConfig(std.testing.allocator, content));
+    }
+}
+
 test "parseConfig: resource_models invalid kind" {
     const allocator = std.testing.allocator;
     const content =
@@ -873,4 +914,24 @@ test "Config.matchResourceModel with return_type" {
     // No match - different return type
     const no_rt_match = cfg.matchResourceModel("customAcquire", null, "OtherType", null);
     try std.testing.expect(no_rt_match == null);
+}
+
+test "parseConfig: optional unwrap test severity accepts visible levels and rejects suppression" {
+    for ([_]struct { json: []const u8, severity: Severity }{
+        .{ .json = "{\"optional_unwrap_test_severity\":\"hint\"}", .severity = .hint },
+        .{ .json = "{\"enabled_rules\":[\"optional-unwrap\"],\"optional_unwrap_test_severity\":\"warning\"}", .severity = .warning },
+        .{ .json = "{\"disabled_rules\":[\"todo\"],\"optional_unwrap_test_severity\":\"error\"}", .severity = .err },
+    }) |case| {
+        var config = try parseConfig(std.testing.allocator, case.json);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.severity, config.optional_unwrap_test_severity);
+    }
+    for ([_][]const u8{
+        "{\"optional_unwrap_test_severity\":\"off\"}",
+        "{\"optional_unwrap_test_severity\":\"err\"}",
+        "{\"optional_unwrap_test_severity\":false}",
+        "{\"optional_unwrap_test_severity\":null}",
+    }) |content| {
+        try std.testing.expectError(error.InvalidConfigFormat, parseConfig(std.testing.allocator, content));
+    }
 }

@@ -14,6 +14,7 @@ pub const MergedConfig = struct {
     resource_models: []const config.ResourceModel = &.{},
     escape_models: []const config.EscapeModel = &.{},
     escape_max_depth: ?u32 = null,
+    optional_unwrap_test_severity: ?@import("../diagnostic.zig").Severity = null,
 };
 
 fn defaultRuleFilter(allocator: std.mem.Allocator) !RuleFilter {
@@ -48,6 +49,7 @@ pub fn mergeConfig(io_context: *compat.Context, allocator: std.mem.Allocator, cl
     const resource_models = loaded_config.resource_models;
     const escape_models = loaded_config.escape_models;
     const escape_max_depth = loaded_config.escape_max_depth;
+    const optional_unwrap_test_severity = loaded_config.optional_unwrap_test_severity;
 
     switch (cli_args.rule_filter) {
         .none => {
@@ -59,6 +61,7 @@ pub fn mergeConfig(io_context: *compat.Context, allocator: std.mem.Allocator, cl
                 .resource_models = resource_models,
                 .escape_models = escape_models,
                 .escape_max_depth = escape_max_depth,
+                .optional_unwrap_test_severity = optional_unwrap_test_severity,
             };
         },
         .allowlist => {
@@ -74,6 +77,7 @@ pub fn mergeConfig(io_context: *compat.Context, allocator: std.mem.Allocator, cl
                 .resource_models = resource_models,
                 .escape_models = escape_models,
                 .escape_max_depth = escape_max_depth,
+                .optional_unwrap_test_severity = optional_unwrap_test_severity,
             };
         },
         .blocklist => {
@@ -89,6 +93,7 @@ pub fn mergeConfig(io_context: *compat.Context, allocator: std.mem.Allocator, cl
                 .resource_models = resource_models,
                 .escape_models = escape_models,
                 .escape_max_depth = escape_max_depth,
+                .optional_unwrap_test_severity = optional_unwrap_test_severity,
             };
         },
     }
@@ -123,27 +128,12 @@ pub fn freeMergedConfig(allocator: std.mem.Allocator, cli_args: CliArgs, merged:
         .none => {},
     }
 
-    for (merged.resource_models) |model| {
-        if (model.method_name) |name| allocator.free(name);
-        if (model.receiver_type) |ty| allocator.free(ty);
-        if (model.return_type) |ty| allocator.free(ty);
-        if (model.fqn) |name| allocator.free(name);
-    }
-    if (merged.resource_models.len > 0) {
-        allocator.free(merged.resource_models);
-    }
-
-    for (merged.escape_models) |model| {
-        if (model.fqn) |name| allocator.free(name);
-        if (model.method_name) |name| allocator.free(name);
-        if (model.receiver_type) |ty| allocator.free(ty);
-        if (model.param_indices.len > 0) {
-            allocator.free(model.param_indices);
-        }
-    }
-    if (merged.escape_models.len > 0) {
-        allocator.free(merged.escape_models);
-    }
+    // `mergeConfig` hands the parsed lists over instead of letting
+    // `Config.deinit` release them, so this is where a merged config's models
+    // go. Releasing them through the shared helpers is what keeps a field
+    // added to either model type from leaking on this path.
+    config.freeResourceModels(allocator, merged.resource_models);
+    config.freeEscapeModels(allocator, merged.escape_models);
 }
 
 test "mergeConfig: CLI overrides config allowlist" {
@@ -242,5 +232,83 @@ test "mergeConfig: uses config when no CLI filter" {
             try std.testing.expectEqualStrings("todo", list[0]);
         },
         else => return error.UnexpectedFilterType,
+    }
+}
+
+test "freeMergedConfig: releases every model a parsed config owns" {
+    const allocator = std.testing.allocator;
+    const io_context = compat.defaultContext();
+
+    var tmp_dir = compat.TestDir.init();
+    defer tmp_dir.cleanup();
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}", .{tmp_dir.path()});
+
+    var config_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const config_path = try std.fmt.bufPrint(&config_path_buf, "{s}/.zwanzig.json", .{tmp_path});
+
+    // Every field the parsers fill today. A field added later and filled from
+    // JSON is covered the same way: the models come from the parser rather than
+    // from a literal here, and std.testing.allocator reports whatever the
+    // release path misses as a leak.
+    const config_content =
+        \\{
+        \\  "resource_models": [
+        \\    {"kind": "open", "method_name": "open", "receiver_type": "MyPool", "return_type": "MyHandle", "fqn": "mypkg.MyPool.open"}
+        \\  ],
+        \\  "escape_models": [
+        \\    {"fqn": "std.process.Child.init", "method_name": "init", "receiver_type": "std.process.Child", "param_indices": [0], "captures_into": "return"}
+        \\  ]
+        \\}
+    ;
+    try tmp_dir.writeFile(".zwanzig.json", config_content);
+
+    const cli_allowlist = [_][]const u8{"dupe-import"};
+    // `.none` keeps the parsed rule filter; an allowlist makes `mergeConfig`
+    // release the loaded config's filter itself and hand over only the models,
+    // which is the path that has to release what `Config.deinit` skipped.
+    for ([_]RuleFilter{ .none, .{ .allowlist = &cli_allowlist } }) |rule_filter| {
+        const cli_args = CliArgs{
+            .paths = &.{},
+            .rule_filter = rule_filter,
+            .build_metadata = null,
+            .config_path = config_path,
+            .output_format = .text,
+            .use_cache = false,
+            .max_worklist_steps = null,
+            .max_states_per_point = null,
+            .use_widening = null,
+            .dump_cfg_dir = null,
+            .dump_exploded_graph_dir = null,
+            .dump_annotated_cfg_dir = null,
+            .dump_path_trace_dir = null,
+            .thread_count = 1,
+        };
+
+        const merged = try mergeConfig(io_context, allocator, cli_args);
+        try std.testing.expectEqual(@as(usize, 1), merged.resource_models.len);
+        try std.testing.expectEqual(@as(usize, 1), merged.escape_models.len);
+        freeMergedConfig(allocator, cli_args, merged);
+    }
+}
+
+test "freeMergedConfig: releases models through the shared config helpers" {
+    // A field-by-field release here would skip any field added to a model type
+    // later, and the leak would surface only on the paths that come through
+    // this function. Two releases of the same lists stay correct only while
+    // both go through src/config.zig.
+    const source = @embedFile("config_merge.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn freeMergedConfig") orelse
+        return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, "\n}\n") orelse
+        return error.TestUnexpectedResult;
+    const body = source[start..end];
+
+    for ([_][]const u8{ "config.freeResourceModels(", "config.freeEscapeModels(" }) |call| {
+        try std.testing.expect(std.mem.indexOf(u8, body, call) != null);
+    }
+    for ([_][]const u8{ ".fqn", ".method_name", ".receiver_type", ".return_type", ".param_indices" }) |field| {
+        try std.testing.expect(std.mem.indexOf(u8, body, field) == null);
     }
 }

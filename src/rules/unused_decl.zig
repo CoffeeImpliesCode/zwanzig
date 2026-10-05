@@ -716,10 +716,19 @@ pub const UnusedDeclRule = struct {
         }
 
         fn resultLocationTargetsOwner(self: *UsageScanner, node: u32) bool {
-            const local_files = [_]import_resolver.File{.{ .path = "", .tree = self.tree }};
-            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
-                .files = &local_files,
-                .file_index = 0,
+            // The fallback owns its file storage, so it stays in this scope while
+            // the array is only filled and queried when it is the one in use.
+            var local_files: [1]import_resolver.File = undefined;
+            const resolver = self.type_ctx.project_resolver orelse single_file: {
+                local_files = .{.{
+                    .path = "",
+                    .tree = self.tree,
+                    .lexical_index = self.type_ctx.lexicalIndexForTree(self.tree),
+                }};
+                break :single_file call_resolver.ProjectTypeResolver{
+                    .files = &local_files,
+                    .file_index = 0,
+                };
             };
             const expected = resolver.resolveResultLocationTypeNode(node) orelse return false;
             const owner_resolver = call_resolver.ProjectTypeResolver{
@@ -775,14 +784,19 @@ pub const UnusedDeclRule = struct {
         /// through lexical bindings, so namespace aliases stay trusted while a
         /// user declaration spelled like the namespace does not.
         fn isStdTestingNamespace(self: *UsageScanner, node: u32) bool {
-            const local_files = [_]import_resolver.File{.{
-                .path = "",
-                .tree = self.tree,
-                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
-            }};
-            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
-                .files = &local_files,
-                .file_index = 0,
+            // The fallback owns its file storage, so it stays in this scope while
+            // the array is only filled and queried when it is the one in use.
+            var local_files: [1]import_resolver.File = undefined;
+            const resolver = self.type_ctx.project_resolver orelse single_file: {
+                local_files = .{.{
+                    .path = "",
+                    .tree = self.tree,
+                    .lexical_index = self.type_ctx.lexicalIndexForTree(self.tree),
+                }};
+                break :single_file call_resolver.ProjectTypeResolver{
+                    .files = &local_files,
+                    .file_index = 0,
+                };
             };
             return resolver.isStdTestingNamespaceExpr(node);
         }
@@ -872,9 +886,11 @@ pub const UnusedDeclRule = struct {
 
         fn isTypedReceiver(self: *UsageScanner, receiver_node: u32) bool {
             const expected_type_node = self.receiver_type_node orelse return false;
-            const files = [_]import_resolver.File{
-                .{ .path = "", .tree = self.tree },
-            };
+            const files = [_]import_resolver.File{.{
+                .path = "",
+                .tree = self.tree,
+                .lexical_index = self.type_ctx.lexicalIndexForTree(self.tree),
+            }};
             const resolver = call_resolver.ProjectTypeResolver{
                 .files = &files,
                 .file_index = 0,
@@ -902,14 +918,19 @@ pub const UnusedDeclRule = struct {
             const function = self.enclosingFnDecl(access_node) orelse return false;
             const proto_node = functionProtoNodeOf(self.tree, function) orelse return false;
 
-            const local_files = [_]import_resolver.File{.{
-                .path = "",
-                .tree = self.tree,
-                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
-            }};
-            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
-                .files = &local_files,
-                .file_index = 0,
+            // The fallback owns its file storage, so it stays in this scope while
+            // the array is only filled and queried when it is the one in use.
+            var local_files: [1]import_resolver.File = undefined;
+            const resolver = self.type_ctx.project_resolver orelse single_file: {
+                local_files = .{.{
+                    .path = "",
+                    .tree = self.tree,
+                    .lexical_index = self.type_ctx.lexicalIndexForTree(self.tree),
+                }};
+                break :single_file call_resolver.ProjectTypeResolver{
+                    .files = &local_files,
+                    .file_index = 0,
+                };
             };
 
             const parameter = comptimeTypeParameterSlot(self.tree, proto_node, resolver, receiver_node) orelse return false;
@@ -1054,14 +1075,19 @@ pub const UnusedDeclRule = struct {
             const container = owner.container_node orelse return false;
             if (field_token >= self.token_tags.len) return false;
             const name = normalizeIdentifier(self.tree.tokenSlice(field_token));
-            const local_files = [_]import_resolver.File{.{
-                .path = "",
-                .tree = self.tree,
-                .lexical_index = self.type_ctx.source.borrowed_lexical_index,
-            }};
-            const resolver = self.type_ctx.project_resolver orelse call_resolver.ProjectTypeResolver{
-                .files = &local_files,
-                .file_index = 0,
+            // The fallback owns its file storage, so it stays in this scope while
+            // the array is only filled and queried when it is the one in use.
+            var local_files: [1]import_resolver.File = undefined;
+            const resolver = self.type_ctx.project_resolver orelse single_file: {
+                local_files = .{.{
+                    .path = "",
+                    .tree = self.tree,
+                    .lexical_index = self.type_ctx.lexicalIndexForTree(self.tree),
+                }};
+                break :single_file call_resolver.ProjectTypeResolver{
+                    .files = &local_files,
+                    .file_index = 0,
+                };
             };
             if (owner.file_index >= resolver.files.len) return false;
             const target_tree = resolver.files[owner.file_index].tree;

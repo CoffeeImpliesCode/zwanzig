@@ -41,7 +41,7 @@ const Parser = struct {
 
 test "a catch that leaves keeps the operand's value in the assigned field" {
     var parser = Parser{ .reader = null };
-    _ = try parser.validate("payload", &.{});
+    _ = try parser.validate("payload", &.{ 1 });
     var warm = Parser{ .reader = Reader{} };
     _ = try warm.validate("again", &.{ 1, 2 });
 }

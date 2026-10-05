@@ -120,7 +120,6 @@ pub fn Mixin(comptime _Builder: type) type {
             const else_ast = if (full_while.ast.else_expr.unwrap()) |e| @intFromEnum(e) else 0;
 
             var exit_node: CfgNodeId = undefined;
-            var else_terminates = false;
             if (else_ast != 0) {
                 // Process else body - loop_exit goes to else body, then else body goes to merge
                 const else_range = try source_range.getSourceRange(source, else_ast);
@@ -129,20 +128,33 @@ pub fn Mixin(comptime _Builder: type) type {
 
                 const else_result = try self.processNode(cfg, source, else_ast, else_entry_node);
 
-                if (else_result.terminates) {
-                    else_terminates = true;
-                    exit_node = else_entry_node;
-                } else {
-                    exit_node = try cfg.addNode(IrNode.init(.nop));
-                    if (else_result.last) |else_end| {
-                        try cfg.addEdge(else_end, exit_node);
-                    } else {
-                        try cfg.addEdge(else_entry_node, exit_node);
-                    }
+                // `exit_node` is where control goes once the loop is over, so
+                // it is also where a `break` from the body lands: the else
+                // branch belongs to running the condition out, and a break
+                // skips it. The else body's entry is therefore never the exit
+                // itself - not even here, where the else body ends every path
+                // it has - because that would send a break through the branch
+                // it just skipped.
+                exit_node = try cfg.addNode(IrNode.init(.nop));
+                if (!else_result.terminates) {
+                    try cfg.addEdge(else_result.last orelse else_entry_node, exit_node);
                 }
             } else {
                 exit_node = try cfg.addNode(IrNode.init(.nop));
                 try cfg.addEdgeWithKind(header_node, exit_node, .loop_exit);
+            }
+
+            // The continuation expression runs after the body and before the
+            // loop back, and a `continue` has to run it too: a continue that
+            // jumped straight to the header would repeat the body it just
+            // left. Its node therefore exists before the body is walked, so a
+            // continue inside that body can link to it directly, and the back
+            // edge to the header leaves it (see below) rather than the body.
+            const cont_ast = if (full_while.ast.cont_expr.unwrap()) |c| @intFromEnum(c) else 0;
+            var cont_node: ?CfgNodeId = null;
+            if (cont_ast != 0) {
+                const cont_range = try source_range.getSourceRange(source, cont_ast);
+                cont_node = try cfg.addNode(IrNode.initFull(.expr, cont_ast, cont_range));
             }
 
             const body_ast = @intFromEnum(full_while.ast.then_expr);
@@ -151,10 +163,22 @@ pub fn Mixin(comptime _Builder: type) type {
                 const body_node = try cfg.addNode(IrNode.initFull(.loop_body, body_ast, body_range));
                 try cfg.addEdgeWithKind(header_node, body_node, .branch_true);
 
-                const body_result = try self.processNode(cfg, source, body_ast, body_node);
+                // The loop's own context covers the body walk only. Its else
+                // branch is walked above, outside the frame, so a continue
+                // there resolves against an enclosing loop like any code that
+                // sits after this one.
+                const frame: _Builder.LoopFrame = .{
+                    .parent = self.current_loop,
+                    .ast_node = ast_node,
+                    .label_token = _Builder.Statements.labelTokenBefore(tree, ast_node),
+                    .enclosing_scope = self.current_scope,
+                    .continue_target = cont_node orelse header_node,
+                    .break_target = exit_node,
+                };
+                self.current_loop = &frame;
+                defer self.current_loop = frame.parent;
 
-                // Handle continue expression if present - executes after body, before loop back
-                const cont_ast = if (full_while.ast.cont_expr.unwrap()) |c| @intFromEnum(c) else 0;
+                const body_result = try self.processNode(cfg, source, body_ast, body_node);
 
                 var loop_back_from: CfgNodeId = body_node;
                 if (body_result.last) |body_end| {
@@ -163,22 +187,24 @@ pub fn Mixin(comptime _Builder: type) type {
                     }
                 }
 
-                if (!body_result.terminates) {
-                    if (cont_ast != 0) {
-                        // Process continue expression
-                        const cont_range = try source_range.getSourceRange(source, cont_ast);
-                        const cont_node = try cfg.addNode(IrNode.initFull(.expr, cont_ast, cont_range));
-                        try cfg.addEdge(loop_back_from, cont_node);
-                        try cfg.addEdgeWithKind(cont_node, header_node, .loop_back);
-                    } else {
-                        try cfg.addEdgeWithKind(loop_back_from, header_node, .loop_back);
+                // `continue` terminates the body but still runs the continuation.
+                // Its back edge must not depend on body fallthrough.
+                if (cont_node) |cont| {
+                    if (!body_result.terminates) {
+                        try cfg.addEdge(loop_back_from, cont);
                     }
+                    try cfg.addEdgeWithKind(cont, header_node, .loop_back);
+                } else if (!body_result.terminates) {
+                    try cfg.addEdgeWithKind(loop_back_from, header_node, .loop_back);
                 }
             } else {
                 try cfg.addEdgeWithKind(header_node, header_node, .loop_back);
             }
 
-            return .{ .last = exit_node, .terminates = else_terminates };
+            for (cfg.edges.items) |edge| {
+                if (edge.to == exit_node) return .{ .last = exit_node, .terminates = false };
+            }
+            return .{ .last = exit_node, .terminates = true };
         }
 
         pub fn processFor(
@@ -200,7 +226,6 @@ pub fn Mixin(comptime _Builder: type) type {
             const else_ast = if (full_for.ast.else_expr.unwrap()) |e| @intFromEnum(e) else 0;
 
             var exit_node: CfgNodeId = undefined;
-            var else_terminates = false;
             if (else_ast != 0) {
                 // Process else body - loop_exit goes to else body, then else body goes to merge
                 const else_range = try source_range.getSourceRange(source, else_ast);
@@ -209,16 +234,16 @@ pub fn Mixin(comptime _Builder: type) type {
 
                 const else_result = try self.processNode(cfg, source, else_ast, else_entry_node);
 
-                if (else_result.terminates) {
-                    else_terminates = true;
-                    exit_node = else_entry_node;
-                } else {
-                    exit_node = try cfg.addNode(IrNode.init(.nop));
-                    if (else_result.last) |else_end| {
-                        try cfg.addEdge(else_end, exit_node);
-                    } else {
-                        try cfg.addEdge(else_entry_node, exit_node);
-                    }
+                // `exit_node` is where control goes once the loop is over, so
+                // it is also where a `break` from the body lands: the else
+                // branch belongs to running the loop out, and a break skips
+                // it. The else body's entry is therefore never the exit
+                // itself - not even here, where the else body ends every path
+                // it has - because that would send a break through the branch
+                // it just skipped.
+                exit_node = try cfg.addNode(IrNode.init(.nop));
+                if (!else_result.terminates) {
+                    try cfg.addEdge(else_result.last orelse else_entry_node, exit_node);
                 }
             } else {
                 exit_node = try cfg.addNode(IrNode.init(.nop));
@@ -230,6 +255,21 @@ pub fn Mixin(comptime _Builder: type) type {
                 const body_range = try source_range.getSourceRange(source, body_ast);
                 const body_node = try cfg.addNode(IrNode.initFull(.loop_body, body_ast, body_range));
                 try cfg.addEdgeWithKind(header_node, body_node, .branch_true);
+
+                // A for loop has no continuation expression: its header steps
+                // to the next item, so that is where a continue lands. The
+                // frame covers the body walk only, so a continue in the else
+                // branch walked above resolves against an enclosing loop.
+                const frame: _Builder.LoopFrame = .{
+                    .parent = self.current_loop,
+                    .ast_node = ast_node,
+                    .label_token = _Builder.Statements.labelTokenBefore(tree, ast_node),
+                    .enclosing_scope = self.current_scope,
+                    .continue_target = header_node,
+                    .break_target = exit_node,
+                };
+                self.current_loop = &frame;
+                defer self.current_loop = frame.parent;
 
                 const body_result = try self.processNode(cfg, source, body_ast, body_node);
 
@@ -244,7 +284,10 @@ pub fn Mixin(comptime _Builder: type) type {
                 try cfg.addEdgeWithKind(header_node, header_node, .loop_back);
             }
 
-            return .{ .last = exit_node, .terminates = else_terminates };
+            for (cfg.edges.items) |edge| {
+                if (edge.to == exit_node) return .{ .last = exit_node, .terminates = false };
+            }
+            return .{ .last = exit_node, .terminates = true };
         }
     };
 }

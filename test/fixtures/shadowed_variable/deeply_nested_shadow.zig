@@ -12,3 +12,5 @@ fn foo(items: []const ?i32) void {
     }
     _ = result;
 }
+
+// zwanzig: not a standalone program: a function-scope constant shadowed by a constant inside a bare block nested under a for capture and an if capture is the intentional invalidity under test, verifying that shadowing is detected across several nesting levels.

@@ -27,48 +27,60 @@ pub fn Mixin(comptime _Engine: type) type {
         /// Extract a constraint from a branch node's condition.
         /// Returns null if no constraint can be extracted.
         pub fn extractBranchConstraint(self: *_Engine, cfg_node: *const CfgNode, current_cfg: *const Cfg) ?Constraint {
-            const ir_node = cfg_node.ir_node;
-            if (ir_node.operand_node) |cond_node| {
-                // First check if the condition is a literal boolean
-                if (_Engine.Literals.evaluateLiteral(self, cond_node)) |literal_val| {
-                    if (literal_val.toBool()) |bool_val| {
-                        // Use literalBool for compile-time known conditions to enable
-                        // proper branch pruning (e.g., if (false) should be pruned)
-                        return Constraint.literalBool(bool_val);
-                    }
-                }
+            const cond_node = cfg_node.ir_node.operand_node orelse return null;
+            return extractConditionConstraint(self, cfg_node, cond_node, current_cfg);
+        }
 
-                // Check if the condition is a null comparison (x == null or x != null)
-                if (extractNullCheckConstraint(self, cond_node, current_cfg)) |null_constraint| {
-                    return null_constraint;
+        /// The constraint the condition `cond_node` decides, or null when it
+        /// names none.
+        ///
+        /// Both kinds of condition read the same way: a `while` header draws
+        /// the fork its condition decides as a loop, but the facts that decide
+        /// it are the facts a `branch` node's edges already carry.
+        fn extractConditionConstraint(
+            self: *_Engine,
+            cfg_node: *const CfgNode,
+            cond_node: u32,
+            current_cfg: *const Cfg,
+        ) ?Constraint {
+            // First check if the condition is a literal boolean
+            if (_Engine.Literals.evaluateLiteral(self, cond_node)) |literal_val| {
+                if (literal_val.toBool()) |bool_val| {
+                    // Use literalBool for compile-time known conditions to enable
+                    // proper branch pruning (e.g., if (false) should be pruned)
+                    return Constraint.literalBool(bool_val);
                 }
+            }
 
-                if (self.source) |src| {
-                    const tree = src.ast() catch return null;
-                    const node = unwrapGroupedExpression(tree, cond_node) orelse return null;
-                    if (comparisonOperator(tree.nodes.items(.tag)[node])) |op| {
-                        return extractComparisonConstraint(self, tree, node, op, current_cfg);
-                    }
-                }
+            // Check if the condition is a null comparison (x == null or x != null)
+            if (extractNullCheckConstraint(self, cond_node, current_cfg)) |null_constraint| {
+                return null_constraint;
+            }
 
-                const var_key = if (self.source != null)
-                    (_Engine.VarResolution.resolveVarIdFromExpr(self, cond_node, current_cfg) orelse return null)
-                else
-                    ids.varId(cond_node);
-                if (ir_node.ast_node) |ast_node| {
-                    if (hasPayloadCapture(self, ast_node)) {
-                        return Constraint.nullCheck(var_key, false);
-                    }
+            if (self.source) |src| {
+                const tree = src.ast() catch return null;
+                const node = unwrapGroupedExpression(tree, cond_node) orelse return null;
+                if (comparisonOperator(tree.nodes.items(.tag)[node])) |op| {
+                    return extractComparisonConstraint(self, tree, node, op, current_cfg);
                 }
-                // If we only have a variable and no comparison info, check if it's an optional
-                // being used as a boolean (if (optional_var) ...)
-                if (isOptionalType(self, cond_node, current_cfg)) {
-                    // When optional is used as condition: true branch means non-null
+            }
+
+            const var_key = if (self.source != null)
+                (_Engine.VarResolution.resolveVarIdFromExpr(self, cond_node, current_cfg) orelse return null)
+            else
+                ids.varId(cond_node);
+            if (cfg_node.ir_node.ast_node) |ast_node| {
+                if (hasPayloadCapture(self, ast_node)) {
                     return Constraint.nullCheck(var_key, false);
                 }
-                return Constraint.boolCheck(var_key, true);
             }
-            return null;
+            // If we only have a variable and no comparison info, check if it's an optional
+            // being used as a boolean (if (optional_var) ...)
+            if (isOptionalType(self, cond_node, current_cfg)) {
+                // When optional is used as condition: true branch means non-null
+                return Constraint.nullCheck(var_key, false);
+            }
+            return Constraint.boolCheck(var_key, true);
         }
 
         /// Return the true-edge comparison; the engine negates it on the false edge.
@@ -155,7 +167,7 @@ pub fn Mixin(comptime _Engine: type) type {
             return null;
         }
 
-        /// Extract multiple constraints from a branch condition.
+        /// Extract the constraints the edges out of this point are decided by.
         /// This handles compound null checks like `a == null or b == null`.
         pub fn extractBranchConstraints(
             self: *_Engine,
@@ -164,6 +176,13 @@ pub fn Mixin(comptime _Engine: type) type {
             out_constraints: *[4]?Constraint,
         ) usize {
             const ir_node = cfg_node.ir_node;
+            if (ir_node.tag == .loop_header) {
+                if (extractLoopCondition(self, cfg_node, current_cfg)) |c| {
+                    out_constraints[0] = c;
+                    return 1;
+                }
+                return 0;
+            }
             if (ir_node.operand_node) |cond_node| {
                 // Try compound null constraints first (for bool_or/bool_and patterns)
                 const count = extractCompoundNullConstraints(self, cond_node, current_cfg, out_constraints);
@@ -178,6 +197,33 @@ pub fn Mixin(comptime _Engine: type) type {
                 }
             }
             return 0;
+        }
+
+        /// The constraint a loop header's condition decides, or null when it
+        /// names none.
+        ///
+        /// A `while` header is the branch that draws itself as a loop: its two
+        /// edges are the body and the way out, and they are taken on the same
+        /// condition any `branch` node reads. Leaving them unconstrained is
+        /// what lets the header's own guard decide nothing, so a pass whose
+        /// counter the widening at that header has already widened away from
+        /// the condition still enters a pass the condition rules out.
+        ///
+        /// A `for` header names no condition to read: it steps to the next
+        /// item instead of testing one, so its edges are not decided by a
+        /// comparison and this returns null for it.
+        fn extractLoopCondition(
+            self: *_Engine,
+            cfg_node: *const CfgNode,
+            current_cfg: *const Cfg,
+        ) ?Constraint {
+            const ast_node = cfg_node.ir_node.ast_node orelse return null;
+            const src = self.source orelse return null;
+            const tree = src.ast() catch return null;
+            const tags = tree.nodes.items(.tag);
+            if (ast_node >= tags.len) return null;
+            const full_while = tree.fullWhile(@enumFromInt(ast_node)) orelse return null;
+            return extractConditionConstraint(self, cfg_node, @intFromEnum(full_while.ast.cond_expr), current_cfg);
         }
 
         /// Extract a null check constraint from a comparison expression.
@@ -435,15 +481,30 @@ pub fn Mixin(comptime _Engine: type) type {
             return false;
         }
 
+        /// Whether the guard at `ast_node` captures a payload, which is what
+        /// says the condition it reads is an optional being unwrapped.
+        ///
+        /// A loop header captures on the same terms an `if` does - the header
+        /// reads the condition that unwraps the value, and its capture
+        /// declares what that condition carried - so it is read the same way
+        /// here. Answering false for one left the header falling through to
+        /// `isOptionalType`, which an inferred optional that the type context
+        /// cannot see never satisfies, and so to a boolean check on a value
+        /// that is not a boolean. That check is unsatisfiable against a
+        /// binding the acquisition settled as non-null in both directions: the
+        /// body the header enters is the one that releases the handle, and the
+        /// handle is still held where the function returns.
         pub fn hasPayloadCapture(self: *_Engine, ast_node: u32) bool {
             const src = self.source orelse return false;
             const tree = src.ast() catch return false;
             const tags = tree.nodes.items(.tag);
 
             if (ast_node >= tags.len) return false;
-            if (tags[ast_node] != .@"if" and tags[ast_node] != .if_simple) return false;
-            const full_if = tree.fullIf(@enumFromInt(ast_node)) orelse return false;
-            return full_if.payload_token != null;
+            return switch (tags[ast_node]) {
+                .@"if", .if_simple => if (tree.fullIf(@enumFromInt(ast_node))) |full| full.payload_token != null else false,
+                .@"while", .while_simple, .while_cont => if (tree.fullWhile(@enumFromInt(ast_node))) |full| full.payload_token != null else false,
+                else => false,
+            };
         }
     };
 }
@@ -840,4 +901,131 @@ test "unsupported branch comparisons leave both paths feasible" {
         reached_returns += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), reached_returns);
+}
+
+test "a guard's payload capture decides its edges, for a loop header as for a branch" {
+    const allocator = std.testing.allocator;
+    // The binding carries no written type, so nothing but the guard's own
+    // capture says the value it reads is an optional. A producer caught to
+    // `null` settles that binding as non-null on the arm where it ran, so the
+    // edge the capture's decision allows is the one that survives there and
+    // the negated one - the way out of the guard - is the one that cannot be
+    // taken. The release written where the capture is still in scope is only
+    // modelled if that edge survives.
+    const cases = [_][]const u8{
+        "if (maybe) |file| { _ = file; }",
+        "while (maybe) |file| { _ = file; break; }",
+    };
+    for (cases) |guard| {
+        var buffer: [256]u8 = undefined;
+        const code = try std.fmt.bufPrint(
+            &buffer,
+            "fn producer() error{{Boom}}!u8 {{ return 1; }}\nfn consumer() void {{\n    const maybe = producer() catch null;\n    {s}\n}}\x00",
+            .{guard},
+        );
+        var source = TestSource.init(allocator, "payload-guard.zig", code[0 .. code.len - 1 :0]);
+        defer source.deinit();
+        const tree = try source.ast();
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const fn_node = tree.rootDecls()[1];
+        var var_id: ids.VarId = undefined;
+        for (tree.nodes.items(.tag), 0..) |node_tag, index| {
+            // `const maybe = ...` carries no written type, so it is filed under
+            // the untyped declaration tag; a typed or aligned one is the other.
+            if (node_tag != .simple_var_decl and node_tag != .local_var_decl) continue;
+            const decl = tree.fullVarDecl(@enumFromInt(index)) orelse continue;
+            var_id = ids.varId(decl.ast.mut_token + 1);
+            break;
+        } else return error.TestUnexpectedResult;
+
+        var builder = TestCfgBuilder.init(allocator);
+        var cfg = (try builder.buildFromFn(&source, ids.astId(@intFromEnum(fn_node)))) orelse
+            return error.TestUnexpectedResult;
+        defer cfg.deinit();
+        var engine = TestEngine.initWithSource(allocator, &cfg, &source);
+        defer engine.deinit();
+        try TestEngine.VarResolution.prepare(&engine, &cfg);
+        var decided: ?Constraint = null;
+        for (cfg.nodes.items) |*node| {
+            if (node.ir_node.tag != .branch and node.ir_node.tag != .loop_header) continue;
+            try std.testing.expect(decided == null);
+            var out: [4]?Constraint = .{ null, null, null, null };
+            try std.testing.expectEqual(
+                @as(usize, 1),
+                TestEngine.BranchConstraints.extractBranchConstraints(&engine, node, &cfg, &out),
+            );
+            decided = out[0];
+        }
+        const constraint = decided orelse return error.TestUnexpectedResult;
+        try std.testing.expect(constraint.eql(Constraint.nullCheck(var_id, false)));
+
+        for ([_]bool{ true, false }) |true_edge| {
+            var state = TestState.init(allocator);
+            defer state.deinit();
+            try state.setVar(var_id, .non_null);
+            try state.addConstraint(if (true_edge) constraint else constraint.negate());
+            try std.testing.expect(state.isSatisfiable() == true_edge);
+        }
+    }
+}
+
+fn payloadGuardScopeAllocationFailure(
+    allocator: std.mem.Allocator,
+    cfg: *const Cfg,
+    code: [:0]const u8,
+) !void {
+    var source = TestSource.init(allocator, "payload-guard.zig", code);
+    defer source.deinit();
+    var engine = TestEngine.initWithSource(allocator, cfg, &source);
+    defer engine.deinit();
+    const scope = (try TestEngine.BranchConstraints.getAssertionScope(&engine, cfg)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), scope.std_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scope.testing_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scope.debug_aliases.items.len);
+}
+
+test "a loop header's assertion scope is built once per function and clean at every allocation boundary" {
+    // The scope a guard reads its assertion names from is the one build this
+    // function's constraints share, and the loop-header shape is the one that
+    // reported it running without end. So the loop header's own scope is
+    // built here directly: once, holding no alias, served from the cache
+    // after that, and leaving nothing behind when a build runs out of memory
+    // part way through.
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn producer() error{Boom}!u8 { return 1; }
+        \\fn consumer() void {
+        \\    const maybe = producer() catch null;
+        \\    while (maybe) |file| { _ = file; break; }
+        \\}
+    ;
+    var source = TestSource.init(allocator, "payload-guard.zig", code);
+    defer source.deinit();
+    const tree = try source.ast();
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const fn_node = tree.rootDecls()[1];
+
+    var builder = TestCfgBuilder.init(allocator);
+    var cfg = (try builder.buildFromFn(&source, ids.astId(@intFromEnum(fn_node)))) orelse
+        return error.TestUnexpectedResult;
+    defer cfg.deinit();
+    var engine = TestEngine.initWithSource(allocator, &cfg, &source);
+    defer engine.deinit();
+
+    const first = (try TestEngine.BranchConstraints.getAssertionScope(&engine, &cfg)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), first.std_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.testing_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.debug_aliases.items.len);
+    try std.testing.expectEqual(@as(usize, 0), first.debug_assert_aliases.items.len);
+    const second = (try TestEngine.BranchConstraints.getAssertionScope(&engine, &cfg)) orelse
+        return error.TestUnexpectedResult;
+    // One build per function: a second read is the cached scope, not a new one.
+    try std.testing.expect(first == second);
+
+    try std.testing.checkAllAllocationFailures(allocator, payloadGuardScopeAllocationFailure, .{
+        &cfg,
+        code,
+    });
 }

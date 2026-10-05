@@ -16,7 +16,6 @@ fn openUrl(allocator: std.mem.Allocator, url: []const u8) !void {
     const wrapped = wrap2(wrap1(child));
     const thread = try std.Thread.spawn(.{}, openUrlThread, .{wrapped});
     thread.detach();
-    _ = thread;
 }
 
 fn openUrlThread(child: std.process.Child) void {

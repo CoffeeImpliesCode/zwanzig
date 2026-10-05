@@ -221,38 +221,6 @@ test "Environment cloning preserves its source on allocation failure" {
     try testing.expect(source.get(ids.varId(1)).?.eql(.{ .concrete_int = 42 }));
 }
 
-test "Environment widen with overlapping variables" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var env1 = Environment.init(allocator);
-    defer env1.deinit();
-
-    var env2 = Environment.init(allocator);
-    defer env2.deinit();
-
-    // Same variable, same value -> preserved
-    try env1.set(ids.varId(1), .{ .concrete_int = 10 });
-    try env2.set(ids.varId(1), .{ .concrete_int = 10 });
-
-    // Same variable, different value -> widened
-    try env1.set(ids.varId(2), .{ .concrete_int = 20 });
-    try env2.set(ids.varId(2), .{ .concrete_int = 30 });
-
-    var widened = try env1.widen(&env2);
-    defer widened.deinit();
-
-    // var1 should be preserved (same value)
-    const val1 = widened.get(ids.varId(1));
-    try testing.expect(val1 != null);
-    try testing.expect(val1.?.eql(.{ .concrete_int = 10 }));
-
-    // var2 should be widened to unknown (different concrete ints)
-    const val2 = widened.get(ids.varId(2));
-    try testing.expect(val2 != null);
-    try testing.expect(val2.?.isUnknown());
-}
-
 test "Environment widen with disjoint variables" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -282,6 +250,54 @@ test "Environment widen with disjoint variables" {
     const val2 = widened.get(ids.varId(2));
     try testing.expect(val2 != null);
     try testing.expect(val2.?.isUnknown());
+}
+
+test "Environment widen with overlapping variables" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var env1 = Environment.init(allocator);
+    defer env1.deinit();
+
+    var env2 = Environment.init(allocator);
+    defer env2.deinit();
+
+    // Both environments bind the same variables; only the second one differs.
+    try env1.set(ids.varId(1), .{ .concrete_int = 10 });
+    try env1.set(ids.varId(2), .{ .concrete_int = 20 });
+
+    try env2.set(ids.varId(1), .{ .concrete_int = 10 }); // same
+    try env2.set(ids.varId(2), .{ .concrete_int = 30 }); // different
+
+    // var3 exists only in env2 and widens to unknown.
+    try env2.set(ids.varId(3), .{ .concrete_bool = true });
+
+    var widened = try env1.widen(&env2);
+    defer widened.deinit();
+
+    try testing.expectEqual(@as(usize, 3), widened.size());
+
+    // The shared value survives untouched: `widen` returns `self` when both
+    // sides are equal.
+    const shared = widened.get(ids.varId(1));
+    try testing.expect(shared != null);
+    try testing.expect(shared.?.eql(.{ .concrete_int = 10 }));
+
+    // The differing pair becomes the integer interval spanning them: the bound
+    // that did not move is kept, the one that did is thrown to the end of the
+    // `i64` domain.
+    const differing = widened.get(ids.varId(2));
+    try testing.expect(differing != null);
+    try testing.expect(differing.?.eql(.{ .int_range = .{
+        .min = 20,
+        .max = std.math.maxInt(i64),
+    } }));
+
+    // A variable only in one side has no value to widen against, so it stays
+    // unknown.
+    const one_sided = widened.get(ids.varId(3));
+    try testing.expect(one_sided != null);
+    try testing.expect(one_sided.?.isUnknown());
 }
 
 test "Environment widen with empty environments" {

@@ -136,7 +136,6 @@ const Component = struct {
             };
 
             const path_tex = makeTextTexture(cache_store, entry_fonts.regular, "path", entry_color) catch {
-                _ = key_tex;
                 destroyEntryTextures(entries[0..idx]);
                 self.allocator.free(entries);
                 self.allocator.destroy(cache);

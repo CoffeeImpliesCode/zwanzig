@@ -99,15 +99,19 @@ jobs:
           name: forketyfork
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
+      # `just ci` is the whole gate, so retrying it would also retry the fixture
+      # sweep - turning a real fixture compile error into a pass whenever the
+      # second attempt got further than the first. There is no retry here. The
+      # fixture sweep runs one compiler process per fixture and asks for one
+      # worker per core unless told otherwise; the hosted runner's own core
+      # count is not a promise, so pin the bound instead of inheriting it.
       - name: Build, test, lint
-        run: |
-          for i in 1 2 3; do
-            nix develop "${{ matrix.nix_flake }}" \
-              --accept-flake-config --command just ci && break
-            if [ $i -eq 3 ]; then exit 1; fi
-            sleep 5
-          done
+        run: nix develop "${{ matrix.nix_flake }}" --accept-flake-config --command just ci
         working-directory: zwanzig
+        env:
+          # One compiler worker per vCPU of the hosted runner, and never more.
+          # See the check-fixtures recipe for why the sweep needs a bound.
+          ZWANGIG_BUILD_JOBS: '4'
 
       - name: Upload SARIF results
         if: always() && matrix.zig_version == '0.15.2'

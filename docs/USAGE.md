@@ -51,7 +51,7 @@ Zig 0.15.2 should stay on the latest v0.17.x release.
 
 ### Parse and frontend diagnostics
 
-Zwanzig validates syntax before it runs checks, including AST-only selections. Syntax errors produce `parse-error` diagnostics at the parser's reported locations. Zwanzig skips the malformed file and continues with valid sibling files. Both supported frontends reject `usingnamespace`.
+Zwanzig validates syntax before it runs checks, including AST-only selections. Syntax errors produce `parse-error` diagnostics at the parser's reported locations. Zwanzig skips the malformed file and continues with valid sibling files. A second `parse-error` at line 1, column 1 states that all other checks for that file were skipped, so a missing finding is never silent. Both supported frontends reject `usingnamespace`.
 
 Enabled native checkers determine whether Zwanzig requests ZIR/type information. If that preflight fails, `frontend-error` identifies the embedded frontend and reports the loss of typed analysis. Required typed checks skip the file. Optional checks continue with AST fallback, which can reduce precision. This frontend check is not a complete compiler build.
 

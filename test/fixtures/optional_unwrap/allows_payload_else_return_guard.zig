@@ -1,6 +1,6 @@
 // EXPECT: none
-pub fn main() ?u8 {
-    var maybe: ?u8 = 1;
+pub fn check() ?u8 {
+    const maybe: ?u8 = 1;
     if (maybe) |value| {
         _ = value;
     } else {

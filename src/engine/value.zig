@@ -46,6 +46,14 @@ pub const AbstractValue = union(enum) {
                 .max = @max(self.max, other.max),
             };
         }
+
+        /// Preserve stable bounds and extend moving bounds to the `i64` domain limits.
+        pub fn widen(self: IntRange, other: IntRange) IntRange {
+            return .{
+                .min = if (other.min < self.min) std.math.minInt(i64) else self.min,
+                .max = if (other.max > self.max) std.math.maxInt(i64) else self.max,
+            };
+        }
     };
 
     pub fn eql(self: AbstractValue, other: AbstractValue) bool {
@@ -161,6 +169,15 @@ pub const AbstractValue = union(enum) {
         };
     }
 
+    /// Return the integer interval. Concrete integers form a single-value interval.
+    fn asIntRange(self: AbstractValue) ?IntRange {
+        return switch (self) {
+            .concrete_int => |v| IntRange.single(v),
+            .int_range => |r| r,
+            else => null,
+        };
+    }
+
     /// Widening operator for abstract values.
     /// Used at widening points to ensure convergence by over-approximating.
     /// Unlike merge, widen is not symmetric: `self` is the previous state at the widening point,
@@ -169,49 +186,23 @@ pub const AbstractValue = union(enum) {
     /// Widening rules:
     /// - If either is `unknown`, result is `unknown`.
     /// - `null_val` vs `non_null` -> `unknown`.
-    /// - `concrete_int` vs `concrete_int` -> same if equal; else widen to `unknown`.
-    /// - `int_range` widening: if bounds expand, widen to `unknown` (simple policy for convergence).
+    /// - `concrete_bool` vs anything else -> `unknown`; two equal bools are
+    ///   already returned unchanged by the equality check above.
+    /// - Integers widen as intervals (`IntRange.widen`): a bound that did not
+    ///   move is kept, a bound that moved is thrown to its end of the `i64`
+    ///   domain. A counter that grows keeps the value it started from as its
+    ///   lower bound instead of collapsing to `unknown`, so the loop
+    ///   condition can still tell which passes the loop really takes.
     pub fn widen(self: AbstractValue, other: AbstractValue) AbstractValue {
         if (self.eql(other)) return self;
 
-        return switch (self) {
-            .unknown => .unknown,
-            .null_val => switch (other) {
-                .null_val => .null_val,
-                else => .unknown,
-            },
-            .non_null => switch (other) {
-                .non_null => .non_null,
-                else => .unknown,
-            },
-            .concrete_int => |v1| switch (other) {
-                .concrete_int => |v2| if (v1 == v2) self else .unknown,
-                .int_range => .unknown,
-                else => .unknown,
-            },
-            .int_range => |r1| switch (other) {
-                .int_range => |r2| blk: {
-                    // If bounds expand in any direction, widen to unknown
-                    if (r2.min < r1.min or r2.max > r1.max) {
-                        break :blk .unknown;
-                    }
-                    // Bounds stayed the same or contracted, keep the merged range
-                    break :blk .{ .int_range = r1.merge(r2) };
-                },
-                .concrete_int => |v| blk: {
-                    // If the concrete value expands the range, widen to unknown
-                    if (v < r1.min or v > r1.max) {
-                        break :blk .unknown;
-                    }
-                    break :blk self;
-                },
-                else => .unknown,
-            },
-            .concrete_bool => |b1| switch (other) {
-                .concrete_bool => |b2| if (b1 == b2) self else .unknown,
-                else => .unknown,
-            },
-        };
+        if (self.asIntRange()) |previous| {
+            if (other.asIntRange()) |incoming| {
+                return .{ .int_range = previous.widen(incoming) };
+            }
+        }
+
+        return .unknown;
     }
 
     /// Returns true if `self` is at least as general as `other`.
@@ -363,60 +354,40 @@ test "AbstractValue merge operations" {
     try testing.expect(merged_same_nulls.isNull());
 }
 
-test "AbstractValue widen operations" {
+test "AbstractValue widening a loop counter reaches a fixed point" {
     const testing = std.testing;
     const IntRange = AbstractValue.IntRange;
 
-    // Widening identical values returns the same value
-    const concrete1: AbstractValue = .{ .concrete_int = 10 };
-    try testing.expect(concrete1.widen(concrete1).eql(concrete1));
+    // A counter that grows: the lower bound is the value the loop started
+    // from and the upper bound runs to the domain on the first back edge,
+    // then stays there. The guard `i < bound` narrows it back to the passes
+    // the loop really takes.
+    var growing: AbstractValue = .{ .concrete_int = 0 };
+    growing = growing.widen(.{ .concrete_int = 1 });
+    try testing.expect(growing.eql(.{ .int_range = IntRange.init(0, std.math.maxInt(i64)) }));
+    growing = growing.widen(.{ .concrete_int = 2 });
+    try testing.expect(growing.eql(.{ .int_range = IntRange.init(0, std.math.maxInt(i64)) }));
 
-    // Widening different concrete_ints widens to unknown
-    const concrete2: AbstractValue = .{ .concrete_int = 20 };
-    try testing.expect(concrete1.widen(concrete2).isUnknown());
+    // A counter that shrinks: the upper bound is the value it started from and
+    // the lower bound runs to the other end of the domain.
+    var shrinking: AbstractValue = .{ .concrete_int = 10 };
+    shrinking = shrinking.widen(.{ .concrete_int = 9 });
+    try testing.expect(shrinking.eql(.{ .int_range = IntRange.init(std.math.minInt(i64), 10) }));
+    shrinking = shrinking.widen(.{ .concrete_int = 8 });
+    try testing.expect(shrinking.eql(.{ .int_range = IntRange.init(std.math.minInt(i64), 10) }));
 
-    // Widening unknown with anything returns unknown
-    const unknown: AbstractValue = .unknown;
-    try testing.expect(unknown.widen(concrete1).isUnknown());
-    try testing.expect(concrete1.widen(unknown).isUnknown());
+    // A counter that starts below zero keeps that negative lower bound, so a
+    // guard of the form `i >= start` can still prove where the loop began.
+    var from_below_zero: AbstractValue = .{ .concrete_int = -5 };
+    from_below_zero = from_below_zero.widen(.{ .concrete_int = -4 });
+    try testing.expect(from_below_zero.eql(.{ .int_range = IntRange.init(-5, std.math.maxInt(i64)) }));
+    from_below_zero = from_below_zero.widen(.{ .concrete_int = -3 });
+    try testing.expect(from_below_zero.eql(.{ .int_range = IntRange.init(-5, std.math.maxInt(i64)) }));
 
-    // Widening null_val with non_null widens to unknown
-    const null_val: AbstractValue = .null_val;
-    const non_null: AbstractValue = .non_null;
-    try testing.expect(null_val.widen(non_null).isUnknown());
-    try testing.expect(non_null.widen(null_val).isUnknown());
-
-    // Widening identical null/non_null returns the same value
-    try testing.expect(null_val.widen(.null_val).isNull());
-    try testing.expect(non_null.widen(.non_null).isNonNull());
-
-    // Widening int_range: if new range expands bounds, widen to unknown
-    const range1: AbstractValue = .{ .int_range = IntRange.init(0, 10) };
-    const range2: AbstractValue = .{ .int_range = IntRange.init(-5, 10) }; // expands min
-    const range3: AbstractValue = .{ .int_range = IntRange.init(0, 15) }; // expands max
-    const range4: AbstractValue = .{ .int_range = IntRange.init(2, 8) }; // contracts
-    const range5: AbstractValue = .{ .int_range = IntRange.init(0, 10) }; // same
-
-    try testing.expect(range1.widen(range2).isUnknown());
-    try testing.expect(range1.widen(range3).isUnknown());
-
-    // Contracted or same range should preserve the range
-    const widened4 = range1.widen(range4);
-    try testing.expect(widened4.eql(range1));
-
-    const widened5 = range1.widen(range5);
-    try testing.expect(widened5.eql(range1));
-
-    // Widening int_range with concrete_int that expands bounds widens to unknown
-    const range_small: AbstractValue = .{ .int_range = IntRange.init(5, 15) };
-    const concrete_outside: AbstractValue = .{ .concrete_int = 20 };
-    const concrete_inside: AbstractValue = .{ .concrete_int = 10 };
-
-    try testing.expect(range_small.widen(concrete_outside).isUnknown());
-    try testing.expect(range_small.widen(concrete_inside).eql(range_small));
-
-    // Widening concrete_int with int_range widens to unknown
-    try testing.expect(concrete1.widen(range1).isUnknown());
+    // Once fixed, the widened counter covers every value the loop can still
+    // produce, so no later pass adds a state the header does not already hold.
+    try testing.expect(growing.subsumes(.{ .concrete_int = 99 }));
+    try testing.expect(shrinking.subsumes(.{ .concrete_int = -99 }));
 }
 
 test "AbstractValue concrete_bool merge and widen" {

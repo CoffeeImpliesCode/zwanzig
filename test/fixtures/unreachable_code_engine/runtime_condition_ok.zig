@@ -7,3 +7,5 @@ fn foo(trueValue: bool, falsey: bool) void {
         doWork();
     }
 }
+
+fn doWork() void {}

@@ -189,6 +189,34 @@ pub const LexicalIndex = struct {
         return self.ranges[if (token < self.scopes_by_token.len) self.scopes_by_token[token] else 0];
     }
 
+    /// The smallest container whose token range holds `token`, or null when the
+    /// index cannot name one. The walk starts at the stored owner of the
+    /// innermost scope and climbs stored parents, so it costs one chain instead
+    /// of a scan over every node. Null is deliberately ambiguous: it also covers
+    /// the root namespace, an index left inert by parser recovery, and tags that
+    /// do not describe this tree, so a caller that needs to tell those apart must
+    /// confirm them with its own walk.
+    pub fn smallestEnclosingContainer(
+        self: *const LexicalIndex,
+        tags: []const std.zig.Ast.Node.Tag,
+        token: u32,
+    ) ?u32 {
+        if (tags.len != self.ranges.len or self.scopes_by_token.len == 0) return null;
+        var node: u32 = if (token < self.scopes_by_token.len) self.scopes_by_token[token] else 0;
+        // Parent links are a forest over nodes, so a chain ends at a root
+        // declaration; the node count is that structural bound and no smaller.
+        var remaining: usize = self.ranges.len;
+        while (remaining != 0 and node < self.ranges.len) : (remaining -= 1) {
+            const range = self.ranges[node];
+            // A range that misses the token would mean a link that skips a level,
+            // which no ancestor chain has; report nothing rather than guess.
+            if (!range.contains(token)) return null;
+            if (call_resolver.isContainerTag(tags[node])) return node;
+            node = self.parent(node) orelse return null;
+        }
+        return null;
+    }
+
     pub fn isRootDeclaration(self: *const LexicalIndex, node: usize) bool {
         return node < self.root_declarations.len and self.root_declarations[node];
     }
@@ -362,4 +390,25 @@ test "lexical index releases partial syntax and name indexes on allocation failu
         }
     };
     try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{&tree});
+}
+
+test "a cyclic parent link ends the container walk without a claim" {
+    const ranges = [_]ScopeRange{
+        .{ .first_token = 0, .last_token = 9 },
+        .{ .first_token = 0, .last_token = 9 },
+        .{ .first_token = 0, .last_token = 9 },
+    };
+    // Node 1 and node 2 point at each other, and neither is a container, so a
+    // walk that trusts the links alone would never reach a claim.
+    const parents = [_]u32{ 0, 2, 1 };
+    var scopes_by_token = [_]u32{0} ** 10;
+    scopes_by_token[5] = 1;
+    const tags = [_]std.zig.Ast.Node.Tag{ .root, .block, .block_two };
+    const index: LexicalIndex = .{
+        .ranges = &ranges,
+        .parents = &parents,
+        .scopes_by_token = &scopes_by_token,
+    };
+    try std.testing.expectEqual(@as(?u32, null), index.smallestEnclosingContainer(&tags, 5));
+    try std.testing.expectEqual(@as(?u32, null), index.smallestEnclosingContainer(&tags, 1));
 }

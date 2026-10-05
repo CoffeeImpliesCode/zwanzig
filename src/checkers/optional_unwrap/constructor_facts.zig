@@ -8,9 +8,11 @@
 //! assumed, so a runtime flag with the same spelling proves nothing, and a
 //! constructor whose guard is missing leaves the use unproven.
 //!
-//! Construction facts apply only to a closed source: no exported declarations
-//! except a parameterless `main` returning `void`, no address escapes, and no
-//! writes or opaque calls that can change the field. A public factory or an
+//! Construction facts apply only to a closed source: no exported declaration
+//! that names the container, no address of the container or of anything this
+//! file cannot type, and no writes or opaque calls that can change the field.
+//! A public factory, whether it builds the container itself or forwards it
+//! through a private alias, a public function over the container, or an
 //! untracked receiver keeps the unwrap unproven.
 const lexical_index = @import("../../analysis/lexical_index.zig");
 const std = @import("std");
@@ -115,6 +117,16 @@ const ParameterFacts = struct {
     }
 };
 
+/// The allocator a container-exposure question may spend on remembering the
+/// answers it reaches. This file's query borrows source-owned syntax and
+/// builds no index of its own, so it brings no allocator of its own: the type
+/// context's is the one the caller already handed this check, and a query that
+/// arrived without one has nothing to borrow but the page allocator, which
+/// serves a list of node ids and is freed before the question ends.
+fn queryAllocator(type_context: ?*TypeContext) std.mem.Allocator {
+    return if (type_context) |context| context.allocator else std.heap.page_allocator;
+}
+
 pub fn isProvenByConditionalConstruction(
     query: *const QueryContext,
     unwrap_node: u32,
@@ -131,7 +143,8 @@ pub fn isProvenByConditionalConstruction(
     const receiver = @intFromEnum(tree.nodes.items(.data)[unwrapped_var].node_and_token[0]);
     if (!isReceiverOfFirstParameter(query, receiver, fn_decl)) return false;
     const container = enclosingContainer(query, fn_decl) orelse return false;
-    if (tree.errors.len != 0 or !sourcePreservesField(query, container, field_token)) return false;
+
+    if (tree.errors.len != 0 or !sourcePreservesField(query, container, field_token, queryAllocator(type_context))) return false;
 
     var required = Literals{};
     var sites: usize = 0;
@@ -153,10 +166,19 @@ pub fn isProvenByConditionalConstruction(
 /// A constructor cannot establish a lifetime invariant for exported or escaped
 /// mutable storage. Keep this proof inside one closed source and inspect every
 /// write and call, including callers and sibling methods.
-fn sourcePreservesField(query: *const QueryContext, container: u32, field_token: u32) bool {
+fn sourcePreservesField(
+    query: *const QueryContext,
+    container: u32,
+    field_token: u32,
+    allocator: std.mem.Allocator,
+) bool {
     const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const datas = tree.nodes.items(.data);
+    // One container, one question: every answer below is a fact about this
+    // container, so a helper answered once is answered for the whole walk.
+    var answered = Answered.init(allocator);
+    defer answered.deinit();
     for (tree.rootDecls()) |decl| {
         const node = @intFromEnum(decl);
         if (tree.fullVarDecl(decl)) |full| {
@@ -169,7 +191,14 @@ fn sourcePreservesField(query: *const QueryContext, container: u32, field_token:
                 }
                 if (proto.visib_token != null) {
                     const name = proto.name_token orelse return false;
-                    if (!std.mem.eql(u8, tree.tokenSlice(name), "main") or proto.ast.params.len != 0) return false;
+                    // `main` is handed no storage this file owns; every
+                    // other exported function is a way in only when it names
+                    // the container.
+                    if (!std.mem.eql(u8, tree.tokenSlice(name), "main")) {
+                        if (exportedDeclarationExposesContainer(query, &answered, node, container)) return false;
+                        continue;
+                    }
+                    if (proto.ast.params.len != 0) return false;
                     var result = @intFromEnum(proto.ast.return_type);
                     if (tags[result] == .error_union) result = @intFromEnum(datas[result].node_and_node[1]);
                     if (tags[result] != .identifier or !std.mem.eql(u8, tree.tokenSlice(tree.nodes.items(.main_token)[result]), "void")) return false;
@@ -183,7 +212,18 @@ fn sourcePreservesField(query: *const QueryContext, container: u32, field_token:
             .identifier => {
                 if (std.mem.eql(u8, tree.tokenSlice(tree.nodes.items(.main_token)[node]), "undefined")) return false;
             },
-            .address_of, .@"asm", .asm_simple, .assign_destructure => return false,
+            .address_of => {
+                // A pointer to the container, or to something this file cannot
+                // type, puts a field within reach of code that may write it. A
+                // pointer to a value it can type -- a function kept alive by
+                // its own address -- cannot name this container at all.
+                const operand = @intFromEnum(datas[node].node);
+                switch (valueKind(query, operand, container, 0)) {
+                    .scalar, .namespace => {},
+                    .container, .unknown => return false,
+                }
+            },
+            .@"asm", .asm_simple, .assign_destructure => return false,
             .assign,
             .assign_mul,
             .assign_div,
@@ -241,6 +281,397 @@ fn sourcePreservesField(query: *const QueryContext, container: u32, field_token:
         }
     }
     return true;
+}
+
+/// An exported function is a way for code outside this file to reach the
+/// container only when it names it or hands one back. A public function over
+/// unrelated values is handed no container, builds none, and can pass none on,
+/// so its presence cannot change a field this file owns.
+fn exportedDeclarationExposesContainer(
+    query: *const QueryContext,
+    answered: *Answered,
+    fn_decl: u32,
+    container: u32,
+) bool {
+    // The generic function that returns the container is its own factory.
+    if (isFactoryFunction(query, fn_decl, container)) return true;
+
+    const tree = query.tree;
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = treeFnProto(tree, fn_decl, &buffer) orelse return true;
+    // An unstated return type is taken from the body, which the scan below
+    // may not see: this file does not know what such a signature hands out.
+    const result_node = proto.ast.return_type.unwrap() orelse return true;
+    if (typeValueKind(query, @intFromEnum(result_node), container, 0) == .container) return true;
+    for (proto.ast.params) |param| {
+        const written = parameterTypeNode(tree, @intFromEnum(param)) orelse return true;
+        if (typeValueKind(query, written, container, 0) == .container) return true;
+    }
+    // What this declaration hands back is exposure on its own, and a name bound
+    // to a call is a name as much as the call is: `const Alias = Iterator(true);
+    // pub fn makeType() type { return Alias; }` writes the container down where a
+    // scan for names that resolve to functions of this file cannot see it. The
+    // walk over helpers' own results already follows such a binding, and it
+    // answers this exported declaration from its own result for the same
+    // reason it answers a helper: what it cannot rule out as a scalar is a way
+    // out of this file.
+    if (producesContainer(query, answered, fn_decl, container, null)) return true;
+    return mentionsContainer(query, answered, fn_decl, container);
+}
+
+/// The names from which a value of this container can be written down inside
+/// one declaration: the container declaration itself, the factory that returns
+/// it, and the private helpers that forward the factory's type -- `fn Alias()
+/// type { return Iterator(true); }` hands out the very container one call
+/// removed. Every other name there belongs to somebody else's type.
+fn mentionsContainer(query: *const QueryContext, answered: *Answered, fn_decl: u32, container: u32) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const main_tokens = tree.nodes.items(.main_token);
+    if (fn_decl >= tree.nodes.len or tags[fn_decl] != .fn_decl) return true;
+    const first = tree.firstToken(@enumFromInt(fn_decl));
+    const last = tree.lastToken(@enumFromInt(fn_decl));
+
+    for (tags, 0..) |tag, index| {
+        if (index == 0) continue;
+        if (tag != .identifier and !call_resolver.isContainerTag(tag)) continue;
+        const node: u32 = @intCast(index);
+        const start = tree.firstToken(@enumFromInt(node));
+        if (start < first or start > last) continue;
+        if (node == container) return true;
+        if (tag != .identifier) continue;
+        const token = main_tokens[node];
+        if (token >= tree.tokens.len or tree.tokenTag(token) != .identifier) continue;
+        const name = import_resolver.normalizeIdentifier(tree.tokenSlice(token));
+        const function = query.lexical.findFunction(name, token) orelse continue;
+        if (producesContainer(query, answered, function, container, null)) return true;
+    }
+    return false;
+}
+
+/// One step of the route the walk is following right now. The record lives in
+/// the frame that took the step and points at the step below it, so a route
+/// extends itself without allocating anything and without being copied: each
+/// function and each expression records itself in the frame it is asked
+/// about. Meeting a node this same route already walked means the walk has
+/// stopped describing helpers that forward a type and started describing a
+/// cycle, which is not evidence about any container. Every branch records its
+/// own path, so a helper reached twice by different branches is a route seen
+/// twice, not a cycle.
+const Route = struct {
+    const Kind = enum { function, expression };
+
+    kind: Kind,
+    node: u32,
+    parent: ?*const Route,
+};
+
+fn routeRepeats(outer: ?*const Route, kind: Route.Kind, node: u32) bool {
+    var step = outer;
+    while (step) |current| : (step = current.parent) {
+        if (current.kind == kind and current.node == node) return true;
+    }
+    return false;
+}
+
+/// The helpers one container-exposure question has already finished at
+/// `false`, so that a helper reached along many paths is walked once.
+///
+/// A helper's answer does not depend on the arguments it was called with: this
+/// walk reads the helper's own signature and its own return expressions and
+/// resolves callees by name inside the file. The route a helper is reached by
+/// changes only where a cycle stops the walk, and a stopped walk answers `true`
+/// rather than `false`, so an answer kept here is the same on every path. Only
+/// `false` is kept: a `true` either is evidence or is the walk declining to
+/// answer, and both end the question that asked, so neither is reusable.
+///
+/// The inline table covers every source in practice without allocating. Past it
+/// the same list continues in memory the question's allocator owns; a list
+/// that cannot grow is not a smaller answer, only a longer walk, so a failed
+/// growth keeps what fits and grants nothing.
+const Answered = struct {
+    const inline_capacity = 16;
+
+    allocator: std.mem.Allocator,
+    fixed: [inline_capacity]u32 = undefined,
+    len: usize = 0,
+    /// The inline table continued, kept ascending so a lookup halves.
+    spilled: std.ArrayList(u32) = .empty,
+
+    fn init(allocator: std.mem.Allocator) Answered {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *Answered) void {
+        self.spilled.deinit(self.allocator);
+    }
+
+    /// Has `function` already been walked all the way to `false`?
+    fn holds(self: *const Answered, function: u32) bool {
+        for (self.fixed[0..self.len]) |answered| {
+            if (answered == function) return true;
+        }
+        const at = insertion(self.spilled.items, function);
+        return at < self.spilled.items.len and self.spilled.items[at] == function;
+    }
+
+    fn record(self: *Answered, function: u32) void {
+        if (self.len < inline_capacity) {
+            self.fixed[self.len] = function;
+            self.len += 1;
+            return;
+        }
+        const at = insertion(self.spilled.items, function);
+        if (at < self.spilled.items.len and self.spilled.items[at] == function) return;
+        self.spilled.insert(self.allocator, at, function) catch return;
+    }
+};
+
+/// Where `function` sits in an ascending list of answered helpers, or where it
+/// would sit.
+fn insertion(sorted: []const u32, function: u32) usize {
+    var low: usize = 0;
+    var high = sorted.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (sorted[middle] < function) low = middle + 1 else high = middle;
+    }
+    return low;
+}
+
+/// Can calling `function` hand a value of the container back to whoever called
+/// it? The generic factory that builds the container is one such route, and so
+/// is a helper of this file that declares the container as its result or
+/// forwards a call to another such helper. Only functions this file declares
+/// are followed, and only for as long as the route stays a route: a function
+/// this route has already walked is a cycle, and a cycle -- like any other
+/// unanswerable question about an exported declaration -- is a way out of this
+/// file.
+///
+/// `answered` is what makes this a walk rather than a reenumeration of paths:
+/// a helper already finished at `false` answers `false` again for every later
+/// path to it, and a helper that hands the container back ends the question
+/// before any of that matters.
+fn producesContainer(
+    query: *const QueryContext,
+    answered: *Answered,
+    function: u32,
+    container: u32,
+    outer: ?*const Route,
+) bool {
+    // A helper this question already walked all the way to `false` answers
+    // `false` for every later path to it. Such an answer is the same on every
+    // path: the walk read the helper's own signature and its own return
+    // expressions and never its arguments, and it resolved nothing as
+    // unknown, or it would have answered `true` and never been recorded. A
+    // factory answers `true` before it can be recorded at all, so this can
+    // stand ahead of the factory check without hiding one.
+    if (answered.holds(function)) return false;
+    if (isFactoryFunction(query, function, container)) return true;
+    const tree = query.tree;
+    if (function >= tree.nodes.len) return true;
+
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = treeFnProto(tree, function, &buffer) orelse return true;
+    const declared: ValueKind = if (proto.ast.return_type.unwrap()) |written|
+        typeValueKind(query, @intFromEnum(written), container, 0)
+    else
+        .scalar;
+    if (declared == .container) return true;
+    if (declared == .scalar) return false;
+
+    if (routeRepeats(outer, .function, function)) return true;
+    const route = Route{ .kind = .function, .node = function, .parent = outer };
+
+    // A resolved callee is a prototype, and a prototype's own tokens stop at
+    // the end of its signature. What the function hands back is written in
+    // the declaration that owns it, so the walk reads that declaration: read
+    // the prototype instead, it finds no `return` at all, every helper answers
+    // `false`, and the answer this question remembers is that a factory
+    // reached through a private alias cannot be reached at all.
+    const declaration = declaringFunction(query, function) orelse return true;
+    const tags = tree.nodes.items(.tag);
+    const first = tree.firstToken(@enumFromInt(declaration));
+    const last = tree.lastToken(@enumFromInt(declaration));
+    for (tags, 0..) |tag, index| {
+        if (tag != .@"return") continue;
+        const node: u32 = @intCast(index);
+        const start = tree.firstToken(@enumFromInt(node));
+        if (start < first or start > last) continue;
+        const value = tree.nodes.items(.data)[node].opt_node.unwrap() orelse continue;
+        if (returnedValueIsContainer(query, answered, @intFromEnum(value), container, &route)) return true;
+    }
+    answered.record(function);
+    return false;
+}
+
+/// Does `expression` evaluate to the container? Only helpers whose own
+/// signature this file has not already ruled out as a scalar reach here, so
+/// no shape below has to be closed again by that signature and every shape
+/// this walk cannot name a type for stays open. The shapes that do name a type
+/// are followed: a call to a function of this file, a name bound to such a
+/// call, a branch, an unwrapped optional, and `@TypeOf` of anything of those.
+fn returnedValueIsContainer(
+    query: *const QueryContext,
+    answered: *Answered,
+    expression: u32,
+    container: u32,
+    outer: ?*const Route,
+) bool {
+    const tree = query.tree;
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    if (expression == 0 or expression >= tree.nodes.len) return true;
+    if (routeRepeats(outer, .expression, expression)) return true;
+    const route = Route{ .kind = .expression, .node = expression, .parent = outer };
+
+    switch (tags[expression]) {
+        .number_literal,
+        .char_literal,
+        .string_literal,
+        .multiline_string_literal,
+        .enum_literal,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .less_or_equal,
+        .greater_than,
+        .greater_or_equal,
+        .bool_and,
+        .bool_or,
+        .bool_not,
+        .struct_init,
+        .struct_init_comma,
+        .struct_init_one,
+        .struct_init_one_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .array_init,
+        .array_init_comma,
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        => return false,
+
+        .grouped_expression => return returnedValueIsContainer(
+            query,
+            answered,
+            @intFromEnum(datas[expression].node_and_token[0]),
+            container,
+            &route,
+        ),
+        .@"comptime", .@"try" => return returnedValueIsContainer(
+            query,
+            answered,
+            @intFromEnum(datas[expression].node),
+            container,
+            &route,
+        ),
+
+        .unwrap_optional => {
+            // `?T` unwraps to `T`, so an optional of the container hands back
+            // a container and its operand decides.
+            return returnedValueIsContainer(
+                query,
+                answered,
+                @intFromEnum(datas[expression].node_and_token[0]),
+                container,
+                &route,
+            );
+        },
+
+        .@"orelse", .@"catch" => {
+            inline for (datas[expression].node_and_node) |operand| {
+                if (returnedValueIsContainer(query, answered, @intFromEnum(operand), container, &route)) return true;
+            }
+            return false;
+        },
+
+        .@"if", .if_simple => {
+            const full = tree.fullIf(@enumFromInt(expression)) orelse return true;
+            const then_expr = branchValue(tree, @intFromEnum(full.ast.then_expr)) orelse return true;
+            if (returnedValueIsContainer(query, answered, then_expr, container, &route)) return true;
+            const else_node = full.ast.else_expr.unwrap() orelse return true;
+            const else_expr = branchValue(tree, @intFromEnum(else_node)) orelse return true;
+            return returnedValueIsContainer(query, answered, else_expr, container, &route);
+        },
+
+        .call, .call_comma, .call_one, .call_one_comma => {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, @enumFromInt(expression)) orelse return true;
+            // A callee this file cannot resolve hands back whatever that callee
+            // returns, which is a type this file cannot type.
+            const callee = localCallable(query, @intFromEnum(call.ast.fn_expr), container, 0) orelse return true;
+            return producesContainer(query, answered, callee, container, &route);
+        },
+
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+            const name = tree.tokenSlice(tree.nodes.items(.main_token)[expression]);
+            if (!std.mem.eql(u8, name, "@TypeOf")) return true;
+            var buffer: [2]std.zig.Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buffer, @enumFromInt(expression)) orelse return true;
+            if (params.len != 1) return true;
+            return returnedValueIsContainer(query, answered, @intFromEnum(params[0]), container, &route);
+        },
+
+        .field_access => {
+            // A member of a namespace names a declaration and a member of a
+            // value is one, but which member it is cannot be read from the
+            // shape, and this walk is only reached by a helper whose own
+            // result it has not already ruled out as a scalar. So there is no
+            // helper signature left to close this shape with and it stays
+            // open, exactly as it did when the signature was consulted here.
+            return true;
+        },
+
+        .identifier => {
+            const token = tree.nodes.items(.main_token)[expression];
+            if (token >= tree.tokens.len or tree.tokenTag(token) != .identifier) return true;
+            const name = import_resolver.normalizeIdentifier(tree.tokenSlice(token));
+            if (query.lexical.findFunction(name, token)) |function| {
+                return producesContainer(query, answered, function, container, &route);
+            }
+            const candidate = bindingOf(query, expression) orelse return true;
+            if (candidate.kind != .variable) return true;
+            const full = tree.fullVarDecl(@enumFromInt(candidate.node)) orelse return true;
+            // A written type settles the binding in only two ways: naming the
+            // container is the container, and a proven scalar can never become
+            // one. Every other spelling -- `type`, `?Container`, a name this
+            // file cannot resolve -- leaves the initializer in charge, so
+            // `const Alias: type = makeType();` still follows `makeType()`,
+            // and a written type this walk cannot follow at all stays open.
+            if (full.ast.type_node.unwrap()) |written| {
+                const written_kind = typeValueKind(query, @intFromEnum(written), container, 0);
+                if (written_kind == .container) return true;
+                if (written_kind == .scalar) return false;
+            }
+            const init = full.ast.init_node.unwrap() orelse return true;
+            return returnedValueIsContainer(query, answered, @intFromEnum(init), container, &route);
+        },
+
+        else => return true,
+    }
+}
+
+/// The value an `if` arm produces when the `if` is used as an expression: the
+/// parser wraps a bare arm in a block, and the wrapper is not part of the value.
+fn branchValue(tree: *const std.zig.Ast, node: u32) ?u32 {
+    const tags = tree.nodes.items(.tag);
+    if (node == 0 or node >= tree.nodes.len) return null;
+    switch (tags[node]) {
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var buffer: [2]u32 = undefined;
+            const statements = ast_walk.getBlockStatements(tree, node, &buffer) orelse return null;
+            if (statements.len != 1) return null;
+            return statements[0];
+        },
+        else => return node,
+    }
 }
 
 const ValueKind = enum { scalar, container, namespace, unknown };
@@ -327,6 +758,15 @@ fn valueKind(query: *const QueryContext, node: u32, container: u32, depth: u32) 
             const base = valueKind(query, @intFromEnum(field[0]), container, depth + 1);
             return if (base == .namespace) .namespace else .unknown;
         },
+        .array_access => {
+            // An element read out of an array is a value of that array's
+            // element type, so the container is only in reach through an
+            // array of containers. This file reads the element type through
+            // the same analysis it reads every other type reference with, and
+            // a base whose type it cannot name proves nothing either way.
+            const element = arrayElementType(query, @intFromEnum(datas[node].node_and_node[0]), container, depth + 1) orelse return .unknown;
+            return typeValueKind(query, element, container, depth + 1);
+        },
         .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
             const name = tree.tokenSlice(tree.nodes.items(.main_token)[node]);
             if (std.mem.eql(u8, name, "@import")) return .namespace;
@@ -348,13 +788,57 @@ fn valueKind(query: *const QueryContext, node: u32, container: u32, depth: u32) 
             const proto = treeFnProto(tree, function, &proto_buffer) orelse return .unknown;
             return typeValueKind(query, @intFromEnum(proto.ast.return_type), container, depth + 1);
         },
-        .grouped_expression, .@"comptime", .@"try" => return valueKind(query, @intFromEnum(datas[node].node), container, depth + 1),
+        .grouped_expression => return valueKind(query, @intFromEnum(datas[node].node_and_token[0]), container, depth + 1),
+        .@"comptime", .@"try" => return valueKind(query, @intFromEnum(datas[node].node), container, depth + 1),
         .unwrap_optional => return valueKind(query, @intFromEnum(datas[node].node_and_token[0]), container, depth + 1),
         else => return .unknown,
     }
 }
 
-fn localCallable(query: *const QueryContext, expr: u32, container: u32, depth: u32) ?u32 {
+/// The element type of the array a value is a value of, when this file can
+/// name that type: the written type of the binding it is read through, or the
+/// result type of the call that binding is initialized from. Null when the
+/// value is not an array, or when the type it has cannot be read here.
+fn arrayElementType(query: *const QueryContext, node: u32, container: u32, depth: u32) ?u32 {
+    const tree = query.tree;
+    if (node == 0 or node >= tree.nodes.len or depth >= 64) return null;
+    const tags = tree.nodes.items(.tag);
+    switch (tags[node]) {
+        .identifier => {
+            const candidate = bindingOf(query, node) orelse return null;
+            if (candidate.kind != .variable) return null;
+            const full = tree.fullVarDecl(@enumFromInt(candidate.node)) orelse return null;
+            if (full.ast.type_node.unwrap()) |written| return arrayElementTypeNode(tree, @intFromEnum(written));
+            const init = full.ast.init_node.unwrap() orelse return null;
+            return arrayElementType(query, @intFromEnum(init), container, depth + 1);
+        },
+        .call, .call_comma, .call_one, .call_one_comma => {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, @enumFromInt(node)) orelse return null;
+            const function = localCallable(query, @intFromEnum(call.ast.fn_expr), container, depth + 1) orelse return null;
+            var proto_buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const proto = treeFnProto(tree, function, &proto_buffer) orelse return null;
+            const result = proto.ast.return_type.unwrap() orelse return null;
+            return arrayElementTypeNode(tree, @intFromEnum(result));
+        },
+        else => return null,
+    }
+}
+
+/// The element type expression of an array type.
+fn arrayElementTypeNode(tree: *const std.zig.Ast, type_node: u32) ?u32 {
+    if (type_node >= tree.nodes.len) return null;
+    const tags = tree.nodes.items(.tag);
+    switch (tags[type_node]) {
+        .array_type, .array_type_sentinel => {},
+        else => return null,
+    }
+    const array = tree.fullArrayType(@enumFromInt(type_node)) orelse return null;
+    const element = @intFromEnum(array.ast.elem_type);
+    return if (element >= tree.nodes.len) null else element;
+}
+
+pub fn localCallable(query: *const QueryContext, expr: u32, container: u32, depth: u32) ?u32 {
     const tree = query.tree;
     if (expr == 0 or expr >= tree.nodes.len or depth >= 64) return null;
     const tags = tree.nodes.items(.tag);
@@ -386,7 +870,7 @@ fn isFactoryFunction(query: *const QueryContext, function: u32, container: u32) 
 // Construction sites
 // ---------------------------------------------------------------------------
 
-fn structInitAt(tags: []const std.zig.Ast.Node.Tag, node: u32) ?u32 {
+pub fn structInitAt(tags: []const std.zig.Ast.Node.Tag, node: u32) ?u32 {
     return switch (tags[node]) {
         .struct_init,
         .struct_init_comma,
@@ -772,10 +1256,16 @@ fn collectLiterals(out: *Literals, query: *const QueryContext, condition: u32, a
     if (condition >= tags.len) return;
 
     switch (tags[condition]) {
-        .grouped_expression, .@"comptime" => collectLiterals(
+        .grouped_expression => collectLiterals(
             out,
             query,
             @intFromEnum(datas[condition].node_and_token[0]),
+            assumed,
+        ),
+        .@"comptime" => collectLiterals(
+            out,
+            query,
+            @intFromEnum(datas[condition].node),
             assumed,
         ),
         .bool_not => collectLiterals(out, query, @intFromEnum(datas[condition].node), !assumed),
@@ -837,7 +1327,7 @@ fn parameterNameToken(query: *const QueryContext, ident_node: u32) ?u32 {
 
 /// The declared type of a parameter, whether the AST spells it as a var decl
 /// (`name: T = default`) or leaves only the type expression in place.
-fn parameterTypeNode(tree: *const std.zig.Ast, param: u32) ?u32 {
+pub fn parameterTypeNode(tree: *const std.zig.Ast, param: u32) ?u32 {
     if (param >= tree.nodes.len) return null;
     if (tree.fullVarDecl(@enumFromInt(param))) |full| {
         const type_node = full.ast.type_node.unwrap() orelse return null;
@@ -850,7 +1340,7 @@ fn parameterTypeNode(tree: *const std.zig.Ast, param: u32) ?u32 {
 // Structure helpers
 // ---------------------------------------------------------------------------
 
-fn treeFnProto(
+pub fn treeFnProto(
     tree: *const std.zig.Ast,
     node: u32,
     buffer: *[1]std.zig.Ast.Node.Index,
@@ -872,12 +1362,24 @@ fn treeFnProto(
 }
 
 /// The `fn_decl` that lexically holds `node`.
-fn enclosingFunction(query: *const QueryContext, node: u32) ?u32 {
+pub fn enclosingFunction(query: *const QueryContext, node: u32) ?u32 {
     if (node >= query.tree.nodes.len) return null;
     return query.lexical.enclosingFunction(query.firstToken(node));
 }
 
-fn enclosingContainer(query: *const QueryContext, node: u32) ?u32 {
+/// The declaration that owns the body `function` describes. Project
+/// declaration resolution answers with the prototype node, whose tokens stop
+/// at the signature, so every read of what a function hands back has to climb
+/// to the declaration first. Null when no declaration owns it, which is a body
+/// this file cannot read rather than a body that returns nothing.
+fn declaringFunction(query: *const QueryContext, function: u32) ?u32 {
+    const tree = query.tree;
+    if (function >= tree.nodes.len) return null;
+    if (tree.nodes.items(.tag)[function] == .fn_decl) return function;
+    return query.lexical.enclosingFunction(query.firstToken(function));
+}
+
+pub fn enclosingContainer(query: *const QueryContext, node: u32) ?u32 {
     const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     const first_token = query.firstToken(node);
@@ -895,7 +1397,7 @@ fn enclosingContainer(query: *const QueryContext, node: u32) ?u32 {
 /// alias resolves to it directly, and every other spelling goes through the
 /// project's declaration resolution, so a same-named type elsewhere does not
 /// match.
-fn denotesContainer(query: *const QueryContext, type_node: u32, container: u32) bool {
+pub fn denotesContainer(query: *const QueryContext, type_node: u32, container: u32) bool {
     const tree = query.tree;
     const tags = tree.nodes.items(.tag);
     if (type_node >= tree.nodes.len) return false;
@@ -1025,6 +1527,21 @@ test "constructor field proof requires closed storage throughout its lifetime" {
         .{ .name = "callee field reset", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "self.fill = null;", "", "", "var it = Iterator(true).init(1); _ = it.next();"), .warnings = 1 },
         .{ .name = "opaque receiver borrow", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "other.clear(self);", "", "const other = @import(\"other.zig\");", "var it = Iterator(true).init(1); _ = it.next();"), .warnings = 1 },
         .{ .name = "public type factory", .input = constructorFixture("pub ", "std.debug.assert", "if (!pad) return null;", "", "", "", "var it = Iterator(true).init(1); _ = it.next();"), .warnings = 1 },
+        .{ .name = "unrelated exported function", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "pub fn peek(value: ?u8) u8 { return value orelse 0; }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "unrelated function address", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn peek() void {}", "var it = Iterator(true).init(1); _ = &peek; std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "exported container factory", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "pub fn blank() Iterator(true) { return .{ .fill = 1 }; }", "var it = Iterator(true).init(1); _ = it.next();"), .warnings = 1 },
+        .{ .name = "exported factory through a private alias", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn Alias() type { return Iterator(true); }\npub fn makeType() type { return Alias(); }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "exported factory through a parenthesized alias", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn Alias() type { return (Iterator(true)); }\npub fn makeType() type { return Alias(); }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "exported factory through a conditional alias", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn Alias() type { return if (comptime false) Iterator(true) else Iterator(true); }\npub fn makeType() type { return Alias(); }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "exported factory through a typed local alias", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn Alias() type { const T: type = Iterator(true); return T; }\npub fn makeType() type { return Alias(); }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "exported factory through an optional alias", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn Alias() type { return ?Iterator(true); }\npub fn makeType() type { return Alias(); }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "exported factory through an alias into another module", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "const other = @import(\"other.zig\");\nfn Alias() type { return other.container(); }\npub fn makeType() type { return Alias(); }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 1 },
+        .{ .name = "exported factory through a value binding", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "const Alias = Iterator(true);\npub fn makeType() type { return Alias; }", "const T = makeType(); _ = T;"), .warnings = 1 },
+        .{ .name = "unrelated exported function forwarding a private helper", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn scale(value: u8) u8 { return std.math.clamp(value, 0, 100); }\npub fn peek(value: u8) u8 { return scale(value); }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "unrelated scalar route longer than any walk budget", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "fn hop1(value: u8) u8 { return value; }\nfn hop2(value: u8) u8 { return hop1(value); }\nfn hop3(value: u8) u8 { return hop2(value); }\nfn hop4(value: u8) u8 { return hop3(value); }\nfn hop5(value: u8) u8 { return hop4(value); }\nfn hop6(value: u8) u8 { return hop5(value); }\nfn hop7(value: u8) u8 { return hop6(value); }\nfn hop8(value: u8) u8 { return hop7(value); }\nfn hop9(value: u8) u8 { return hop8(value); }\nfn hop10(value: u8) u8 { return hop9(value); }\npub fn peek(value: u8) u8 { return hop10(value); }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "unrelated shared helper graph past the inline answer table", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", sharedHelperChain(20) ++ "pub fn peek(value: u8) [1]u8 { return hop20(value); }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "shared aggregate helper read by a consumer of its element", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", sharedHelperChain(20) ++ "pub fn aggregate(value: u8) [1]u8 { return hop20(value); }\n" ++ "test \"shared aggregate helper preserves the input byte\" { const result = aggregate(7); try std.testing.expectEqual(@as(u8, 7), result[0]); }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
+        .{ .name = "unrelated exported function forwarding a bound value", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "", "const Defaults = makeDefaults();\nfn makeDefaults() [1]u8 { return [_]u8{7}; }\npub fn defaults() [1]u8 { return Defaults; }", "var it = Iterator(true).init(1); std.debug.assert(it.next() == 1);"), .warnings = 0 },
         .{ .name = "missing comptime guard", .input = constructorFixture("", "std.debug.assert", "", "", "", "", "var it = Iterator(false).init(null); _ = it.next();"), .warnings = 1 },
         .{ .name = "fake assertion", .input = constructorFixture("", "fakeAssert", "if (!pad) return null;", "", "", "fn fakeAssert(condition: bool) void { _ = condition; }", "var it = Iterator(true).init(null); _ = it.next();"), .warnings = 1 },
         .{ .name = "nullable alternative constructor", .input = constructorFixture("", "std.debug.assert", "if (!pad) return null;", "", "pub fn blank() Self { return .{ .fill = null }; }", "", "var it = Iterator(true).blank(); _ = it.next();"), .warnings = 1 },
@@ -1048,6 +1565,26 @@ test "constructor field proof requires closed storage throughout its lifetime" {
         };
         for (diagnostics.items) |diagnostic| try std.testing.expectEqualStrings("optional-unwrap", diagnostic.rule_id);
     }
+}
+
+/// Helpers that hand back an unrelated `[1]u8` -- a type this file cannot
+/// read as scalar and cannot read as the container either -- with every one of
+/// them naming the previous helper from *both* arms of one branch. Every path
+/// through the chain therefore reaches the same helper, so a walk that reads a
+/// helper once per path grows as the number of paths, while a walk that
+/// remembers a finished `false` reads each helper once however many paths
+/// arrive at it. The chain is longer than the inline answer table, so the
+/// answers past it live in the spill.
+fn sharedHelperChain(comptime last: usize) []const u8 {
+    comptime var text: []const u8 = "fn hop0(value: u8) [1]u8 { return .{value}; }\n";
+    comptime var index: usize = 1;
+    inline while (index <= last) : (index += 1) {
+        text = text ++ std.fmt.comptimePrint(
+            "fn hop{d}(value: u8) [1]u8 {{ return if (value > {d}) hop{d}(value) else hop{d}(value); }}\n",
+            .{ index, index, index - 1, index - 1 },
+        );
+    }
+    return text;
 }
 
 fn constructorFixture(

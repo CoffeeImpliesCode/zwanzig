@@ -14,6 +14,16 @@ const zir_bridge_mod = @import("../zir_bridge.zig");
 /// - Parameter and payload names: snake_case
 /// - SCREAMING_SNAKE_CASE is allowed only when aliasing external conventions
 ///
+/// The convention is chosen from the resolved type-versus-value result of the
+/// declaration, not from the capitalization of what it is bound to. A type
+/// value is proved by the initializer expression itself: a type-producing
+/// builtin, a generic type factory call, a `@typeInfo` field that carries a
+/// type, a namespace member the resolver proves to be a type, a labeled block
+/// whose every break carries one, or a conditional or switch whose every branch
+/// carries one. A value member is proved the same way, and a member of a
+/// namespace declared by another file is left alone because its result is
+/// unknown rather than assumed.
+///
 /// Names starting with underscore (_) are ignored as they indicate
 /// intentionally ignored/internal identifiers.
 pub const IdentifierStyleRule = struct {
@@ -230,7 +240,7 @@ pub const IdentifierStyleRule = struct {
         const is_type_value_expr = blk: {
             if (!is_const) break :blk false;
             const init_idx = init_idx_opt orelse break :blk false;
-            break :blk isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, init_idx);
+            break :blk isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, init_idx, type_value_hops);
         };
 
         const zir_classification = classifyDeclWithTypeInfo(src, name, node_idx);
@@ -291,6 +301,15 @@ pub const IdentifierStyleRule = struct {
                 return;
             },
             .unknown => {
+                // A member of a namespace declared by another file has no
+                // resolved type-versus-value result here. Asserting either
+                // convention from the member's spelling would report a rule the
+                // resolution never proved, so the alias is left alone.
+                if (is_const) {
+                    if (init_idx_opt) |init_idx| {
+                        if (isInvisibleNamespaceMember(tree, tags, datas, token_tags, init_idx)) return;
+                    }
+                }
                 // ZIR info not available, fall back to heuristic analysis
             },
         }
@@ -335,7 +354,7 @@ pub const IdentifierStyleRule = struct {
 
                     // Check for type alias from import: const Foo = @import("...").Foo
                     // or type alias: const Foo = SomeType
-                    if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, init_idx)) {
+                    if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, init_idx, type_value_hops)) {
                         // This is likely a type alias - check for PascalCase
                         if (!isPascalCase(name) and !isCTypeAliasName(name)) {
                             try emitDiagnostic(src, allocator, diagnostics, token_starts[name_token], name, "type alias", .pascal_case);
@@ -372,11 +391,26 @@ pub const IdentifierStyleRule = struct {
         }
     }
 
+    /// How many binding hops one type-value proof may follow.
+    ///
+    /// The block, identifier and wrapper walks below are mutually recursive: an
+    /// identifier resolves to the initializer of the declaration it names, and
+    /// that initializer can be a labeled block whose breaks name declarations
+    /// again. All of them spend one budget, so an alias cycle runs out of it
+    /// and proves nothing instead of recursing until the stack is exhausted.
+    /// Counting hops keeps the proof allocation-free.
+    const type_value_hops: u8 = 32;
+
     /// Prove that an initializer expression evaluates to a type value.
     ///
     /// Only expression forms that cannot be mistaken for a value are accepted:
-    /// a type-producing builtin, a generic type factory call, or a conditional
+    /// a type-producing builtin, a generic type factory call, a reflection
+    /// field that carries a type, a namespace member the resolver proves to be
+    /// a type, a labeled block whose every break carries one, or a conditional
     /// or switch expression whose every branch is itself a type value.
+    ///
+    /// The budget is what the walks that call this one have left, so an alias
+    /// cycle between them proves nothing rather than recursing without end.
     fn isTypeValueInitExpr(
         tree: *const std.zig.Ast,
         tags: []const std.zig.Ast.Node.Tag,
@@ -384,8 +418,11 @@ pub const IdentifierStyleRule = struct {
         main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
+        budget: u8,
     ) bool {
+        if (budget == 0) return false;
         if (init_idx >= tags.len) return false;
+        if (isTypeValueDeclaration(tree, tags, main_tokens, token_tags, init_idx)) return true;
         return switch (tags[init_idx]) {
             .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
                 const builtin_name = builtinCallName(tree, tags, token_tags, init_idx) orelse break :blk false;
@@ -398,6 +435,25 @@ pub const IdentifierStyleRule = struct {
                 main_tokens,
                 token_tags,
                 init_idx,
+                budget - 1,
+            ),
+            .identifier, .field_access => resolvedInitIsTypeValue(
+                tree,
+                tags,
+                datas,
+                main_tokens,
+                token_tags,
+                init_idx,
+                budget - 1,
+            ),
+            .block, .block_semicolon, .block_two, .block_two_semicolon => isTypeValueLabeledBlock(
+                tree,
+                tags,
+                datas,
+                main_tokens,
+                token_tags,
+                init_idx,
+                budget - 1,
             ),
             .@"switch", .switch_comma => isTypeSwitchAlias(
                 tree,
@@ -406,6 +462,7 @@ pub const IdentifierStyleRule = struct {
                 main_tokens,
                 token_tags,
                 init_idx,
+                budget - 1,
             ),
             .@"if", .if_simple => isTypeIfAlias(
                 tree,
@@ -414,9 +471,380 @@ pub const IdentifierStyleRule = struct {
                 main_tokens,
                 token_tags,
                 init_idx,
+                budget - 1,
             ),
+            .unwrap_optional,
+            .grouped_expression,
+            => blk: {
+                const data = datas[init_idx].node_and_token;
+                break :blk isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, @intFromEnum(data[0]), budget - 1);
+            },
             else => false,
         };
+    }
+
+    /// A declaration that names a type: a type expression, an error set, or a
+    /// container that is not a fieldless namespace struct. A fieldless struct
+    /// is a namespace, which holds declarations rather than types, so it keeps
+    /// the namespace naming rule instead of the type rule.
+    fn isTypeValueDeclaration(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        main_tokens: []const std.zig.Ast.TokenIndex,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+    ) bool {
+        if (node_idx >= tags.len) return false;
+        if (isTypeExpressionTag(tags[node_idx])) return true;
+        if (!isTypeDefinitionTag(tags[node_idx])) return false;
+        if (isStructContainer(node_idx, main_tokens, token_tags)) {
+            return containerHasFields(tree, tags, node_idx);
+        }
+        return true;
+    }
+
+    /// How many alias hops the invisible-namespace walk may take. That walk
+    /// follows one chain of bindings at a time and calls nothing else, so a
+    /// cycle terminates as "unresolved" instead of spinning or deciding the
+    /// classification on its own repetition. The type-value proof shares its
+    /// own budget, `type_value_hops`, because it recurses between the walks.
+    const resolved_alias_hops = 8;
+
+    /// The single-file project view the type-aware helpers share. A member of a
+    /// namespace this pass cannot read is never guessed from its capitalization,
+    /// so the view is deliberately limited to the file under analysis. The
+    /// caller keeps the array alive for as long as the resolver borrows it.
+    fn singleFileProject(tree: *const std.zig.Ast) [1]import_resolver.File {
+        return .{.{ .path = "", .tree = tree }};
+    }
+
+    /// Resolve an identifier or member access to the declaration it names and
+    /// decide from that declaration whether the expression carries a type.
+    ///
+    /// Each hop moves one binding closer to the declaration and spends one unit
+    /// of the shared budget: an identifier to its own initializer, a member to
+    /// the initializer of the member it names. A builtin type name is conclusive
+    /// on its own, and a form that cannot produce a type value ends the walk.
+    /// The declaration a hop lands on is read through the same refinement every
+    /// other declaration gets, so a fieldless struct stays the namespace it is
+    /// rather than turning into a type.
+    fn resolvedInitIsTypeValue(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        main_tokens: []const std.zig.Ast.TokenIndex,
+        token_tags: []const std.zig.Token.Tag,
+        init_idx: usize,
+        budget: u8,
+    ) bool {
+        const files = singleFileProject(tree);
+        const resolver = call_resolver.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+        var node = init_idx;
+        var remaining = budget;
+        while (remaining > 0) : (remaining -= 1) {
+            if (node >= tags.len) return false;
+            switch (tags[node]) {
+                .identifier => {
+                    if (isBuiltinTypeNode(tree, main_tokens, token_tags, node)) return true;
+                    const target = resolver.resolveTypeAliasNode(@intCast(node)) orelse return false;
+                    node = target.node_index;
+                },
+                .field_access => {
+                    // A reflection field is not a declaration, so the resolver
+                    // has no binding for it; the field name is the proof.
+                    if (isTypeInfoDerivedExpr(tree, tags, datas, token_tags, node)) return true;
+                    const target = resolver.resolveTypeAliasNode(@intCast(node)) orelse return false;
+                    node = target.node_index;
+                },
+                .unwrap_optional,
+                .grouped_expression,
+                => node = @intFromEnum(datas[node].node_and_token[0]),
+                else => return isTypeValueDeclaration(tree, tags, main_tokens, token_tags, node) or
+                    isFunctionTypeTag(tags[node]) or
+                    isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, node, remaining - 1),
+            }
+        }
+        return false;
+    }
+
+    fn isBuiltinTypeNode(
+        tree: *const std.zig.Ast,
+        main_tokens: []const std.zig.Ast.TokenIndex,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+    ) bool {
+        if (node_idx >= main_tokens.len) return false;
+        const ident_token = main_tokens[node_idx];
+        if (ident_token >= token_tags.len or token_tags[ident_token] != .identifier) return false;
+        return isBuiltinTypeName(tree.tokenSlice(ident_token));
+    }
+
+    /// Prove that a labeled block yields a type value.
+    ///
+    /// The block produces the value of every `break :label` expression that can
+    /// leave it, so all of them must carry a type, and the body has to end by
+    /// leaving through that label: a body that can run off its end, or that
+    /// leaves through a `return` or another label, evaluates to `void` and
+    /// proves nothing. A break with no operand carries nothing to classify, a
+    /// break aimed at an inner block of the same name leaves that block
+    /// instead, and a body without a break yields nothing at all, so none of
+    /// them is accepted as a type.
+    fn isTypeValueLabeledBlock(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        main_tokens: []const std.zig.Ast.TokenIndex,
+        token_tags: []const std.zig.Token.Tag,
+        init_idx: usize,
+        budget: u8,
+    ) bool {
+        if (budget == 0 or init_idx >= tags.len) return false;
+        const block_node: std.zig.Ast.Node.Index = @enumFromInt(init_idx);
+        const label_token = labeledBlockLabelToken(tree, block_node) orelse return false;
+
+        var scratch: [2]u32 = undefined;
+        const statements = blockStatements(tree, tags, datas, init_idx, &scratch);
+        if (statements.len == 0) return false;
+        const last_statement: std.zig.Ast.Node.Index = @enumFromInt(statements[statements.len - 1]);
+        // Running off the end of the body leaves the label with no value, so
+        // the block would be `void` rather than the type a break carries.
+        if (!statementExitsBlock(tree, tags, datas, last_statement, block_node)) return false;
+
+        const block_function = enclosingFunctionScope(tree, tags, tree.nodeMainToken(block_node));
+        var saw_typed_break = false;
+        for (tags, 0..) |tag, node_index| {
+            if (tag != .@"break") continue;
+            const pair = datas[node_index].opt_token_and_opt_node;
+            // A break without a label cannot leave a labeled block.
+            const break_label = pair[0].unwrap() orelse continue;
+            // A label declaration and a `break :label` are two different
+            // tokens, so the name decides which block the break reaches.
+            if (!labelsMatch(tree, label_token, break_label)) continue;
+            const break_token = main_tokens[node_index];
+            if (!breakReachesBlock(tree, tags, break_token, break_label, block_node)) continue;
+            // A function body opens its own label scope, so a break inside a
+            // nested function cannot leave this block even where the tokens of
+            // that function put it inside the block.
+            if (enclosingFunctionScope(tree, tags, break_token) != block_function) continue;
+            const operand = pair[1].unwrap() orelse return false;
+            if (!isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, @intFromEnum(operand), budget - 1)) {
+                return false;
+            }
+            saw_typed_break = true;
+        }
+        return saw_typed_break;
+    }
+
+    /// The label a block carries, or null when it is unlabeled. A block's main
+    /// token is its `{`, so a label is the identifier in front of the `:` that
+    /// precedes it.
+    fn labeledBlockLabelToken(
+        tree: *const std.zig.Ast,
+        block_node: std.zig.Ast.Node.Index,
+    ) ?std.zig.Ast.TokenIndex {
+        const brace_token = tree.nodeMainToken(block_node);
+        if (brace_token < 2) return null;
+        if (tree.tokenTag(brace_token - 1) != .colon) return null;
+        const label_token = brace_token - 2;
+        if (tree.tokenTag(label_token) != .identifier) return null;
+        return label_token;
+    }
+
+    /// The statements of a block body. A two-statement block keeps them in the
+    /// node itself instead of the extra data, so they land in the caller's
+    /// scratch space rather than in an allocation.
+    fn blockStatements(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        block_idx: usize,
+        scratch: *[2]u32,
+    ) []const u32 {
+        switch (tags[block_idx]) {
+            .block, .block_semicolon => {
+                const range = datas[block_idx].extra_range;
+                const start: usize = @intFromEnum(range.start);
+                const end: usize = @intFromEnum(range.end);
+                return tree.extra_data[start..end];
+            },
+            .block_two, .block_two_semicolon => {
+                const nodes = datas[block_idx].opt_node_and_opt_node;
+                var count: usize = 0;
+                if (nodes[0].unwrap()) |node| {
+                    scratch[count] = @intFromEnum(node);
+                    count += 1;
+                }
+                if (nodes[1].unwrap()) |node| {
+                    scratch[count] = @intFromEnum(node);
+                    count += 1;
+                }
+                return scratch[0..count];
+            },
+            else => return &.{},
+        }
+    }
+
+    /// Whether a statement leaves the labeled block through its own label,
+    /// which is the only ending that gives the label a value. Running off the
+    /// end of the body, a `return`, a `break` aimed at an outer label and a
+    /// `break` out of a surrounding loop all leave the block with nothing, so a
+    /// body that ends any other way yields `void`.
+    fn statementExitsBlock(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        statement: std.zig.Ast.Node.Index,
+        block_node: std.zig.Ast.Node.Index,
+    ) bool {
+        const statement_idx = @intFromEnum(statement);
+        if (statement_idx >= tags.len) return false;
+        return switch (tags[statement_idx]) {
+            .@"break" => blk: {
+                const label = datas[statement_idx].opt_token_and_opt_node[0].unwrap() orelse break :blk false;
+                break :blk breakReachesBlock(tree, tags, tree.nodeMainToken(statement), label, block_node);
+            },
+            .@"if", .if_simple => blk: {
+                const full_if = tree.fullIf(statement) orelse break :blk false;
+                const else_expr = full_if.ast.else_expr.unwrap() orelse break :blk false;
+                break :blk statementExitsBlock(tree, tags, datas, full_if.ast.then_expr, block_node) and
+                    statementExitsBlock(tree, tags, datas, else_expr, block_node);
+            },
+            .@"switch", .switch_comma => blk: {
+                const full_switch = tree.switchFull(statement);
+                if (full_switch.ast.cases.len == 0) break :blk false;
+                for (full_switch.ast.cases) |case_node| {
+                    const full_case = tree.fullSwitchCase(case_node) orelse break :blk false;
+                    if (!statementExitsBlock(tree, tags, datas, full_case.ast.target_expr, block_node)) {
+                        break :blk false;
+                    }
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    /// The block a `break :label` reaches: the innermost labeled block whose
+    /// label names the same identifier. The name alone is not enough, because
+    /// an inner `blk: { break :blk ... }` binds its own label before an outer
+    /// block of the same name is in reach.
+    fn breakReachesBlock(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        break_token: std.zig.Ast.TokenIndex,
+        break_label: std.zig.Ast.TokenIndex,
+        block_node: std.zig.Ast.Node.Index,
+    ) bool {
+        var reached: ?usize = null;
+        var reached_span: u32 = std.math.maxInt(u32);
+        for (tags, 0..) |tag, node_index| {
+            switch (tag) {
+                .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+                else => continue,
+            }
+            const node: std.zig.Ast.Node.Index = @enumFromInt(node_index);
+            const first_token = tree.firstToken(node);
+            const last_token = tree.lastToken(node);
+            if (first_token > last_token) continue;
+            if (break_token < first_token or break_token > last_token) continue;
+            const block_label = labeledBlockLabelToken(tree, node) orelse continue;
+            if (!labelsMatch(tree, block_label, break_label)) continue;
+            if (reached == null or last_token - first_token < reached_span) {
+                reached = node_index;
+                reached_span = last_token - first_token;
+            }
+        }
+        return reached != null and reached.? == @intFromEnum(block_node);
+    }
+
+    /// The innermost function body a token sits in, or null at container level.
+    /// A function body opens its own label scope, so a label of an enclosing
+    /// block cannot be reached from inside one.
+    fn enclosingFunctionScope(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        token: std.zig.Ast.TokenIndex,
+    ) ?usize {
+        var enclosing: ?usize = null;
+        var enclosing_span: u32 = std.math.maxInt(u32);
+        for (tags, 0..) |tag, node_index| {
+            switch (tag) {
+                .fn_decl, .test_decl => {},
+                else => continue,
+            }
+            const node: std.zig.Ast.Node.Index = @enumFromInt(node_index);
+            const first_token = tree.firstToken(node);
+            const last_token = tree.lastToken(node);
+            if (first_token > last_token) continue;
+            if (token < first_token or token > last_token) continue;
+            if (enclosing == null or last_token - first_token < enclosing_span) {
+                enclosing = node_index;
+                enclosing_span = last_token - first_token;
+            }
+        }
+        return enclosing;
+    }
+
+    /// Whether a block's label and a `break :label` name the same label.
+    fn labelsMatch(
+        tree: *const std.zig.Ast,
+        block_label: std.zig.Ast.TokenIndex,
+        break_label: std.zig.Ast.TokenIndex,
+    ) bool {
+        return std.mem.eql(u8, labelText(tree, block_label), labelText(tree, break_label));
+    }
+
+    /// The identifier a label token names. `@"name"` is the same identifier as
+    /// `name`, so both spellings normalize before they compare.
+    fn labelText(tree: *const std.zig.Ast, token: std.zig.Ast.TokenIndex) []const u8 {
+        return import_resolver.normalizeIdentifier(tree.tokenSlice(token));
+    }
+
+    /// Prove that the initializer is a member of a namespace declared by
+    /// another file, whose members this pass never resolves.
+    ///
+    /// The resolved type-versus-value result of such a member is unknown, and an
+    /// unknown result must not become an asserted convention, so the caller
+    /// leaves the alias alone instead of reading the member's capitalization.
+    fn isInvisibleNamespaceMember(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        init_idx: usize,
+    ) bool {
+        const files = singleFileProject(tree);
+        const resolver = call_resolver.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+        var node = init_idx;
+        var hops: usize = 0;
+        while (hops < resolved_alias_hops) : (hops += 1) {
+            if (node >= tags.len) return false;
+            switch (tags[node]) {
+                .field_access, .unwrap_optional, .grouped_expression => node = @intFromEnum(datas[node].node_and_token[0]),
+                .identifier => {
+                    const target = resolver.resolveTypeAliasNode(@intCast(node)) orelse return false;
+                    node = target.node_index;
+                },
+                .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                    const builtin_name = builtinCallName(tree, tags, token_tags, node) orelse return false;
+                    if (!std.mem.eql(u8, builtin_name, "@import")) return false;
+                    return isUnresolvedImportPath(tree, node);
+                },
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// An import that names declarations the analyzer resolves outside the file
+    /// under analysis. The standard-library and builtin packages keep their own
+    /// naming conventions, so their members stay diagnosable; every other
+    /// import names a namespace whose members this pass never reads.
+    fn isUnresolvedImportPath(tree: *const std.zig.Ast, node_idx: usize) bool {
+        const import_path = import_resolver.importPathFromBuiltinCall(tree, node_idx) orelse return false;
+        return !std.mem.eql(u8, import_path, "std") and
+            !std.mem.eql(u8, import_path, "builtin") and
+            !std.mem.eql(u8, import_path, import_resolver.root_import_path);
     }
 
     /// A member of the verified `std` import whose name is PascalCase names a
@@ -446,6 +874,10 @@ pub const IdentifierStyleRule = struct {
         );
     }
 
+    /// Whether the expression reaches the standard-library namespace, either
+    /// through a verified `@import("std")` binding or through a direct
+    /// `@import("std")` expression. Anything spelled like `std` without that
+    /// provenance is a local declaration and is not trusted.
     fn isStdQualifiedValue(
         tree: *const std.zig.Ast,
         tags: []const std.zig.Ast.Node.Tag,
@@ -464,6 +896,10 @@ pub const IdentifierStyleRule = struct {
                     .file_index = 0,
                 };
                 break :blk resolver.isVerifiedImportBinding(node_idx, "std");
+            },
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
+                const import_path = import_resolver.importPathFromBuiltinCall(tree, node_idx) orelse break :blk false;
+                break :blk std.mem.eql(u8, import_path, "std");
             },
             .field_access => isStdQualifiedValue(
                 tree,
@@ -507,6 +943,9 @@ pub const IdentifierStyleRule = struct {
     }
 
     /// Check if the init expression is likely a type alias (field access on import, or PascalCase identifier)
+    ///
+    /// The budget is the shared type-value hop budget, so this naming-based walk
+    /// spends it exactly like the proof that calls it.
     fn isLikelyTypeAlias(
         tree: *const std.zig.Ast,
         tags: []const std.zig.Ast.Node.Tag,
@@ -514,41 +953,63 @@ pub const IdentifierStyleRule = struct {
         main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
+        budget: u8,
     ) bool {
+        if (budget == 0) return false;
         const init_tag = tags[init_idx];
         if (isTypeDefinitionTag(init_tag)) return true;
+        // Pointer, slice, array, optional and error-union expressions name a
+        // type whatever they are built from.
+        if (isTypeExpressionTag(init_tag)) return true;
 
         return switch (init_tag) {
             // Direct identifier reference - check if PascalCase (likely type)
             .identifier => isTypeAliasCallee(tree, tags, datas, token_tags, init_idx),
             // Field access: @import("...").Foo or Module.Type
             .field_access => isTypeAliasCallee(tree, tags, datas, token_tags, init_idx),
-            .call, .call_comma, .call_one, .call_one_comma => isTypeFactoryCall(tree, tags, datas, main_tokens, token_tags, init_idx),
+            .call, .call_comma, .call_one, .call_one_comma => isTypeFactoryCall(tree, tags, datas, main_tokens, token_tags, init_idx, budget - 1),
             .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
                 const builtin_name = builtinCallName(tree, tags, token_tags, init_idx) orelse break :blk false;
                 break :blk isTypeFactoryBuiltin(builtin_name);
             },
-            .merge_error_sets,
-            .error_union,
-            .optional_type,
-            .anyframe_type,
-            .ptr_type,
-            .ptr_type_sentinel,
-            .ptr_type_bit_range,
-            .ptr_type_aligned,
-            .array_type,
-            .array_type_sentinel,
-            => true,
-            .@"switch", .switch_comma => isTypeSwitchAlias(tree, tags, datas, main_tokens, token_tags, init_idx),
-            .@"if", .if_simple => isTypeIfAlias(tree, tags, datas, main_tokens, token_tags, init_idx),
+            .@"switch", .switch_comma => isTypeSwitchAlias(tree, tags, datas, main_tokens, token_tags, init_idx, budget - 1),
+            .@"if", .if_simple => isTypeIfAlias(tree, tags, datas, main_tokens, token_tags, init_idx, budget - 1),
             .unwrap_optional,
             .grouped_expression,
             => blk: {
                 const data = datas[init_idx].node_and_token;
-                break :blk isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, @intFromEnum(data[0]));
+                break :blk isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, @intFromEnum(data[0]), budget - 1);
             },
             else => false,
         };
+    }
+
+    /// Whether a branch of a conditional or of a switch carries a type value.
+    ///
+    /// A branch that is `@compileError` produces no value to classify, so it
+    /// counts for every alias. Any other branch counts when its spelling names
+    /// a type or when the resolver proves the declaration it binds to be one.
+    /// That second proof is what a member spelled `SCREAMING_SNAKE_CASE` needs:
+    /// a foreign namespace spells its constants that way far more often than its
+    /// types, so `isTypeAliasCallee` rejects the name and only the resolved
+    /// declaration shows that such a member is, for instance, the `HMODULE`
+    /// handle type a platform API exposes.
+    ///
+    /// The budget is what the caller has left and both walks it starts spend
+    /// it, so a conditional that reaches itself through its own members proves
+    /// nothing instead of recursing without end.
+    fn isTypeValueBranch(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        main_tokens: []const std.zig.Ast.TokenIndex,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+        budget: u8,
+    ) bool {
+        if (isCompileErrorExpr(tree, tags, datas, token_tags, node_idx)) return true;
+        if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, node_idx, budget)) return true;
+        return isTypeValueInitExpr(tree, tags, datas, main_tokens, token_tags, node_idx, budget);
     }
 
     fn isTypeSwitchAlias(
@@ -558,13 +1019,14 @@ pub const IdentifierStyleRule = struct {
         main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
+        budget: u8,
     ) bool {
+        if (budget == 0) return false;
         const full_switch = tree.switchFull(@enumFromInt(init_idx));
         for (full_switch.ast.cases) |case_node| {
             const full_case = tree.fullSwitchCase(case_node) orelse return false;
             const target_idx = @intFromEnum(full_case.ast.target_expr);
-            if (isCompileErrorExpr(tree, tags, datas, token_tags, target_idx)) continue;
-            if (!isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, target_idx)) return false;
+            if (!isTypeValueBranch(tree, tags, datas, main_tokens, token_tags, target_idx, budget - 1)) return false;
         }
         return true;
     }
@@ -576,16 +1038,16 @@ pub const IdentifierStyleRule = struct {
         main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
+        budget: u8,
     ) bool {
+        if (budget == 0) return false;
         const full_if = tree.fullIf(@enumFromInt(init_idx)) orelse return false;
         const then_idx = @intFromEnum(full_if.ast.then_expr);
         const else_expr = full_if.ast.else_expr.unwrap() orelse return false;
         const else_idx = @intFromEnum(else_expr);
 
-        const then_is_type = isCompileErrorExpr(tree, tags, datas, token_tags, then_idx) or
-            isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, then_idx);
-        const else_is_type = isCompileErrorExpr(tree, tags, datas, token_tags, else_idx) or
-            isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, else_idx);
+        const then_is_type = isTypeValueBranch(tree, tags, datas, main_tokens, token_tags, then_idx, budget - 1);
+        const else_is_type = isTypeValueBranch(tree, tags, datas, main_tokens, token_tags, else_idx, budget - 1);
         return then_is_type and else_is_type;
     }
 
@@ -714,8 +1176,37 @@ pub const IdentifierStyleRule = struct {
         };
     }
 
+    /// The `std.builtin.Type` payload fields whose value is a type (`type` or
+    /// `?type`): the pointed-to, element, payload, tag, backing and signature
+    /// types. Reading one binds a type value even though `@typeInfo` itself
+    /// evaluates to a `std.builtin.Type` union value.
     fn isTypeInfoTypeField(name: []const u8) bool {
-        return std.mem.eql(u8, name, "return_type");
+        return std.mem.eql(u8, name, "child") or
+            std.mem.eql(u8, name, "element_type") or
+            std.mem.eql(u8, name, "error_set") or
+            std.mem.eql(u8, name, "payload") or
+            std.mem.eql(u8, name, "tag_type") or
+            std.mem.eql(u8, name, "backing_integer") or
+            std.mem.eql(u8, name, "return_type") or
+            std.mem.eql(u8, name, "type");
+    }
+
+    /// Expressions that are a type by construction rather than by their name.
+    fn isTypeExpressionTag(tag: std.zig.Ast.Node.Tag) bool {
+        return switch (tag) {
+            .merge_error_sets,
+            .error_union,
+            .optional_type,
+            .anyframe_type,
+            .ptr_type,
+            .ptr_type_sentinel,
+            .ptr_type_bit_range,
+            .ptr_type_aligned,
+            .array_type,
+            .array_type_sentinel,
+            => true,
+            else => false,
+        };
     }
 
     fn isTypeInfoBaseExpr(
@@ -772,6 +1263,12 @@ pub const IdentifierStyleRule = struct {
                 const field_token = data.node_and_token[1];
                 if (field_token < token_tags.len and token_tags[field_token] == .identifier) {
                     const field_name = tree.tokenSlice(field_token);
+                    // A SCREAMING_SNAKE_CASE member names a flag, an enum value
+                    // or a foreign constant, never a type, and a codec member
+                    // of the standard library is a codec instance. Both are
+                    // values whatever their capitalization suggests.
+                    if (isScreamingSnakeCase(field_name)) return false;
+                    if (isStdCodecValueMember(tree, tags, datas, token_tags, node_idx)) return false;
                     return isPascalCase(field_name) or isCTypeAliasName(field_name);
                 }
                 return false;
@@ -784,6 +1281,47 @@ pub const IdentifierStyleRule = struct {
             },
             else => false,
         };
+    }
+
+    /// `std.base64.standard` and its siblings are `Codecs` values, so their
+    /// `Encoder` and `Decoder` members hold initialized codec instances rather
+    /// than types. Binding one of them binds a value, and a value keeps the
+    /// snake_case rule even though the member name is PascalCase.
+    ///
+    /// Only the verified `@import("std")` namespace is trusted for this, and
+    /// only the documented codec sets and member names are matched, so a local
+    /// declaration spelled the same way keeps the type classification.
+    fn isStdCodecValueMember(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+    ) bool {
+        if (!isMemberNamed(tree, tags, datas, token_tags, node_idx, "Encoder") and
+            !isMemberNamed(tree, tags, datas, token_tags, node_idx, "Decoder")) return false;
+        const codec_set_idx = @intFromEnum(datas[node_idx].node_and_token[0]);
+        if (!isMemberNamed(tree, tags, datas, token_tags, codec_set_idx, "standard") and
+            !isMemberNamed(tree, tags, datas, token_tags, codec_set_idx, "standard_no_pad") and
+            !isMemberNamed(tree, tags, datas, token_tags, codec_set_idx, "url_safe")) return false;
+        const base64_idx = @intFromEnum(datas[codec_set_idx].node_and_token[0]);
+        if (!isMemberNamed(tree, tags, datas, token_tags, base64_idx, "base64")) return false;
+        return isStdQualifiedValue(tree, tags, datas, token_tags, @intFromEnum(datas[base64_idx].node_and_token[0]));
+    }
+
+    /// Whether `node_idx` is a field access whose member is spelled `name`.
+    fn isMemberNamed(
+        tree: *const std.zig.Ast,
+        tags: []const std.zig.Ast.Node.Tag,
+        datas: []const std.zig.Ast.Node.Data,
+        token_tags: []const std.zig.Token.Tag,
+        node_idx: usize,
+        name: []const u8,
+    ) bool {
+        if (node_idx >= tags.len or tags[node_idx] != .field_access) return false;
+        const field_token = datas[node_idx].node_and_token[1];
+        if (field_token >= token_tags.len or token_tags[field_token] != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(field_token), name);
     }
 
     fn isCTypeAliasName(name: []const u8) bool {
@@ -823,7 +1361,9 @@ pub const IdentifierStyleRule = struct {
         main_tokens: []const std.zig.Ast.TokenIndex,
         token_tags: []const std.zig.Token.Tag,
         init_idx: usize,
+        budget: u8,
     ) bool {
+        if (budget == 0) return false;
         var buf: [1]std.zig.Ast.Node.Index = undefined;
         const call_info = tree.fullCall(&buf, @enumFromInt(init_idx)) orelse return false;
         const callee_idx = @intFromEnum(call_info.ast.fn_expr);
@@ -839,7 +1379,7 @@ pub const IdentifierStyleRule = struct {
         var saw_type_arg = false;
         for (call_info.ast.params) |param| {
             const arg_idx = @intFromEnum(param);
-            if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, arg_idx)) {
+            if (isLikelyTypeAlias(tree, tags, datas, main_tokens, token_tags, arg_idx, budget - 1)) {
                 saw_type_arg = true;
                 continue;
             }
@@ -1362,11 +1902,13 @@ pub const IdentifierStyleRule = struct {
         return .value;
     }
 
-    /// Prove that the operand is a `?type` field of a `@typeInfo` payload.
+    /// Prove that the operand is a type-carrying field of a `@typeInfo`
+    /// payload.
     ///
-    /// `std.builtin.Type` declares exactly these payload fields as `?type`
-    /// (`Struct.backing_integer`, `Union.tag_type`, `Fn.return_type`,
-    /// `Fn.Param.type`, `AnyFrame.child`), so capturing one binds a type value
+    /// `std.builtin.Type` declares exactly these payload fields as `type` or
+    /// `?type` (`Struct.backing_integer`, `Enum.tag_type`, `Union.tag_type`,
+    /// `ErrorUnion.error_set`, `ErrorUnion.payload`, `Fn.return_type`,
+    /// `Fn.Param.type`, `AnyFrame.child`), so reading one binds a type value
     /// rather than a value. The receiver has to be a payload captured from a
     /// `@typeInfo(...)` switch, and both the builtin token and the std payload
     /// names are matched, so a local `typeInfo` function or an unrelated
@@ -1408,11 +1950,7 @@ pub const IdentifierStyleRule = struct {
     }
 
     fn isOptionalTypeInfoFieldName(name: []const u8) bool {
-        return std.mem.eql(u8, name, "tag_type") or
-            std.mem.eql(u8, name, "backing_integer") or
-            std.mem.eql(u8, name, "return_type") or
-            std.mem.eql(u8, name, "child") or
-            std.mem.eql(u8, name, "type");
+        return isTypeInfoTypeField(name);
     }
 
     /// Prove that `name` is a capture of a prong of a `switch (@typeInfo(...))`
@@ -1938,4 +2476,378 @@ test "skript residual: a snake_case @typeInfo value binding is accepted" {
 
     try IdentifierStyleRule.rule.check(&source, allocator, &diagnostics);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+/// Initializer node of the first `const` named `name`, at file scope or inside a
+/// function body.
+fn rootConstInitIndex(tree: *const std.zig.Ast, name: []const u8) !usize {
+    const tags = tree.nodes.items(.tag);
+    for (tags, 0..) |tag, node_idx| {
+        if (!import_resolver.isVarDeclTag(tag)) continue;
+        const full = tree.fullVarDecl(@enumFromInt(node_idx)) orelse continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(full.ast.mut_token + 1), name)) continue;
+        return @intFromEnum(full.ast.init_node.unwrap() orelse return error.DeclarationNotFound);
+    }
+    return error.DeclarationNotFound;
+}
+
+fn expectInitializerVerdict(
+    code: [:0]const u8,
+    name: []const u8,
+    expected_invisible: bool,
+) !void {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "verdict.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    const token_tags = tree.tokens.items(.tag);
+    const init_idx = try rootConstInitIndex(tree, name);
+    try std.testing.expectEqual(
+        expected_invisible,
+        IdentifierStyleRule.isInvisibleNamespaceMember(tree, tags, datas, token_tags, init_idx),
+    );
+}
+
+test "isTypeInfoTypeField names the type-carrying reflection fields" {
+    const is_type_info_type_field = IdentifierStyleRule.isTypeInfoTypeField;
+    const type_fields = [_][]const u8{
+        "child",
+        "element_type",
+        "error_set",
+        "payload",
+        "tag_type",
+        "backing_integer",
+        "return_type",
+        "type",
+    };
+    for (type_fields) |field| {
+        try std.testing.expect(is_type_info_type_field(field));
+    }
+    const value_fields = [_][]const u8{
+        "fields",
+        "decls",
+        "layout",
+        "size",
+        "align",
+        "value",
+        "identifier",
+        "name",
+    };
+    for (value_fields) |field| {
+        try std.testing.expect(!is_type_info_type_field(field));
+    }
+}
+
+test "labeledBlockLabelToken names the label a break can target" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Outer = outer: {
+        \\    break :outer inner: {
+        \\        break :inner error{Missing};
+        \\    };
+        \\};
+        \\const Plain = {
+        \\    break 1;
+        \\};
+    ;
+    var source = Source.init(allocator, "blocks.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    const outer_idx = try rootConstInitIndex(tree, "Outer");
+    const plain_idx = try rootConstInitIndex(tree, "Plain");
+
+    const outer_label = IdentifierStyleRule.labeledBlockLabelToken(tree, @enumFromInt(outer_idx));
+    try std.testing.expect(outer_label != null);
+    try std.testing.expectEqualStrings("outer", tree.tokenSlice(outer_label.?));
+    try std.testing.expect(IdentifierStyleRule.labeledBlockLabelToken(tree, @enumFromInt(plain_idx)) == null);
+}
+
+test "isTypeValueLabeledBlock accepts every typed break and no value break" {
+    const allocator = std.testing.allocator;
+    const typed_code: [:0]const u8 =
+        \\const Errors = blk: {
+        \\    if (@import("std").builtin.is_test) break :blk error{Skipped};
+        \\    break :blk error{Failed};
+        \\};
+    ;
+    var typed_source = Source.init(allocator, "typed_block.zig", typed_code);
+    defer typed_source.deinit();
+    const typed_tree = try typed_source.ast();
+    const typed_tags = typed_tree.nodes.items(.tag);
+    const typed_datas = typed_tree.nodes.items(.data);
+    const typed_main_tokens = typed_tree.nodes.items(.main_token);
+    const typed_token_tags = typed_tree.tokens.items(.tag);
+    const typed_init = try rootConstInitIndex(typed_tree, "Errors");
+    try std.testing.expect(IdentifierStyleRule.isTypeValueLabeledBlock(
+        typed_tree,
+        typed_tags,
+        typed_datas,
+        typed_main_tokens,
+        typed_token_tags,
+        typed_init,
+        IdentifierStyleRule.type_value_hops,
+    ));
+
+    const value_code: [:0]const u8 =
+        \\const limit = blk: {
+        \\    if (true) break :blk 1;
+        \\    break :blk 2;
+        \\};
+    ;
+    var value_source = Source.init(allocator, "value_block.zig", value_code);
+    defer value_source.deinit();
+    const value_tree = try value_source.ast();
+    const value_tags = value_tree.nodes.items(.tag);
+    const value_datas = value_tree.nodes.items(.data);
+    const value_main_tokens = value_tree.nodes.items(.main_token);
+    const value_token_tags = value_tree.tokens.items(.tag);
+    const value_init = try rootConstInitIndex(value_tree, "limit");
+    try std.testing.expect(!IdentifierStyleRule.isTypeValueLabeledBlock(
+        value_tree,
+        value_tags,
+        value_datas,
+        value_main_tokens,
+        value_token_tags,
+        value_init,
+        IdentifierStyleRule.type_value_hops,
+    ));
+}
+
+test "a break names the block it reaches, not every block of that name" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Outer = outer: {
+        \\    break :outer u8;
+        \\};
+        \\const Inner = blk: {
+        \\    break :blk blk: {
+        \\        break :blk error{Missing};
+        \\    };
+        \\};
+        \\const Mixed = blk: {
+        \\    break :blk error{Missing};
+        \\    break :blk 1;
+        \\};
+        \\const Wrong = blk: {
+        \\    break :outer u8;
+        \\    break :blk 1;
+        \\};
+        \\const Falls = blk: {
+        \\    break :blk u8;
+        \\    unreachable;
+        \\};
+    ;
+    var source = Source.init(allocator, "label_scope.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    try std.testing.expect(try resolvedInitIsTypeValueFor(tree, "Outer"));
+    try std.testing.expect(try resolvedInitIsTypeValueFor(tree, "Inner"));
+    // A block that also yields a plain number is a value, whichever of its
+    // breaks a reader would stop at.
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Mixed")));
+    // A break under another name leaves another block, so it proves nothing
+    // about this one.
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Wrong")));
+    // A body that can run off its end makes the label `void`.
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Falls")));
+}
+
+test "an alias cycle between labeled blocks proves no type" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const First = blk: {
+        \\    break :blk Second;
+        \\};
+        \\const Second = blk: {
+        \\    break :blk First;
+        \\};
+        \\const Chosen = blk: {
+        \\    break :blk First;
+        \\};
+    ;
+    var source = Source.init(allocator, "alias_cycle.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "First")));
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Second")));
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Chosen")));
+}
+
+test "an alias cycle through a conditional branch proves no type" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const builtin = @import("builtin");
+        \\const win = struct {
+        \\    pub const HMODULE = if (builtin.os.tag == .windows) win.HMODULE else void;
+        \\};
+        \\const Cycle = if (builtin.os.tag == .windows) win.HMODULE else u8;
+    ;
+    var source = Source.init(allocator, "conditional_cycle.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Cycle")));
+}
+
+test "a resolved alias of a fieldless namespace stays a value" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const defaults = struct {
+        \\    pub const timeout_ms: u32 = 100;
+        \\};
+        \\const config = defaults;
+        \\const settings = struct {
+        \\    timeout_ms: u32,
+        \\};
+        \\const Config = settings;
+    ;
+    var source = Source.init(allocator, "namespace_alias.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "config")));
+    try std.testing.expect(try resolvedInitIsTypeValueFor(tree, "Config"));
+}
+
+test "a member of another file's namespace has no resolved verdict" {
+    const code: [:0]const u8 =
+        \\const kit = @import("kit.zig").kit;
+        \\const Chord = kit.chord;
+        \\const Vertex = kit.vertex;
+    ;
+    try expectInitializerVerdict(code, "Chord", true);
+    try expectInitializerVerdict(code, "Vertex", true);
+}
+
+test "the standard library keeps a diagnosable member verdict" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const fs = std.fs;
+        \\const Mem = std.mem;
+    ;
+    try expectInitializerVerdict(code, "fs", false);
+    try expectInitializerVerdict(code, "Mem", false);
+}
+
+test "a namespace member resolves to the declaration that defines it" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Posix = struct {
+        \\    pub const fd_t = u32;
+        \\    pub const limit = 4096;
+        \\};
+        \\const Fd = Posix.fd_t;
+        \\const Limit = Posix.limit;
+        \\const Element = @typeInfo([]u8).pointer.child;
+        \\const Count = @sizeOf(u32);
+    ;
+    var source = Source.init(allocator, "members.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    try std.testing.expect(try resolvedInitIsTypeValueFor(tree, "Fd"));
+    try std.testing.expect(try resolvedInitIsTypeValueFor(tree, "Element"));
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Limit")));
+    try std.testing.expect(!(try resolvedInitIsTypeValueFor(tree, "Count")));
+}
+
+fn resolvedInitIsTypeValueFor(tree: *const std.zig.Ast, name: []const u8) !bool {
+    return IdentifierStyleRule.resolvedInitIsTypeValue(
+        tree,
+        tree.nodes.items(.tag),
+        tree.nodes.items(.data),
+        tree.nodes.items(.main_token),
+        tree.tokens.items(.tag),
+        try rootConstInitIndex(tree, name),
+        IdentifierStyleRule.type_value_hops,
+    );
+}
+
+test "an uppercase flag member is a value rather than a type" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Mode = packed struct {
+        \\    NONBLOCK: bool = false,
+        \\    RDONLY: bool = true,
+        \\};
+        \\fn wantsNonBlocking(flags: Mode) bool {
+        \\    const nonblocking = flags.NONBLOCK;
+        \\    return nonblocking;
+        \\}
+    ;
+    var source = Source.init(allocator, "flags.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    const token_tags = tree.tokens.items(.tag);
+    var flag_field_access: ?usize = null;
+    for (tags, 0..) |tag, node_idx| {
+        if (tag != .field_access) continue;
+        const field_token = datas[node_idx].node_and_token[1];
+        if (field_token >= token_tags.len or token_tags[field_token] != .identifier) continue;
+        if (!std.mem.eql(u8, tree.tokenSlice(field_token), "NONBLOCK")) continue;
+        flag_field_access = node_idx;
+        break;
+    }
+    try std.testing.expect(flag_field_access != null);
+    try std.testing.expect(!IdentifierStyleRule.isTypeAliasCallee(
+        tree,
+        tags,
+        datas,
+        token_tags,
+        flag_field_access.?,
+    ));
+}
+
+test "a standard base64 codec member is a value rather than a type" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\const decoder = std.base64.standard.Decoder;
+        \\const encoder = std.base64.standard.Encoder;
+        \\const shadow = struct {
+        \\    pub const standard = struct {
+        \\        pub const Decoder = u8;
+        \\    };
+        \\};
+        \\const local = shadow.standard.Decoder;
+    ;
+    var source = Source.init(allocator, "codec.zig", code);
+    defer source.deinit();
+
+    const tree = try source.ast();
+    const tags = tree.nodes.items(.tag);
+    const datas = tree.nodes.items(.data);
+    const token_tags = tree.tokens.items(.tag);
+    try std.testing.expect(!IdentifierStyleRule.isTypeAliasCallee(
+        tree,
+        tags,
+        datas,
+        token_tags,
+        try rootConstInitIndex(tree, "decoder"),
+    ));
+    try std.testing.expect(!IdentifierStyleRule.isTypeAliasCallee(
+        tree,
+        tags,
+        datas,
+        token_tags,
+        try rootConstInitIndex(tree, "encoder"),
+    ));
+    // A declaration spelled the same way outside the standard library keeps
+    // the type classification.
+    try std.testing.expect(IdentifierStyleRule.isTypeAliasCallee(
+        tree,
+        tags,
+        datas,
+        token_tags,
+        try rootConstInitIndex(tree, "local"),
+    ));
 }

@@ -20,6 +20,85 @@ Run `just test` and `just lint` in both shells when changing code that touches t
 `just lint` uses a ReleaseSafe analyzer and one analysis worker to limit CPU load.
 Use `zig build` directly when you need a Debug executable.
 
+## Fixture compilation
+
+`just ci` runs `check-fixtures`, which compiles every fixture named in the
+directory list in `build.zig`. The fixture tests read fixtures as text and
+compare diagnostic rows, so they pass on code the frontends reject. This step
+is the only gate that compiles the fixtures, and a fixture that stops
+compiling fails it. Run it in both shells while you work:
+
+```bash
+nix develop -c zig build check-fixtures
+nix develop .#zig015 -c zig build check-fixtures
+```
+
+Add every new fixture directory to the list in `build.zig`. A directory the
+list omits is never compiled.
+
+A fixture compiles on both frontends unless it names the one it targets:
+
+```zig
+// EXPECT: none
+// Zig 0.16.0 fixture: the `Io` spellings below do not exist in Zig 0.15.2.
+```
+
+The marker line goes directly under the `EXPECT` row and names the only
+frontend whose standard library the fixture builds against. The check compiles
+the fixture on that frontend and skips it on the other one.
+`// Zig 0.15.2 fixture:` is the same marker for the compatibility shell. A file
+that carries both markers stops the build, because the two lines contradict
+each other.
+
+A fixture that cannot compile on either frontend is not broken. It carries the
+not-a-program marker instead:
+
+```zig
+// EXPECT: none
+// zwanzig: not a standalone program: Zig rejects these underscore-prefixed
+// shadows as compile errors regardless of the analyzer's opinion.
+```
+
+The marker line goes under the `EXPECT` row, like the per-frontend markers. It
+tells the gate to skip the file on every frontend, because the invalidity is
+the thing the rule exists to detect: an import of a module that does not exist
+on disk, a shadowed declaration, an unreachable statement. 40 fixtures carry
+the marker today, against 8 that carry a per-frontend one.
+
+The reason is part of the marker, not a comment. An empty reason stops the
+build, and the reason has to say the same thing the fixture asserts. A fixture
+whose `EXPECT` row pins a diagnostic describes the invalidity as the
+intentional subject under test. A fixture whose row reads `EXPECT: none`
+describes a construct the frontend rejects regardless of the analyzer's
+opinion; a reason that claims the rule fires on such a fixture contradicts the
+row it sits next to.
+
+A per-frontend marker and the not-a-program marker on one file is the third
+build error, after two per-frontend markers and an empty reason. The two say
+contradictory things: one asks the gate to compile the file on exactly one
+frontend, the other asks it never to compile it. Each fixture states exactly
+one of the three.
+
+Fixtures may also declare analyzer settings inline:
+
+```zig
+// CONFIG: {"resource_models":[{"kind":"open","method_name":"acquire"}]}
+// EXPECT: rule=store-violations-engine severity=error message=resource leak
+```
+
+Only the fixture test harness reads that line. The CLI configures itself from a
+config file and never parses `// CONFIG:` out of the sources it analyzes, so a
+fixture that declares its resource models or escape models inline reports
+nothing under a bare CLI run. Pass the same models through `--config` to
+reproduce what the harness sees:
+
+```bash
+zwanzig --config models.json test/fixtures/store_violations_engine
+```
+
+That is the contract. The inline line configures the harness, and a CLI run
+gets the same models from a file.
+
 ## Performance measurement
 
 The benchmark runner measures whatever source trees you name, and this checkout
@@ -27,13 +106,18 @@ is the only workload when you name none. Each extra workload is a `NAME=PATH`
 pair. It requires Python 3, Linux `perf`, and GNU `time`. Runs are sequential,
 use one worker and nice level 15, and leave analysis limits unchanged.
 
+Set `BENCH_ROOT` to a new directory on local storage outside the checkout.
+Keep toolchain caches, temporary files, snapshots, and results there.
 Freeze the inputs and retain the baseline executable before editing:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -j1
-python3 scripts/benchmark.py snapshot .tmp/bench-inputs other=/path/to/project
-cp zig-out/bin/zwanzig .tmp/bench-before
-python3 scripts/benchmark.py run .tmp/bench-inputs .tmp/bench-before .tmp/bench-baseline
+mkdir -p "$BENCH_ROOT/tmp"
+export TMPDIR="$BENCH_ROOT/tmp" TMP="$BENCH_ROOT/tmp" TEMP="$BENCH_ROOT/tmp"
+export ZIG_LOCAL_CACHE_DIR="$BENCH_ROOT/cache/local"
+export ZIG_GLOBAL_CACHE_DIR="$BENCH_ROOT/cache/global"
+zig build -Doptimize=ReleaseSafe --prefix "$BENCH_ROOT/before" -j1
+python3 scripts/benchmark.py snapshot "$BENCH_ROOT/inputs" other=/path/to/project
+python3 scripts/benchmark.py run "$BENCH_ROOT/inputs" "$BENCH_ROOT/before/bin/zwanzig" "$BENCH_ROOT/baseline"
 ```
 
 The snapshot includes Zig sources and root build/configuration files. Its manifest
@@ -46,9 +130,9 @@ out of version control, and publish only results whose workloads may be public.
 Build the candidate with the same frontend and optimization mode, then compare:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -j1
-python3 scripts/benchmark.py run .tmp/bench-inputs zig-out/bin/zwanzig .tmp/bench-candidate
-python3 scripts/benchmark.py compare .tmp/bench-baseline .tmp/bench-candidate
+zig build -Doptimize=ReleaseSafe --prefix "$BENCH_ROOT/after" -j1
+python3 scripts/benchmark.py run "$BENCH_ROOT/inputs" "$BENCH_ROOT/after/bin/zwanzig" "$BENCH_ROOT/candidate"
+python3 scripts/benchmark.py compare "$BENCH_ROOT/baseline" "$BENCH_ROOT/candidate"
 ```
 
 Results include user and elapsed time, peak RSS, hardware counters, executable hash,
@@ -62,10 +146,10 @@ as a complete analysis.
 Profile long runs separately so sampling overhead does not affect the timing comparison:
 
 ```bash
-python3 scripts/benchmark.py run .tmp/bench-inputs .tmp/bench-before .tmp/bench-profile \
+python3 scripts/benchmark.py run "$BENCH_ROOT/inputs" "$BENCH_ROOT/before/bin/zwanzig" "$BENCH_ROOT/profile" \
   --profile --workloads other
 perf report --stdio --no-children --max-stack 8 --call-graph none \
-  -i .tmp/bench-profile/other/perf.data
+  -i "$BENCH_ROOT/profile/other/perf.data"
 ```
 
 Profiles use frame-pointer call chains. Self samples locate expensive functions;
@@ -76,6 +160,23 @@ a single measurement.
 
 The comparison procedure and its caveats are in the
 [performance measurements](internal/ADJUSTMENT_PLAN.md#performance-measurements).
+
+Alternate baseline and candidate runs when you repeat the comparison.
+Keep the frontend, target, build mode, CPU affinity, and inputs fixed.
+Report medians and instruction counts, not only one elapsed-time result.
+Use a separate local Zig cache for each source checkout.
+Verify the executable's debug source paths before measuring checkout variants.
+Measure allocation behavior separately because profilers add overhead.
+Valgrind Massif with `--pages-as-heap=yes` measures mapped pages, not requested allocation bytes.
+
+Single-file type, resource, and reference queries reuse source-owned syntax indexes.
+Indexed `@This` queries follow container parents instead of scanning every AST node.
+Queries retain the unindexed path when an index is unavailable.
+
+Engine snapshots copy only live constraints and call sites, not unused list capacity.
+Exact-size copies can need another allocation when a branch appends an item.
+Measure the full analysis to include this cost.
+These changes retain analysis limits and runtime safety checks.
 
 ## Formatting
 

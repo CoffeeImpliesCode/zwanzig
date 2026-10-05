@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    var maybe: ?u8 = null;
+    const maybe: ?u8 = null;
     try std.testing.expectEqual(@as(?u8, null), maybe);
     const v = maybe.?;
     _ = v;

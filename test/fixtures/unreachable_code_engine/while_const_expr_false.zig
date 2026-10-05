@@ -5,3 +5,5 @@ fn foo() void {
         doWork();
     }
 }
+
+fn doWork() void {}

@@ -33,7 +33,7 @@ fn foo(opt: ?i32) !void {
 
     errdefer |err| {
         _ = err;
-    };
+    }
 
     switch (Value{ .ok = 1 }) {
         .ok => |value_ok| {

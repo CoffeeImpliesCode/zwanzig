@@ -5,7 +5,7 @@ const testing = struct {
 };
 
 pub fn main() void {
-    var maybe: ?u8 = null;
+    const maybe: ?u8 = null;
     testing.expect(maybe != null);
     const v = maybe.?;
     _ = v;

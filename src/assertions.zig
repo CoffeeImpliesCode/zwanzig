@@ -7,6 +7,13 @@ const AssertionKind = enum {
     equality,
 };
 
+/// The most aliases one namespace list records. These lists answer a name
+/// lookup, so they are a fixed-size table rather than a record of the file:
+/// a declaration past this many proves nothing further about the namespace
+/// it names, and letting every declaration in would make the scope's memory
+/// a function of the file's text instead of of this bound.
+pub const max_aliases = 64;
+
 pub const AssertionScope = struct {
     std_aliases: std.ArrayList([]const u8),
     testing_aliases: std.ArrayList([]const u8),
@@ -71,16 +78,19 @@ pub const AssertionScope = struct {
 
     fn addStdAlias(self: *AssertionScope, allocator: std.mem.Allocator, name: []const u8) !void {
         if (self.hasStdAlias(name)) return;
+        if (self.std_aliases.items.len >= max_aliases) return;
         try self.std_aliases.append(allocator, name);
     }
 
     fn addTestingAlias(self: *AssertionScope, allocator: std.mem.Allocator, name: []const u8) !void {
         if (self.hasTestingAlias(name)) return;
+        if (self.testing_aliases.items.len >= max_aliases) return;
         try self.testing_aliases.append(allocator, name);
     }
 
     fn addDebugAlias(self: *AssertionScope, allocator: std.mem.Allocator, name: []const u8) !void {
         if (self.hasDebugAlias(name)) return;
+        if (self.debug_aliases.items.len >= max_aliases) return;
         try self.debug_aliases.append(allocator, name);
     }
 
@@ -114,6 +124,7 @@ pub const AssertionScope = struct {
         for (self.debug_assert_aliases.items) |existing| {
             if (existing.declaration_node == alias.declaration_node) return;
         }
+        if (self.debug_assert_aliases.items.len >= max_aliases) return;
         try self.debug_assert_aliases.append(allocator, alias);
     }
 };
@@ -261,6 +272,16 @@ fn collectAliasesFromRoot(tree: *const std.zig.Ast, allocator: std.mem.Allocator
     }
 }
 
+/// Read the declarations inside one function body.
+///
+/// The walk spends at most one visit per node of the tree it reads. A
+/// declaration reachable by several paths - the same block written inside
+/// nested loops, a subtree the parser shares - is then offered to the
+/// scope a bounded number of times instead of once per path, so what this
+/// costs is a function of the tree rather than of how many paths reach a
+/// node. Nothing is lost by the cut-off: an alias is recorded once by name,
+/// so a repeat adds nothing, and a walk that runs past its budget names
+/// nothing further.
 fn collectAliasesFromBody(
     tree: *const std.zig.Ast,
     allocator: std.mem.Allocator,
@@ -270,6 +291,7 @@ fn collectAliasesFromBody(
     var collector = VarDeclCollector{
         .allocator = allocator,
         .scope = scope,
+        .visits_left = tree.nodes.len,
     };
     try ast_walk.walk(VarDeclCollector, tree, body_node, &collector);
 }
@@ -463,11 +485,109 @@ fn isStringLiteralValue(tree: *const std.zig.Ast, node: u32, value: []const u8) 
 const VarDeclCollector = struct {
     allocator: std.mem.Allocator,
     scope: *AssertionScope,
+    /// Node visits this walk may still spend, one per node of the tree.
+    visits_left: usize,
     stop: bool = false,
 
     pub fn visit(self: *VarDeclCollector, tree: *const std.zig.Ast, node: u32, tag: std.zig.Ast.Node.Tag) !void {
+        if (self.visits_left == 0) {
+            self.stop = true;
+            return;
+        }
+        self.visits_left -= 1;
         if (isVarDeclTag(tag)) {
             try addAliasFromVarDecl(tree, self.allocator, node, self.scope);
         }
     }
 };
+
+test "an assertion scope over a payload-capture guard records no alias on either arm" {
+    // The shape whose scope build was reported running without end: a producer
+    // caught to `null`, read by a guard that captures the value it carries,
+    // once as a branch and once as a loop header. Neither arm names a
+    // namespace, so the scope stays empty - and empty is what makes the whole
+    // build allocation-free, which is the property this pins.
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "if (maybe) |file| { _ = file; }",
+        "while (maybe) |file| { _ = file; break; }",
+    };
+    for (cases) |guard| {
+        var buffer: [256]u8 = undefined;
+        const code = try std.fmt.bufPrint(
+            &buffer,
+            "fn producer() error{{Boom}}!u8 {{ return 1; }}\nfn consumer() void {{\n    const maybe = producer() catch null;\n    {s}\n}}\x00",
+            .{guard},
+        );
+        var tree = try std.zig.Ast.parse(allocator, code[0 .. code.len - 1 :0], .zig);
+        defer tree.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+
+        var scope = try buildAssertionScope(allocator, &tree, @intFromEnum(tree.rootDecls()[1]), false);
+        defer scope.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), scope.std_aliases.items.len);
+        try std.testing.expectEqual(@as(usize, 0), scope.testing_aliases.items.len);
+        try std.testing.expectEqual(@as(usize, 0), scope.debug_aliases.items.len);
+        try std.testing.expectEqual(@as(usize, 0), scope.debug_assert_aliases.items.len);
+    }
+}
+
+test "the namespace table is a fixed size however many declarations name one" {
+    // A generated file: more distinct declarations alias the namespace than the
+    // table holds. Recording every one would let the scope's memory grow with
+    // the file's text; a declaration past the bound proves nothing further
+    // about the namespace it names, so it is not recorded.
+    const allocator = std.testing.allocator;
+    const declared = max_aliases + 8;
+    var buffer: [8192]u8 = undefined;
+    var length: usize = 0;
+    var index: usize = 0;
+    while (index < declared) : (index += 1) {
+        length += (try std.fmt.bufPrint(
+            buffer[length..],
+            "const alias{d} = @import(\"std\");\n",
+            .{index},
+        )).len;
+    }
+    buffer[length] = 0;
+
+    var tree = try std.zig.Ast.parse(allocator, buffer[0..length :0], .zig);
+    defer tree.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+
+    var scope = try buildAssertionScope(allocator, &tree, 0, false);
+    defer scope.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, max_aliases), scope.std_aliases.items.len);
+}
+
+fn scopeBuildAllocationFailure(allocator: std.mem.Allocator, code: [:0]const u8, fn_root: u32) !void {
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    var scope = try buildAssertionScope(allocator, &tree, fn_root, false);
+    scope.deinit(allocator);
+}
+
+test "an alias scan over a body that reaches its declarations many ways is clean at every allocation boundary" {
+    // The scan reads the same declaration once per path that reaches it. A
+    // build that grew with the paths rather than with the tree would leave the
+    // records it made behind when a later allocation failed, so this walks
+    // every boundary of a body whose declarations sit under nested loops.
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const lib = @import("std");
+        \\fn check() void {
+        \\    const outer = lib;
+        \\    while (outer != null) {
+        \\        const inner = outer;
+        \\        if (inner != null) {
+        \\            const deepest = inner;
+        \\            _ = deepest;
+        \\        }
+        \\    }
+        \\}
+    ;
+    try std.testing.checkAllAllocationFailures(allocator, scopeBuildAllocationFailure, .{
+        code,
+        @as(u32, 1),
+    });
+}

@@ -7,3 +7,5 @@ pub fn main() void {
         _ = value;
     }
 }
+
+// zwanzig: not a standalone program: for loop pointer capture shadowing container constant `value` is the intentional invalidity under test, verifying that shadowed container decls are detected as unused.

@@ -10,3 +10,5 @@ fn foo() void {
     x += 1;
     _ = x;
 }
+
+// zwanzig: not a standalone program: a variable in an inner block shadowing a variable from the outer scope is the intentional invalidity under test, verifying that the shadowed-variable rule reports variable shadowing as well as constants.

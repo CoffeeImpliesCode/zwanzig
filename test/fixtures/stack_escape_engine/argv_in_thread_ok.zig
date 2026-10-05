@@ -8,7 +8,7 @@ fn openUrl(allocator: std.mem.Allocator, url: []const u8) !void {
 
 fn openUrlThread(allocator: std.mem.Allocator, owned_url: []const u8) void {
     const argv = [_][]const u8{ "open", owned_url };
-    var child = std.process.Child.init(&argv, allocator);
+    const child = std.process.Child.init(&argv, allocator);
     _ = child;
 }
 

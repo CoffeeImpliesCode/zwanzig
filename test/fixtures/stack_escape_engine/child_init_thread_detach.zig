@@ -6,7 +6,6 @@ fn openUrl(allocator: std.mem.Allocator, url: []const u8) !void {
     const child = std.process.Child.init(&.{ "open", owned_url }, allocator);
     const thread = try std.Thread.spawn(.{}, openUrlThread, .{ thread_allocator, child, owned_url });
     thread.detach();
-    _ = thread;
 }
 
 fn openUrlThread(allocator: std.mem.Allocator, child: std.process.Child, url: []const u8) void {

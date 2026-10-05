@@ -13,3 +13,5 @@ fn foo() void {
     }
     _ = x;
 }
+
+// zwanzig: not a standalone program: two nested block constants each shadowing the same name from outer scopes are the intentional invalidity under test, verifying that both shadowing declarations are reported.

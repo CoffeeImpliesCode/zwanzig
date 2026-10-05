@@ -8,3 +8,5 @@ pub fn main() void {
         _ = index;
     }
 }
+
+// zwanzig: not a standalone program: for loop index capture shadowing container constant `index` is the intentional invalidity under test, verifying that shadowed container decls are detected as unused.

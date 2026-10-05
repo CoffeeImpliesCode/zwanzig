@@ -202,6 +202,30 @@ pub const Analyzer = struct {
         }
     }
 
+    /// The first name in the active rule filter that no registered checker or
+    /// rule answers to, or null when every name resolves.
+    ///
+    /// A rule filter is a selection, not a set of hints: an allowlist naming
+    /// only unknown rules selects no analysis at all, and the run would then
+    /// report "No issues found." for an analysis that never happened. The
+    /// registered set is the vocabulary those names are matched against -
+    /// `isRuleEnabled` does a plain string compare - so this is the one place
+    /// that can say whether a name the user supplied resolves to anything.
+    /// Naming it here rather than in each entry point is what keeps `--do`,
+    /// `--skip` and a config file's `enabled_rules`/`disabled_rules` on one
+    /// check instead of three copies of the name list.
+    pub fn unknownRuleName(self: *const Analyzer) ?[]const u8 {
+        const names: []const []const u8 = switch (self.rule_filter) {
+            .none => return null,
+            .allowlist => |list| list,
+            .blocklist => |list| list,
+        };
+        for (names) |name| {
+            if (!self.checker_manager.hasCheckerOrRule(name)) return name;
+        }
+        return null;
+    }
+
     fn containsRuleName(list: []const []const u8, rule_name: []const u8) bool {
         for (list) |item| {
             if (std.mem.eql(u8, rule_name, item)) return true;
@@ -341,7 +365,12 @@ pub const Analyzer = struct {
 
         const tree = try source.ast();
         if (tree.errors.len != 0) {
+            // Parser recovery leaves nodes that the lexical index and the
+            // scope-sensitive engines refuse to walk, so the remaining checks
+            // cannot produce reliable findings on this file. The parse errors
+            // alone would leave the user reading the file as clean.
             try appendParseErrors(&source, tree, self.allocator, &result.diagnostics);
+            try appendSkippedChecksNotice(&source, self.allocator, &result.diagnostics);
             return result;
         }
 
@@ -474,6 +503,33 @@ pub const Analyzer = struct {
             errdefer diagnostic.deinit(allocator);
             try diagnostics.append(allocator, diagnostic);
         }
+    }
+
+    /// Report that every other check on this file did not run.
+    ///
+    /// The rules and engines need a lexical index, and that index declines a
+    /// tree with parse errors because recovered nodes cannot be walked. The
+    /// skipped report carries that loss to the user. It shares the rule id
+    /// `parse-error` and the early return, so it stays unsuppressible like the
+    /// parser's own diagnostics.
+    fn appendSkippedChecksNotice(
+        source: *Source,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+    ) !void {
+        const message = "Zwanzig skipped all other checks for this file because the parser " ++
+            "reported syntax errors. Fix the syntax errors and run again.";
+        var diagnostic = try Diagnostic.initAtLocation(
+            allocator,
+            source.getFilePath(),
+            "parse-error",
+            .err,
+            message,
+            1,
+            1,
+        );
+        errdefer diagnostic.deinit(allocator);
+        try diagnostics.append(allocator, diagnostic);
     }
 
     /// Filter suppressed diagnostics in a standalone list.
@@ -740,6 +796,93 @@ test "Analyzer.isRuleEnabled: blocklist" {
     try std.testing.expect(analyzer.isRuleEnabled("other-rule"));
 }
 
+test "Analyzer.unknownRuleName: no filter names nothing to reject" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+
+    try analyzer.registerRule(&UnusedDeclRule.rule);
+    analyzer.setRuleFilter(.none);
+    try testing.expect(analyzer.unknownRuleName() == null);
+}
+
+test "Analyzer.unknownRuleName: reports a name nothing is registered under" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+
+    try analyzer.registerRule(&UnusedDeclRule.rule);
+
+    // The vocabulary is the registered set, so a name that resolves through
+    // `isRuleEnabled` must not be reported, and one that does not must be.
+    const allowlist = [_][]const u8{ "unused-decl", "empty-catt" };
+    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
+    try testing.expectEqualStrings("empty-catt", analyzer.unknownRuleName().?);
+
+    const blocklist = [_][]const u8{"empty-catt"};
+    analyzer.setRuleFilter(.{ .blocklist = &blocklist });
+    try testing.expectEqualStrings("empty-catt", analyzer.unknownRuleName().?);
+}
+
+test "Analyzer.unknownRuleName: every registered name passes and the first unknown one is reported" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+
+    // A rule and a checker, because `--do`/`--skip` draw from both and the
+    // check has to hold for each of them.
+    const probe_checker = Checker{ .name = "probe-checker" };
+    try analyzer.registerRule(&UnusedDeclRule.rule);
+    try analyzer.registerChecker(&probe_checker);
+
+    const allowlist = [_][]const u8{ "unused-decl", "probe-checker" };
+    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
+    try testing.expect(analyzer.unknownRuleName() == null);
+
+    const blocklist = [_][]const u8{ "unused-decl", "probe-checker" };
+    analyzer.setRuleFilter(.{ .blocklist = &blocklist });
+    try testing.expect(analyzer.unknownRuleName() == null);
+
+    // The first unknown name is the one reported, so a reader is told where
+    // to start looking rather than being sent through the whole list.
+    const mixed = [_][]const u8{ "unused-decl", "empty-catt", "unused-var" };
+    analyzer.setRuleFilter(.{ .allowlist = &mixed });
+    try testing.expectEqualStrings("empty-catt", analyzer.unknownRuleName().?);
+}
+
+test "Analyzer.unknownRuleName: an unregistered name is unknown even when nothing is registered" {
+    // The vocabulary is the registered set. An analyzer with nothing
+    // registered has no vocabulary, so a name resolves to nothing and is
+    // reported - which is why the CLI validates after `registerDefaults`
+    // rather than before it.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+
+    const allowlist = [_][]const u8{"unused-decl"};
+    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
+    try testing.expectEqualStrings("unused-decl", analyzer.unknownRuleName().?);
+}
+
+test "Analyzer.setRuleFilter keeps accepting an unvalidated list" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    // Public API: a caller that builds its own list is not forced through the
+    // registry. Validation is a separate step the CLI opts into.
+    var analyzer = Analyzer.init(allocator);
+    defer analyzer.deinit();
+
+    const allowlist = [_][]const u8{"not-a-registered-rule"};
+    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
+    try testing.expectEqualStrings("not-a-registered-rule", analyzer.unknownRuleName().?);
+    try testing.expect(analyzer.isRuleEnabled("not-a-registered-rule"));
+    try testing.expect(!analyzer.isRuleEnabled("unused-decl"));
+}
+
 test "Analyzer.shouldRunProjectUnusedDecls requires registration and follows rule filter" {
     const allocator = std.testing.allocator;
     var analyzer = Analyzer.init(allocator);
@@ -945,6 +1088,50 @@ test "Analyzer reports parse errors and continues valid project siblings" {
     }
     try testing.expect(parse_errors != 0);
     try testing.expectEqual(@as(usize, 1), duplicate_imports);
+}
+
+test "Analyzer reports that a syntax error skipped the file's other checks" {
+    // `errdefer |BadErr| {}` names a payload in a case the parser rejects, so
+    // identifier-style reports the capture when the fixture gate reads the file
+    // with that rule alone. The analyzer parses the file first, so the parse
+    // error costs the file that finding and every other one. The parse errors
+    // must therefore carry the loss.
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const IdentifierStyleRule = @import("rules/identifier_style.zig").IdentifierStyleRule;
+    var io_context = try compat.Context.init(allocator, 1);
+    defer io_context.deinit();
+    var temp_dir = compat.TestDir.init();
+    defer temp_dir.cleanup();
+    const broken_content =
+        \\fn foo() !void {
+        \\    errdefer |BadErr| {};
+        \\    return;
+        \\}
+        \\
+    ;
+    try temp_dir.writeFile("broken.zig", broken_content);
+    const broken_path = try std.fmt.allocPrint(allocator, "{s}/broken.zig", .{temp_dir.path()});
+    defer allocator.free(broken_path);
+    var analyzer = Analyzer.initWithContext(allocator, &io_context);
+    defer analyzer.deinit();
+    try analyzer.registerRule(&IdentifierStyleRule.rule);
+
+    try analyzer.analyzeFile(broken_path);
+
+    var parser_reports: usize = 0;
+    var skip_reports: usize = 0;
+    for (analyzer.diagnostics.items) |diagnostic| {
+        if (!std.mem.eql(u8, diagnostic.rule_id, "parse-error")) continue;
+        parser_reports += 1;
+        if (std.mem.indexOf(u8, diagnostic.message, "skipped all other checks") == null) continue;
+        try testing.expectEqual(broken_path, diagnostic.file_path);
+        try testing.expect(diagnostic.severity == .err);
+        try testing.expectEqual(@as(usize, 1), diagnostic.range.start.line);
+        skip_reports += 1;
+    }
+    try testing.expect(parser_reports != 0);
+    try testing.expectEqual(@as(usize, 1), skip_reports);
 }
 
 test "Analyzer gates frontend failures by checker type requirements" {

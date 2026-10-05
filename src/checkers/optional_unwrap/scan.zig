@@ -8,6 +8,8 @@ const Source = @import("../../source.zig").Source;
 const ids = @import("../../ids.zig");
 const guards = @import("guards.zig");
 const constructor_facts = @import("constructor_facts.zig");
+const call_facts = @import("call_facts.zig");
+const relational_facts = @import("relational_facts.zig");
 const diagnostics = @import("diagnostics.zig");
 const engine_mod = @import("../../engine.zig");
 const AnalysisEngine = engine_mod.AnalysisEngine;
@@ -26,6 +28,7 @@ pub fn scanForUnsafeUnwraps(
     reported: *std.AutoHashMap(u32, void),
     fn_node: ids.AstNodeId,
     type_context: ?*TypeContext,
+    test_severity: checker_mod.Severity,
 ) CheckerError!void {
     const tags = tree.nodes.items(.tag);
     const main_tokens = tree.nodes.items(.main_token);
@@ -80,12 +83,25 @@ pub fn scanForUnsafeUnwraps(
         // the optional before unwrapping it
         if (guards.isGuardedByLazyInit(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
+        // The two preceding forms each decide one statement, so they are asked
+        // before the general local-initialisation proof below, which a matching
+        // `const` declaration or branch join would answer first and leave them
+        // unreached. Every guard in this chain only skips the diagnostic, so
+        // moving one changes which proof claims a source, never which sources
+        // are reported.
+
         // Check if this is an early exit pattern where a null check leads to
         // continue/break/return, making subsequent code only reachable when non-null
         if (guards.isGuardedByEarlyExit(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is a switch that exits on null before the unwrap
         if (guards.isGuardedBySwitchNullCase(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
+
+        // Initializers and branch joins must leave the storage non-null. This is
+        // the broad proof -- any optional declared with a value that cannot be
+        // null, or a join whose every exit leaves the storage non-null -- so it
+        // answers after the two shapes above that it would otherwise swallow.
+        if (guards.isProvenByLocalInitialization(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
         // Check if this is an assignment followed by immediate unwrap pattern
         // e.g., `x = foo() orelse return error; x.?`
@@ -95,9 +111,8 @@ pub fn scanForUnsafeUnwraps(
         // is written or passed to a call that may mutate it.
         if (guards.isGuardedByPriorUnwrap(&query, ast_node, unwrapped_node, parent_map, type_context)) continue;
 
-        // Check if this is a method call with catch/early exit that ensures the field
-        // e.g., `self.ensureTexture() catch return; ... self.texture.?`
-        if (guards.isGuardedByMethodCallWithCatch(&query, ast_node, unwrapped_node, parent_map, fn_node, type_context)) continue;
+        // The callee must leave the field non-null on every successful exit.
+        if (guards.isGuardedBySelfMethodPostcondition(&query, ast_node, unwrapped_node, parent_map, fn_node, type_context)) continue;
 
         // Check if this is a labeled block invariant pattern
         // e.g., `const flag = blk: { x orelse break :blk false; ... }; if (flag) { x.? }`
@@ -117,45 +132,45 @@ pub fn scanForUnsafeUnwraps(
             &assertion_scope,
         )) continue;
 
-        const message = if (isInsideForBody(tree, ast_node, parent_map))
-            "forced optional unwrap can panic at runtime; non-null proofs from a separate validation loop are not tracked, so check for null in this loop"
-        else
-            "forced optional unwrap can panic at runtime";
+        // Every reachable private caller must establish the exact receiver field.
+        if (call_facts.isProvenByCallContext(
+            &query,
+            ast_node,
+            unwrapped_node,
+            type_context,
+        )) continue;
+
+        if (relational_facts.isProvenNonNull(&query, ast_node, unwrapped_node, type_context)) continue;
+
+        const message = "forced optional unwrap can panic at runtime";
+        const severity: checker_mod.Severity = if (isTestContext(tree, ast_node, parent_map)) test_severity else .warning;
 
         // Find the CFG node containing this AST node
         const cfg_node_idx = findCfgNodeForAst(cfg, ast_node, tree);
         const node_idx = cfg_node_idx orelse {
             // AST node not in CFG (possibly unreachable code) - report conservatively
-            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message);
+            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message, severity);
             try reported.put(ast_node, {});
             continue;
         };
 
         // Check if the variable is proven non-null at this point
         if (!isProvenNonNull(engine, node_idx, unwrapped_node, cfg, tree)) {
-            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message);
+            try diagnostics.reportUnsafeUnwrap(src, allocator, diagnostics_list, main_tokens[ast_node], token_starts, message, severity);
             try reported.put(ast_node, {});
         }
     }
 }
 
-/// This is diagnostic context, not a proof: a prior pass cannot exempt an
-/// unwrap, and a write inside the consuming loop must still be reported.
-fn isInsideForBody(tree: *const std.zig.Ast, unwrap_node: u32, parent_map: []const u32) bool {
-    const tags = tree.nodes.items(.tag);
+fn isTestContext(tree: *const std.zig.Ast, unwrap_node: u32, parent_map: []const u32) bool {
     var node = unwrap_node;
-    while (node < parent_map.len) {
-        const parent = parent_map[node];
-        if (parent == 0 or parent >= tags.len) return false;
-        switch (tags[parent]) {
-            .@"for", .for_simple => {
-                const loop = tree.fullFor(@enumFromInt(parent)) orelse return false;
-                if (@intFromEnum(loop.ast.then_expr) == node) return true;
-            },
+    var remaining = parent_map.len;
+    while (node != 0 and node < parent_map.len and remaining > 0) : (remaining -= 1) {
+        switch (tree.nodes.items(.tag)[node]) {
+            .test_decl => return true,
             .fn_decl => return false,
-            else => {},
+            else => node = parent_map[node],
         }
-        node = parent;
     }
     return false;
 }

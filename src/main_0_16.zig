@@ -38,6 +38,9 @@ test {
     _ = @import("checkers/unreachable_code_checker.zig");
     _ = @import("checkers/store_violations_engine.zig");
     _ = @import("checkers/optional_unwrap_engine.zig");
+    _ = @import("checkers/optional_unwrap/call_facts.zig");
+    _ = @import("checkers/optional_unwrap/constructor_facts.zig");
+    _ = @import("checkers/optional_unwrap/relational_facts.zig");
     _ = @import("rules/unused_decl.zig");
     _ = @import("rules/dupe_import.zig");
     _ = @import("rules/todo_comment.zig");

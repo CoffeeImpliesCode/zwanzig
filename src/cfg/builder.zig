@@ -38,6 +38,10 @@ pub const CfgBuilder = struct {
     /// Scope that owns the deferred body currently being inlined, if any. A
     /// transfer that targets it or anything above it escapes the body.
     defer_boundary: ?*const Scope = null,
+    /// Innermost loop currently open, chained through the loops it was
+    /// entered from. Set for the duration of a loop body walk only, so a
+    /// loop's own `else` branch never finds that loop as a continue target.
+    current_loop: ?*const LoopFrame = null,
     /// One block-shaped scope entered on the way down into a function body. The
     /// parent link points at the calling `processBlock`'s own `Scope` local, so
     /// the chain borrows stack frames: entering a block costs no allocation,
@@ -52,6 +56,34 @@ pub const CfgBuilder = struct {
         /// have one, and it exists before the body is walked so a break inside
         /// the body can jump to it directly.
         merge_node: ?CfgNodeId,
+    };
+
+    /// One loop entered on the way down into a function body. The parent link
+    /// points at the calling `processWhile`'s or `processFor`'s own `LoopFrame`
+    /// local, so the chain borrows stack frames the way `Scope` does:
+    /// entering a loop costs no allocation, copies nothing, and has no depth
+    /// limit to outgrow.
+    pub const LoopFrame = struct {
+        parent: ?*const LoopFrame,
+        /// AST node of the loop statement.
+        ast_node: u32,
+        /// Token index of the loop's label identifier, 0 when it has none.
+        label_token: u32,
+        /// Scope the loop statement itself sits in. A `continue` ends the
+        /// scopes below this one and none of the ones above: it leaves the
+        /// loop's body, not the scope that holds the loop.
+        enclosing_scope: ?*const Scope,
+        /// Where `continue` lands: the continuation expression of a `while`
+        /// that has one, the loop header otherwise. The node exists before
+        /// the body is walked, so a `continue` inside the body can link to
+        /// it directly.
+        continue_target: CfgNodeId,
+        /// Where `break` lands: the node control reaches once the loop is
+        /// over, past any `else` branch - a break skips the else, which only
+        /// runs when the condition runs out. Like the continue target it
+        /// exists before the body is walked, so a `break` inside the body can
+        /// link to it directly instead of falling through into a second pass.
+        break_target: CfgNodeId,
     };
 
     pub const TypeAnnotation = builder_type_annotation.Mixin(@This());
@@ -104,6 +136,7 @@ pub const CfgBuilder = struct {
         // functions, so start with no scope open.
         self.current_scope = null;
         self.defer_boundary = null;
+        self.current_loop = null;
 
         const tree = try source.ast();
         const tags = tree.nodes.items(.tag);
@@ -229,6 +262,7 @@ pub const CfgBuilder = struct {
             .@"try" => try ErrorFlow.processTry(self, cfg, source, ast_node, prev_node),
             .@"catch" => try ErrorFlow.processCatch(self, cfg, source, ast_node, prev_node),
             .@"break" => try Statements.processBreak(self, cfg, source, ast_node, prev_node),
+            .@"continue" => try Statements.processContinue(self, cfg, source, ast_node, prev_node),
             .@"switch", .switch_comma => try SwitchFlow.processSwitch(self, cfg, source, ast_node, prev_node),
             .unreachable_literal => try Statements.processUnreachable(self, cfg, source, ast_node, prev_node),
             else => try Statements.processGenericExpr(self, cfg, source, ast_node, prev_node),

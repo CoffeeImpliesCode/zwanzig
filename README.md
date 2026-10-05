@@ -164,7 +164,7 @@ Engine-backed checkers:
 
 ## Analysis behavior
 
-Syntax errors produce `parse-error` diagnostics. Zwanzig skips checks for malformed files and continues with valid sibling files. Enabled native checkers control type preflight. If the embedded frontend rejects a file during that preflight, Zwanzig emits `frontend-error`. Required typed checks skip the file, while optional checks use AST fallback. AST-only selections avoid ZIR preflight.
+Syntax errors produce `parse-error` diagnostics. Zwanzig skips checks for malformed files and continues with valid sibling files. A file with a syntax error also reports that its other checks were skipped, so a user never reads a malformed file as clean. Enabled native checkers control type preflight. If the embedded frontend rejects a file during that preflight, Zwanzig emits `frontend-error`. Required typed checks skip the file, while optional checks use AST fallback. AST-only selections avoid ZIR preflight.
 
 `--threads` includes the calling thread on both frontends. Engine state caps include all call contexts at each program point. If analysis cannot continue within a cap, Zwanzig stops that function analysis and reports `analysis-limit-exceeded` for it. Independent constant-condition and structural checks can still report diagnostics.
 

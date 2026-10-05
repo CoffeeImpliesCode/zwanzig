@@ -8,3 +8,5 @@ fn foo() void {
     }
     _ = value;
 }
+
+// zwanzig: not a standalone program: a bare block constant shadowing the enclosing function-scope constant is the intentional invalidity under test, verifying that the shadowed-variable rule reports the inner declaration.

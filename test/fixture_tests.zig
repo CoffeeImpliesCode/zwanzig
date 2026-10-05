@@ -648,3 +648,56 @@ test "divide_by_zero_engine fixtures" {
 test "slice_bounds_engine fixtures" {
     try runCheckerFixturesInDir(std.testing.allocator, &SliceBoundsEngineChecker.checker, "test/fixtures/slice_bounds_engine");
 }
+
+test "project-wide unused declarations follow the compilation root reached through a named module" {
+    var analyzer = src.Analyzer.init(std.testing.allocator);
+    defer analyzer.deinit();
+    try analyzer.registerRule(&UnusedDeclRule.rule);
+
+    const allowlist = [_][]const u8{"unused-decl"};
+    analyzer.setRuleFilter(.{ .allowlist = &allowlist });
+
+    const files = [_][]const u8{
+        "test/fixtures/project_unused_decl/root_import_pkg/build.zig",
+        "test/fixtures/project_unused_decl/root_import_pkg/src/checker.zig",
+        "test/fixtures/project_unused_decl/root_import_pkg/src/seam.zig",
+        "test/fixtures/project_unused_decl/root_import_pkg/src/marker.zig",
+        "test/fixtures/project_unused_decl/root_import_pkg/src/probe.zig",
+        "test/fixtures/project_unused_decl/root_import_pkg/src/probe_seam.zig",
+    };
+    try analyzer.prepareProject(&files);
+    // The per-file rule runs first, so the package is covered the way the CLI
+    // covers it: the same-file control beside the checker, then the project
+    // pass over every public declaration.
+    for (files) |path| {
+        if (std.mem.eql(u8, "build.zig", std.fs.path.basename(path))) continue;
+        try analyzer.analyzeFile(path);
+    }
+    try analyzer.analyzeProjectUnusedDecls();
+
+    // Each seam calls its compilation root's checker from guarded top-level
+    // comptime through `@import("root")`, so those checkers are live. What is
+    // left is exactly three findings: the same-file unused control plus the one
+    // root member per artifact that nothing reaches.
+    try std.testing.expectEqual(@as(usize, 3), analyzer.diagnostics.items.len);
+    var checker_reports: usize = 0;
+    var probe_reports: usize = 0;
+    var control_reports: usize = 0;
+    for (analyzer.diagnostics.items) |diagnostic| {
+        try std.testing.expectEqualStrings("unused-decl", diagnostic.rule_id);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "checkSeam") == null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "checkProbeRoot") == null);
+        if (std.mem.indexOf(u8, diagnostic.message, "unusedRootHelper") != null) checker_reports += 1;
+        if (std.mem.indexOf(u8, diagnostic.message, "unusedProbeHelper") != null) probe_reports += 1;
+        if (std.mem.indexOf(u8, diagnostic.message, "unusedControl") != null) {
+            try std.testing.expectEqualStrings(
+                "test/fixtures/project_unused_decl/root_import_pkg/src/checker.zig",
+                diagnostic.file_path,
+            );
+            control_reports += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), checker_reports);
+    try std.testing.expectEqual(@as(usize, 1), probe_reports);
+    try std.testing.expectEqual(@as(usize, 1), control_reports);
+}

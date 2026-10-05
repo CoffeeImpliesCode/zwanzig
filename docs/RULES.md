@@ -95,6 +95,7 @@ When `unused-decl` is enabled and more than one file is analyzed, zwanzig also r
 Private file-as-struct methods called through `self.method` are treated as used, even when an unrelated field has the same name. A bare field read never counts as a method call, so a same-named field on another type does not mask an unused method.
 Calls to the real `std.testing.refAllDecls` and `refAllDeclsRecursive` also keep the target container's declarations reachable. Immutable aliases of the imported `std` module or its `testing` namespace are supported. Fake namespaces, shadowed bindings, and mutable aliases do not grant this exemption.
 Cyclic type aliases and namespace re-exports stop at the repeated binding or file. They do not prevent resolution of independent declarations.
+Guarded `@import("root")` references follow the one compilation root that reaches the file through its build module graph, including named module imports. A file that two compilation roots reach has no single root, so its `@import("root")` references resolve to no file rather than to an arbitrary root. Live comptime checker calls count as uses; unrelated root helpers can still be reported unused.
 Bounded type and import searches log a warning when they exhaust their resolution budget. The warning names the search and its frame limit; the conservative result is not proof that the type or reference is absent. Cycle detection remains separate from budget exhaustion.
 Contextual constants such as `.empty` count as references when the result type identifies their container, including typed initialization, assignment, and return expressions. A same-named constant in another container remains eligible for an unused-declaration report.
 Project-wide unused-public reports require valid syntax in every prepared source and build file. If parsing fails, Zwanzig defers those reports rather than treating missing references as non-use. Per-file checks still run on valid siblings.
@@ -386,6 +387,9 @@ Enforces Zig naming conventions:
 - Type-valued builtin, factory, conditional, and switch expressions use PascalCase. Standard-library factories such as `std.StaticBitSet(256)` require a verified `std` import. A local `std` shadow does not get this exemption.
 - `@typeInfo(T)` returns a value, not a type. Its result uses snake_case.
 - Payloads from `?type` fields of a verified `@typeInfo` switch capture may use PascalCase. Examples include `Union.tag_type` and `Fn.return_type`. Ordinary value payloads still use snake_case.
+- Aliases of namespace member types keep PascalCase. The resolved member declaration, not the spelling of the member name, determines whether it is a type. A member of a namespace declared by another file produces no type verdict from this rule, because the walk stops at an import whose file it never reads. A chain longer than the walk's hop budget and a cycle among the aliases are not that case: both leave the member unproved rather than exempt, so the spelling-based fallback behind the type information classifies that member from its spelling. The type information and that fallback read the file under analysis only. They never consult another file for a member.
+- Type fields such as `@typeInfo(T).pointer.child` use PascalCase. A labeled block is type-valued only when every reachable exit yields a type and each labeled break reaches that block; value, mixed, and fall-through exits do not qualify.
+- Member values keep snake_case, including aliases of `std.base64.standard.Encoder` and `Decoder`, and reads of flag fields.
 
 **Bad:**
 ```zig
@@ -416,6 +420,8 @@ fn doThing(good_param: ?i32) void {
 Detects constant-condition branches and proven contradictions under immutable scalar guards. Constant `true`/`false` conditions include const boolean identifiers and constant expressions such as `(1 + 1) == 2`.
 
 Path-sensitive reports require complete engine analysis and proof from enclosing guards. An absent graph node alone is not proof. Constant-condition checks still run when an engine limit prevents a complete analysis.
+
+A compile-time assertion guard is not reported as runtime dead code. Both halves must hold. The branch sits inside an explicit `comptime` scope, and every statement of its body is a `@compileError(...)` call or a call to a verified `std.debug.assert`. The shape must be unconditional, so an `if` with an `else` and a `while` with a `continue` or an `else` stay reported. A `comptime` branch that runs application logic, a runtime branch whose body only asserts, and every runtime constant or contradictory guard stay reported.
 
 **Bad:**
 ```zig
@@ -455,7 +461,11 @@ fn foo(condition: bool) i32 {
 
 Flags forced optional unwraps using `.?`, which panic at runtime if the value is `null`. Prefer handling the optional with `if (opt) |value|` or `orelse`.
 
-Non-null proofs do not carry between separate validation and consumption loops. Warnings for unwraps inside a `for` body explain this limit. Check for null in the consuming loop; writes during that loop can invalidate an earlier validation pass.
+The `optional_unwrap_test_severity` config setting selects `hint`, `warning`, or `error` for unwraps in test bodies. It defaults to `warning`. Nested function and method bodies, and production bodies, keep `warning`. The setting cannot disable the check. A hint still makes the CLI exit with code 1.
+
+An unwrap passed to a `std.testing` expectation is skipped before any severity applies. The recognized names are `expect`, `expectEqual`, `expectEqualStrings`, `expectEqualSlices`, `expectEqualDeep`, `expectApproxEqAbs`, `expectApproxEqRel`, `expectError`, `expectFmt`, and `assert`. The callee must be reached through a verified `std.testing` namespace or a `const` alias of one. A bare `expect(...)` callee is accepted only inside a `test` body. A `testing` namespace of the user's own gets no exemption.
+
+The checker can replay a deterministic local lookup over a retained prefix when a matching successful lookup guarded each stored row. This proof requires a fixed-size buffer and its counter declared in the analyzed function, a capacity guard, and stores that write the counter's own slot and are paired with a one-step `+ 1` move of it. Between the guard and the replay the lookup inputs, the buffer, and the count must all be unchanged; any other write must land in storage this function owns, and every call that runs in between must be proved pure on its arguments. Buffer, count, and input mutations, escapes through a call, address, or cast, unwritten slots, and any other loop shape keep the warning; for those, check for null in the consuming loop.
 
 **Bad:**
 ```zig
@@ -535,7 +545,7 @@ Field guards also support `std.debug.assert(state.value != null)` and `try std.t
 A write through the address of a different struct field preserves the guard.
 Replacing the guarded field or passing its address to a mutating call invalidates it.
 An ignored `expect` error does not establish a guard.
-Writes to an independent local value, including a slice parameter's `len` or `ptr` header, preserve a field assertion. Writes through the slice's elements or through a pointer remain potential mutations of the guarded object.
+Writes to independent local values and slice `len` or `ptr` headers preserve field guards. Pointer and slice-element writes can change the referenced object. They invalidate a guard when they reach its field or overlapping union storage. Writes to independent by-value sibling fields preserve the guard, and so does a write to a member a by-value copy owns outright. A pointer member the copy carried still designates what the original pointed at, so `const copy = self.flags; copy.cell.value = null;` writes the field the guard read through the original. A call placed on such a member reaches it too, while a call on the copy's own bytes does not. A pointer member of a type that carries nothing the guard was taken from reaches nothing the guard covers. A call this analysis cannot resolve invalidates a guard on a module-level value, because such a call may write it.
 
 
 **Switch null-case guard:**
@@ -561,13 +571,57 @@ fn render(self: *Self) void {
 }
 ```
 
-The callee must leave the field non-null on every successful return or fallthrough, after its deferred writes run. A conditional assignment, later reset, mutating return operand, or pending reset in `defer` does not prove the unwrap safe.
+The callee must leave the field non-null on every successful return or fallthrough, after its deferred writes run. A conditional assignment is not rejected on that account: a null check on the field itself hands the fact to the branch that does not see the null, so `if (self.index == null) self.index = 0;` proves the field from an unknown starting state. What does not prove it is an assignment under a condition the analysis does not connect to the field, a later reset, a mutating return operand, or a reset still pending in a `defer` when the scope exits. An `errdefer` body runs only on the error exits, which never reach the caller's unwrap.
+A successful `orelse return` or `catch return` before an assignment does not establish a new field fact.
+
+Successful constructor results retain fields proven non-null in their returned values, including fields in nested owner wrappers. Facts belong to the initialized binding, not to unrelated initialized locals. Replacement values, teardown, nullable success results, and mutations invalidate the affected facts.
+
+**Caller-proved field:**
+```zig
+const Owner = struct {
+    index: ?u32 = null,
+
+    fn ensure(self: *Owner, fail: bool) error{Unavailable}!void {
+        if (fail) return error.Unavailable;
+        if (self.index == null) self.index = 0;
+    }
+
+    fn append(self: *Owner, value: u8) void {
+        self.index.? += value;  // Safe: every attributed caller fills index first
+    }
+
+    fn process(self: *Owner, value: u8, fail: bool) !void {
+        try self.ensure(fail);
+        var sink: Sink = .{ .owner = self };
+        scan(value, &sink);
+    }
+};
+
+const Sink = struct {
+    owner: *Owner,
+
+    // The same name as the owner's reducer, in a container of its own.
+    fn append(self: *Sink, value: u8) void {
+        self.owner.append(value);
+    }
+};
+
+/// The parameter carries no type, so the call inside is read from the object
+/// each visible caller passes.
+fn scan(value: u8, sink: anytype) void {
+    sink.append(value);
+}
+```
+
+Private helpers can use field guards established by every verified caller. The guard must apply to the object passed to the helper, and it must survive the callee's own body: a call the helper makes on a parameter of another type writes only the bytes that parameter owns, while a call it makes on a foreign pointer reaches the module-level object that pointer designates and can store a null back over what every caller proved.
+
+A successful fallible initializer must dominate the call. Generic callback resolution uses the supplied object's method and actual argument positions. The proof includes every operand evaluated before callee entry. An operand that clears the guarded field defeats the proof. Public callees, unverified or recursive callers, escaped callback addresses, and rebound contexts do not establish this proof. Ignored initializer errors and guarded-field mutations preserve warnings.
 
 **Conditional construction:**
 
-A private type factory can establish a field invariant when every visible construction stores a non-null value under the same `comptime bool` condition that guards the unwrap. The constructor's name is not evidence.
+A private type factory can establish a field invariant when every visible construction stores a non-null value under the same `comptime bool` condition that guards the unwrap. The constructor's name is not evidence, and the value it stores has to be the factory parameter that condition guards: a local the constructor wrote itself could be assigned again before the field it fills is read.
 
-This proof requires a closed source: no public or exported root declarations except a parameterless `main` returning `void` or `!void`. The source must not expose addresses, use undefined storage, replace an instance, write the guarded field, or pass an instance or its type to an opaque call. Local calls are inspected with the rest of the source. Direct writes to sibling fields remain permitted.
+This proof requires a private factory and no external construction or mutation path for its container. Relevance is transitive rather than nominal: any function this file declares that can produce the container counts, including one that returns a factory's result through a chain of exported helpers. A function the analysis cannot follow leaves the question open. Undefined storage, replacement instances, guarded-field writes, pointer escapes, and opaque calls that can receive the container keep the warning. Local calls are inspected; writes to independent sibling fields remain permitted.
 Unclassified aggregate constructions, including contextual array elements and switch results, do not establish this proof.
 
 Public factories, runtime flags, missing assertions, alternate nullable constructions, pointer escapes, and caller or callee resets retain the warning. For these cases, check the field at the use site.
@@ -577,6 +631,8 @@ Public factories, runtime flags, missing assertions, alternate nullable construc
 self.path = try allocator.dupe(u8, input);
 const basename = getBasename(self.path.?);  // Safe: try succeeded, so path is non-null
 ```
+
+A successful generic constructor that returns a non-optional container also establishes the assigned field after `try`. Registering an `errdefer` does not run its cleanup on that success path. Optional or unresolved constructor results do not establish this fact.
 
 **Labeled block invariant:**
 ```zig
@@ -589,6 +645,19 @@ if (should_process) {
 }
 ```
 
+**Error partition guards:**
+
+A local producer and a local predicate can narrow a payload field when both partition the same declared error set, and when a guard before the unwrap calls the predicate with the very error value the producer received. Every tag accepted by the predicate must select a non-null field in the producer. A different error argument, an accepted nullable tag, or a payload that escapes - handed to a call, taken by address, or reached through a cast - keeps the warning. The binding has to be `const` and free of attributes, because a `var` payload can be rewritten between the producer and the unwrap.
+
+**ArrayList removal bound:**
+```zig
+while (items.items.len > 0) {
+    const row = items.pop().?;  // Safe: the guard proves one removal
+}
+```
+
+A verified `std.ArrayList(T)` length guard on a declared local, parameter, or struct field bounds removals before an unwrap. Each preceding removal spends one element. The guarded pop does not invalidate its own proof. A call or storage write that can empty the list cancels the proof. This includes mutations in the guard condition, body, or loop continuation. A nested loop that removes elements from the same list cancels the bound. A loop over another list spends nothing.
+
 ### divide-by-zero-engine
 
 Detects integer division/modulo expressions where the denominator can be zero on at least one reachable path.
@@ -600,6 +669,8 @@ The checker is path-sensitive and tracks:
 - mixed-path outcomes (reports "possible" when some paths are safe and some are unsafe)
 
 Integer guard refinement requires a proven domain that fits signed 64-bit values: signed integers up to 64 bits and unsigned integers up to 63 bits. Floating-point, unknown, and wider domains remain conservative.
+
+Assigning a variable retires the branch constraints that refer to it. The engine explores branches that the assignment makes reachable again. Loop widening keeps an interval's stable bound and expands only a changing bound to the integer-domain limit. An increasing counter therefore keeps its starting lower bound.
 
 Labeled `break` statements that exit an enclosing block preserve the constraints of the continuing path. The engine evaluates the break operand and runs reached defers in the exited scopes before the jump. Unresolved labels and loop breaks remain conservative; they do not remove a possible-zero path.
 
@@ -660,6 +731,8 @@ Detects catch blocks that ignore errors without rethrowing or logging. An error 
 
 If the engine reaches an analysis limit, structural checks still inspect the handler up to its catch merge. A call after the merge does not count as error handling. A handler that terminates with `unreachable` does not silently continue.
 
+A handler can also report failure through the binding the function returns: a boolean rejection or a nonzero failure-count update. A reset, address escape, shadowed binding, different return value, or zero/unknown counter increment does not establish this proof. Empty catches remain the `empty-catch-engine` checker's responsibility.
+
 **Bad:**
 ```zig
 fn bar() i32 {
@@ -692,7 +765,7 @@ fn baz() i32 {
 
 ### store-violations-engine
 
-Detects allocator/resource misuse: double-free, free-without-alloc, close-without-open, use-after-free/close, leaks, and **defer-frees-escapee** (a resource freed by `defer` that has already escaped into an outer container).
+Detects allocator/resource misuse. It reports eight kinds: double-free, double-close, free-without-alloc, close-without-open, use-after-free, use-after-close, leak, and **defer-frees-escapee** (a resource freed by `defer` that has already escaped into an outer container).
 
 **Error-path leak policy:** Leak checks run only on normal return paths. When a function returns an error - a literal error value, a member of a declared error set such as `ConfigError.InvalidConfigFormat`, or a switch or conditional whose branches all return one - the path takes the error state, the `errdefer` cleanup for it is applied, and leak reports are suppressed. This avoids false positives in code that cleans up via `errdefer`.
 
@@ -700,9 +773,19 @@ Detects allocator/resource misuse: double-free, free-without-alloc, close-withou
 
 **Release wrappers:** A wrapper that closes the resource it is handed releases the caller's argument, so `compat.closeDir(ctx, &directory)` ends the caller's hold just as `directory.close()` does. The proof comes from the callee's body, never from its spelling: the callee must resolve to one function declaration, its body must be a single unconditional statement that closes a genuine resource field - `std.fs.File`, `std.fs.Dir`, `std.fs.IterableDir`, `std.posix.fd_t`, `std.Io.File` or `std.Io.Dir` - and that wrapper type must carry exactly one such field. A sibling that only reads the argument, a close behind a branch, a close on a second resource field, and a look-alike close on any other type are all still reported, and the caller must pass the resource by address.
 
+**Deferred closes:** Zig 0.16 `std.Io` handles use `file.close(io)` or `dir.close(io)`. Pre-0.16 `std.fs` handles use `file.close()` or `dir.close()`. POSIX descriptors use `std.posix.close(fd)`. A deferred close releases a successful acquisition from a verified standard API, including immutable namespace aliases and method-syntax opens. A failed open creates no handle. Error mapping does not cancel cleanup registered for a successful open. Standard `cwd`, `stdin`, `stdout`, and `stderr` factories return borrowed handles. User-defined look-alike factories and close methods do not get these ownership rules.
+
+A `catch` chain names the producer each arm selected, so a handle opened inside a fallback belongs to that arm. The fallback may sit inside the guarded operand of an outer `catch`, where it still decides arms of its own.
+
+**Returned allocations:** Pointer-preserving casts and returned aggregates retain their allocations. Stores through a cast or a helper that returns its pointer argument retain the resolved destination's ownership, and the same is true of a store through a field that the destination's own declaration filled with a pointer: returning either the field or the binding behind it carries the payload out. What still reports is a dropped destination and a store into a slot whose pointee type cannot be read. A dereference store whose destination is a bare binding to a scalar pointee hands that block nothing to own, so the stored bytes stay the caller's to release - `const length = try allocator.create(usize); length.* = bytes.len;` does not move the bytes - and this holds whether or not the binding writes its pointee type down. A `create` slot whose pointee is a scalar holds no payload. A successful `realloc` transfers ownership to its replacement; returning that replacement is not a leak. Each arm of a `catch` chain around a resize names its own producer, so a fallback that is not a resize leaves the block handed to the primary resize live. A discarded or unreleased replacement remains diagnostic, and a failed resize leaves the original allocation owned by the caller - by the function's `errdefer`, or by the caller it is returned to.
+
+**Arena contexts:** An allocation through a context field can share a caller's proven arena lifetime. The allocator may be reached through nested context fields, or through a local binding of a context that carries another one by value. Every visible call must pass a stable context tied to a genuine arena owner, and a function with no visible call site in the analyzed file proves nothing at all. Each reachable successful exit must release that arena or transfer its state by value through the returned owner. Returning a different arena or a pointer to the caller's local arena does not transfer that lifetime; an owner that carries the arena itself beside other fields does.
+
+A `defer` covers an exit once control reaches its registration, and a `defer` written in an inner block settles every exit reached after that block has run to its end. A matching `errdefer` covers an explicit error return, not a successful return, and an `errdefer` on its own never discharges the lifetime. Replacing the allocator - through an address alias of its field, directly or through a chain of them, through a helper, or through a method - cancels the lifetime proof, as does handing the context on or returning it. Read-only calls and sibling-field writes keep it.
+
 **Diagnostics per path:** When multiple control-flow paths violate the rule, multiple diagnostics can be emitted for the same source line.
 
-**Resources stored in aggregates:** `aggregate[index] = payload` moves the payload's resources into the aggregate, so they travel with it and are released with it. The transfer needs a proof that the store lands in a slot that stays reachable: the store must be the penultimate statement of a `for` body whose last statement is `<index> += 1`, both the aggregate and the index must be declared outside that loop, and nothing else in the function may write the index or reach the aggregate - no second store, no field or whole-aggregate assignment, and no call that takes either by value or address (a proven allocator release is the one call allowed through). Every store that cannot be proven this way leaves the resources with the payload, so a payload dropped by a cursor that advances by zero, a constant index, a later write through the aggregate, or an aggregate that is replaced is still reported. A value stored into an aggregate that owns nothing is unchanged.
+**Resources stored in aggregates:** `aggregate[index] = payload` moves the payload's resources into the aggregate, so they travel with it and are released with it. The transfer needs a proof that the store lands in a slot that stays reachable: the store must be the penultimate statement of a `for` body whose last statement is `<index> += 1`, both the aggregate and the index must be declared outside that loop, and nothing else in the function may write the index or reach the aggregate - no second store, no field or whole-aggregate assignment, and no call that takes either by value or address (a proven allocator release is the one call allowed through). Every store that cannot be proven this way leaves the resources with the payload, so a payload dropped by a cursor that advances by zero, a constant index, or a later write through the aggregate is still reported. A whole-binding assignment settles it instead: when nothing names the aggregate after that assignment, the lost aggregate is what gets reported, and the payload it carried goes with that block. A value stored into an aggregate that owns nothing is unchanged.
 
 **Resource modeling:** Built-in allocator detection includes `alloc`/`free`, `dupe`, and `create`/`destroy`. Configurable `resource_models` can add project-specific APIs. Model matching uses shared call resolution for identifier calls, receiver methods, receiver types, and FQNs. `kind: "free_owned"` models APIs like `deinit` that free resources owned by a value without freeing the value itself.
 

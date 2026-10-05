@@ -1,7 +1,7 @@
 const std = @import("std");
 
 fn foo(allocator: std.mem.Allocator) !void {
-    var ptr = try allocator.alloc(u8, 1);
+    const ptr = try allocator.alloc(u8, 1);
     allocator.free(ptr);
     allocator.free(ptr);
 }

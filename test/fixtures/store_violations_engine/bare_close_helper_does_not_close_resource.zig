@@ -3,7 +3,7 @@ const std = @import("std");
 fn close(_: std.fs.File) void {}
 
 fn foo() !void {
-    var file = try std.fs.cwd().openFile("foo", .{});
+    const file = try std.fs.cwd().openFile("foo", .{});
     close(file);
 }
 

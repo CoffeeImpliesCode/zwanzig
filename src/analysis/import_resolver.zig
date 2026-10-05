@@ -18,6 +18,25 @@ pub const File = struct {
     path_index: ?*const PathIndex = null,
 };
 
+/// `@import("root")` names the root module of the compilation unit a file is
+/// compiled in. It is neither a path nor a name a build script may bind, so
+/// only the build module graph can answer it.
+pub const root_import_path = "root";
+
+/// `@import("root")` is the one import path no lookup may answer from a file,
+/// a package stem, or a name a build script bound: Zig reserves it for the
+/// compilation root, so only the build module graph can resolve it. Every
+/// lookup that could answer it from one of those three sources rejects it
+/// through this function: `PathIndex.findImport`, `importMayResolveToPath`,
+/// `resolveImportToFileIndex`, `registeredModuleTarget`, and the reference
+/// index's `importTargets`. The path-text helpers they are built from
+/// (`importResolvesToPath`, `packageImportMayResolveToPath`, `pathsEquivalent`)
+/// and a raw `ModuleNames` table answer no import by themselves, so they carry
+/// no reserved check.
+pub fn isReservedImport(import_path: []const u8) bool {
+    return std.mem.eql(u8, import_path, root_import_path);
+}
+
 /// A module root a build script bound to an import name.
 pub const RegisteredModule = struct {
     file: usize,
@@ -43,8 +62,11 @@ pub fn addModuleName(allocator: std.mem.Allocator, names: *ModuleNames, name: []
 
 /// Root a build script bound to a bare import name. A name no registration
 /// reaches, or one bound to two roots, answers null so the caller keeps its
-/// own fallback instead of an invented answer.
+/// own fallback instead of an invented answer. The reserved spelling answers
+/// null too: a binding named `root` names the compilation root, which only the
+/// build module graph knows.
 pub fn registeredModuleTarget(names: *const ModuleNames, import_path: []const u8) ?usize {
+    if (isReservedImport(import_path)) return null;
     if (names.count() == 0) return null;
     if (std.mem.indexOfScalar(u8, import_path, '/') != null) return null;
     if (std.mem.endsWith(u8, import_path, ".zig")) return null;
@@ -116,6 +138,7 @@ pub const PathIndex = struct {
 
     /// Match the scan's first file, not a preference for relative over package imports.
     pub fn findImport(self: *const PathIndex, importer_path: []const u8, import_path: []const u8) ?usize {
+        if (isReservedImport(import_path)) return null;
         var first: ?usize = if (self.exact.get(import_path)) |entry| entry.original else null;
         const importer_dir = std.fs.path.dirname(importer_path) orelse "";
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -456,12 +479,18 @@ pub fn importResolvesToPath(importer_path: []const u8, import_path: []const u8, 
     return pathsEquivalent(resolved, target_path);
 }
 
+/// Whether `import_path` may name `target_path` by path or by package stem.
+/// The reserved spelling answers false: neither a file named `root.zig` nor a
+/// package stem `root` is the compilation root, so a path-only lookup cannot
+/// resolve it and must leave it to the build module graph.
 pub fn importMayResolveToPath(importer_path: []const u8, import_path: []const u8, target_path: []const u8) bool {
+    if (isReservedImport(import_path)) return false;
     if (importResolvesToPath(importer_path, import_path, target_path)) return true;
     return packageImportMayResolveToPath(import_path, target_path);
 }
 
 pub fn resolveImportToFileIndex(files: []const File, importer_path: []const u8, import_path: []const u8) ?usize {
+    if (isReservedImport(import_path)) return null;
     if (files.len != 0) {
         if (files[0].path_index) |index| {
             if (index.files.ptr == files.ptr and index.files.len == files.len) {
@@ -971,6 +1000,39 @@ test "import path comparisons preserve normalization and package precedence" {
     try std.testing.expect(pathsEquivalent("C:value.zig", "./C:value.zig"));
     try std.testing.expect(!pathsEquivalent("src/value.zig", "other/value.zig"));
     try std.testing.expect(importMayResolveToPath("src/main.zig", "module", "lib/module.zig"));
+}
+
+test "reserved root import resolves from no file, package stem, or bound name" {
+    const allocator = std.testing.allocator;
+    // Both decoys the project-wide walk used to face: a file on disk named
+    // `root.zig`, and a module a build script binds to the name `root`.
+    var decoy = try std.zig.Ast.parse(allocator, "pub fn decoy() void {}", .zig);
+    defer decoy.deinit(allocator);
+    var files = [_]File{
+        .{ .path = "src/root.zig", .tree = &decoy },
+    };
+    const plain = files;
+    var index = try PathIndex.init(allocator, &files);
+    defer index.deinit(allocator);
+    for (&files) |*file| file.path_index = &index;
+    try addModuleName(allocator, &index.module_names, root_import_path, 0);
+
+    // The path-only predicates refuse the spelling outright: a file literally
+    // named root.zig, the package stem it would match, and the bound name all
+    // stay unanswered, so no lookup can invent a compilation root from disk.
+    try std.testing.expect(!importMayResolveToPath("src/main.zig", root_import_path, "src/root.zig"));
+    try std.testing.expect(!importMayResolveToPath("src/main.zig", root_import_path, "root.zig"));
+    try std.testing.expect(!importMayResolveToPath("src/main.zig", root_import_path, "src/root"));
+    try std.testing.expectEqual(@as(?usize, null), registeredModuleTarget(&index.module_names, root_import_path));
+    try std.testing.expectEqual(@as(?usize, null), index.findImport("src/main.zig", root_import_path));
+    try std.testing.expectEqual(@as(?usize, null), resolveImportToFileIndex(&plain, "src/main.zig", root_import_path));
+    try std.testing.expectEqual(@as(?usize, null), resolveImportToFileIndex(&files, "src/main.zig", root_import_path));
+
+    // The stem comparison underneath still matches the decoy, so the refusal
+    // is the reserved spelling itself and not a broken path comparison.
+    try std.testing.expect(packageImportMayResolveToPath(root_import_path, "src/root.zig"));
+    try std.testing.expect(importMayResolveToPath("src/main.zig", "roots", "src/roots.zig"));
+    try std.testing.expectEqual(@as(?usize, 0), index.findImport("src/main.zig", "root.zig"));
 }
 
 test "indexed imports preserve exact spelling and package first-match precedence" {

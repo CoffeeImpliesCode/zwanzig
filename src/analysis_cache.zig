@@ -188,6 +188,36 @@ pub const AnalysisCache = struct {
     }
 };
 
+/// Everything a run reads off the key to configure its engine.
+///
+/// The run collects these as one value instead of unwrapping each optional
+/// where it is used. Seven independent unwraps are seven independent branches,
+/// so the state that reaches the end of a run is the product of them rather
+/// than a handful of cases: a run whose key names some inputs and not others
+/// has one state per combination, and the dataflow analysis cannot merge
+/// them. Deciding what to configure once, here, keeps the run itself linear.
+const EngineSources = struct {
+    type_context: ?*checker_mod.TypeContext,
+    config: ?*const checker_mod.Config,
+    build_metadata: ?*const BuildMetadata,
+    artifacts: ?*checker_mod.CachedArtifacts,
+    max_worklist_steps: ?usize,
+    max_states_per_point: ?u32,
+    use_widening: ?bool,
+
+    /// Configure the engine with exactly the inputs the key carries. An input
+    /// the key does not name leaves the engine's own default in place.
+    fn apply(self: EngineSources, engine: *AnalysisEngine) void {
+        if (self.type_context) |types| engine.setTypeContext(types);
+        if (self.config) |config| engine.setConfig(config);
+        if (self.build_metadata) |metadata| engine.setBuildMetadata(metadata);
+        if (self.artifacts) |artifacts| engine.setCachedArtifacts(artifacts);
+        if (self.max_worklist_steps) |steps| engine.setMaxWorklistSteps(steps);
+        if (self.max_states_per_point) |states| engine.setMaxStatesPerPoint(states);
+        if (self.use_widening) |enabled| engine.setUseWidening(enabled);
+    }
+};
+
 pub fn getOrAnalyze(
     context: *const checker_mod.CheckerContext,
     allocator: std.mem.Allocator,
@@ -222,13 +252,16 @@ pub fn getOrAnalyze(
     engine.setCheckerName(checker_name);
     // The log label is not semantic and may be a short-lived caller buffer.
     defer engine.checker_name = null;
-    if (key.type_context) |types| engine.setTypeContext(types);
-    if (key.config) |config| engine.setConfig(config);
-    if (key.build_metadata) |metadata| engine.setBuildMetadata(metadata);
-    if (key.artifacts) |artifacts| engine.setCachedArtifacts(artifacts);
-    if (key.limits.max_worklist_steps) |steps| engine.setMaxWorklistSteps(steps);
-    if (key.limits.max_states_per_point) |states| engine.setMaxStatesPerPoint(states);
-    if (key.limits.use_widening) |enabled| engine.setUseWidening(enabled);
+    const sources: EngineSources = .{
+        .type_context = key.type_context,
+        .config = key.config,
+        .build_metadata = key.build_metadata,
+        .artifacts = key.artifacts,
+        .max_worklist_steps = key.limits.max_worklist_steps,
+        .max_states_per_point = key.limits.max_states_per_point,
+        .use_widening = key.limits.use_widening,
+    };
+    sources.apply(engine);
 
     if (context.analysis_stats) |stats| stats.recordRun();
     defer if (context.analysis_stats) |stats| {

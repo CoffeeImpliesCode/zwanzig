@@ -2,7 +2,7 @@ const std = @import("std");
 
 fn foo(allocator: std.mem.Allocator) void {
     var buf = [_]u8{0};
-    var ptr = buf[0..];
+    const ptr = buf[0..];
     allocator.free(ptr);
 }
 

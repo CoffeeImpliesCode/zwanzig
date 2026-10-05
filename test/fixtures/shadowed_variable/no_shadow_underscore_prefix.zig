@@ -13,3 +13,5 @@ fn bar() void {
     }
     _ = _unused;
 }
+
+// zwanzig: not a standalone program: Zig rejects these underscore-prefixed shadows as compile errors regardless of the analyzer's opinion, so the file cannot compile; it exists only to verify that the shadowed-variable rule stays silent on underscore-prefixed names.

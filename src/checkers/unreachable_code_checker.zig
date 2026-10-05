@@ -5,6 +5,10 @@ const CheckerError = checker_mod.CheckerError;
 const Diagnostic = checker_mod.Diagnostic;
 const SourceRange = checker_mod.SourceRange;
 const Source = @import("../source.zig").Source;
+const ast_walk = @import("../ast_walk.zig");
+const import_resolver = @import("../analysis/import_resolver.zig");
+const LexicalIndex = @import("../analysis/lexical_index.zig").LexicalIndex;
+const call_resolver = @import("../analysis/call_resolver.zig");
 const value = @import("../engine/value.zig");
 const ids = @import("../ids.zig");
 const cfg_mod = @import("../cfg.zig");
@@ -35,12 +39,51 @@ pub const UnreachableCodeChecker = struct {
         const tree = try src.ast();
         const tags = tree.nodes.items(.tag);
 
+        // Only a comptime scope can hold a compile-time assertion guard, so the
+        // parent map that proves one is built when, and only when, the file
+        // mentions `comptime` at all. The map is released by the scope that
+        // built it, which ends once every check that reads it has run.
+        if (hasComptimeKeyword(tree)) {
+            const map = try allocator.alloc(u32, tags.len);
+            defer if (map.len != 0) allocator.free(map);
+            @memset(map, 0);
+            for (tags, 0..) |tag, node| {
+                switch (tag) {
+                    .fn_decl,
+                    .test_decl,
+                    .simple_var_decl,
+                    .local_var_decl,
+                    .global_var_decl,
+                    .aligned_var_decl,
+                    .@"comptime",
+                    => ast_walk.fillParentMap(tree, @intCast(node), map),
+                    else => {},
+                }
+            }
+            return try checkNodes(src, allocator, diagnostics, context, .{ .parents = map });
+        }
+        return try checkNodes(src, allocator, diagnostics, context, .{});
+    }
+
+    /// Every check the AST rule runs over one file, against what that file
+    /// proves about its comptime scopes. A file that never writes `comptime`
+    /// carries an empty context, which turns the assertion exemption off.
+    fn checkNodes(
+        src: *Source,
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        context: checker_mod.CheckerContext,
+        ct: ComptimeContext,
+    ) CheckerError!void {
+        const tree = try src.ast();
+        const tags = tree.nodes.items(.tag);
+
         for (0..tags.len) |i| {
             const tag = tags[i];
             if (tag == .@"if" or tag == .if_simple) {
-                try checkIfStatement(src, allocator, diagnostics, @intCast(i));
+                try checkIfStatement(src, allocator, diagnostics, @intCast(i), ct);
             } else if (tag == .while_simple or tag == .while_cont or tag == .@"while") {
-                try checkWhileStatement(src, allocator, diagnostics, @intCast(i));
+                try checkWhileStatement(src, allocator, diagnostics, @intCast(i), ct);
             }
         }
 
@@ -393,6 +436,7 @@ pub const UnreachableCodeChecker = struct {
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
         if_node: u32,
+        ct: ComptimeContext,
     ) CheckerError!void {
         const tree = try src.ast();
         const full_if = tree.fullIf(@enumFromInt(if_node)) orelse return;
@@ -420,6 +464,13 @@ pub const UnreachableCodeChecker = struct {
                 }
             } else {
                 const then_node: u32 = @intFromEnum(full_if.ast.then_expr);
+                if (isComptimeAssertionGuard(
+                    src,
+                    tree,
+                    ct,
+                    full_if.ast.else_expr.unwrap() == null,
+                    then_node,
+                )) return;
                 const range = try getNodeRange(src, then_node);
                 if (range) |r| {
                     var diag = try Diagnostic.init(
@@ -442,6 +493,7 @@ pub const UnreachableCodeChecker = struct {
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
         while_node: u32,
+        ct: ComptimeContext,
     ) CheckerError!void {
         const tree = try src.ast();
         const full_while = tree.fullWhile(@enumFromInt(while_node)) orelse return;
@@ -452,6 +504,14 @@ pub const UnreachableCodeChecker = struct {
         if (cond_value) |is_true| {
             if (!is_true) {
                 const body_node: u32 = @intFromEnum(full_while.ast.then_expr);
+                if (isComptimeAssertionGuard(
+                    src,
+                    tree,
+                    ct,
+                    full_while.ast.cont_expr.unwrap() == null and
+                        full_while.ast.else_expr.unwrap() == null,
+                    body_node,
+                )) return;
                 const range = try getNodeRange(src, body_node);
                 if (range) |r| {
                     var diag = try Diagnostic.init(
@@ -467,6 +527,172 @@ pub const UnreachableCodeChecker = struct {
                 }
             }
         }
+    }
+
+    /// What one file can prove about its comptime scopes.
+    ///
+    /// `parents` is empty when the file never writes `comptime`, which turns
+    /// the assertion exemption off for the whole file and costs no allocation.
+    const ComptimeContext = struct {
+        parents: []const u32 = &.{},
+    };
+
+    /// A file that never writes the `comptime` keyword cannot hold a
+    /// compile-time assertion, so the parent map that proves one is skipped.
+    fn hasComptimeKeyword(tree: *const std.zig.Ast) bool {
+        for (tree.tokens.items(.tag)) |tag| {
+            if (tag == .keyword_comptime) return true;
+        }
+        return false;
+    }
+
+    /// Lexical index for this tree, borrowed from the source that parsed it.
+    fn lexicalIndexFor(src: *Source, tree: *const std.zig.Ast) ?*const LexicalIndex {
+        const source_tree = src.ast() catch return null;
+        if (tree != source_tree) return null;
+        return src.lexicalIndex() catch null;
+    }
+
+    /// Proven `@import("std")` binding for an expression, through the project's
+    /// own resolver. A user module spelled `std`, a `var` binding, and a local
+    /// that shadows the name all fail, because none of them resolves to a
+    /// declaration whose initializer is that import. The answer comes from a
+    /// single resolution: a malformed file has no lexical index and yields no
+    /// binding, so it proves nothing either.
+    fn isVerifiedStdImport(src: *Source, tree: *const std.zig.Ast, node: u32) bool {
+        if (node >= tree.nodes.items(.tag).len) return false;
+        const files = [_]import_resolver.File{.{
+            .path = src.getFilePath(),
+            .tree = tree,
+            .lexical_index = lexicalIndexFor(src, tree),
+        }};
+        const resolver = call_resolver.ProjectTypeResolver{ .files = &files, .file_index = 0 };
+        return resolver.isVerifiedImportBinding(node, "std");
+    }
+
+    /// A constant-false branch inside a comptime scope whose body only asserts
+    /// is a compile-time invariant guard, not dead application logic: the
+    /// branch never runs because the invariant currently holds, and deleting
+    /// it would drop the check against a future change that breaks it.
+    ///
+    /// Both halves are required. The comptime scope keeps an ordinary dead
+    /// runtime branch reportable, and the assertion-only body keeps a comptime
+    /// branch that runs real logic reportable.
+    fn isComptimeAssertionGuard(
+        src: *Source,
+        tree: *const std.zig.Ast,
+        ct: ComptimeContext,
+        unconditional_shape: bool,
+        body: u32,
+    ) bool {
+        if (ct.parents.len == 0) return false;
+        if (!unconditional_shape) return false;
+        if (!isInsideComptimeScope(tree, ct.parents, body)) return false;
+        return isAssertionOnlyBody(src, tree, body);
+    }
+
+    /// True when the branch is written inside a `comptime` scope. A function
+    /// or test body is runtime code even when its own constants are known, so
+    /// the walk stops there.
+    fn isInsideComptimeScope(
+        tree: *const std.zig.Ast,
+        comptime_parents: []const u32,
+        node: u32,
+    ) bool {
+        const tags = tree.nodes.items(.tag);
+        var current = node;
+        var depth: u32 = 0;
+        while (depth < 64) : (depth += 1) {
+            if (current >= comptime_parents.len) return false;
+            const parent = comptime_parents[current];
+            if (parent == 0 or parent >= tags.len) return false;
+            switch (tags[parent]) {
+                .@"comptime" => return true,
+                .fn_decl, .test_decl => return false,
+                .simple_var_decl,
+                .local_var_decl,
+                .global_var_decl,
+                .aligned_var_decl,
+                => {
+                    const declaration = tree.fullVarDecl(@enumFromInt(parent)) orelse return false;
+                    if (declaration.comptime_token != null) return true;
+                },
+                else => {},
+            }
+            current = parent;
+        }
+        return false;
+    }
+
+    /// True when every statement of the branch body is a compile-time
+    /// assertion. An empty body asserts nothing.
+    fn isAssertionOnlyBody(src: *Source, tree: *const std.zig.Ast, body: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (body >= tags.len) return false;
+        switch (tags[body]) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+                var buffer: [2]u32 = undefined;
+                const statements = ast_walk.getBlockStatements(tree, body, &buffer) orelse return false;
+                if (statements.len == 0) return false;
+                for (statements) |statement| {
+                    if (!isCompileTimeAssertion(src, tree, statement)) return false;
+                }
+                return true;
+            },
+            else => return isCompileTimeAssertion(src, tree, body),
+        }
+    }
+
+    /// `@compileError(...)` stops the build when the branch is taken, and the
+    /// real `std.debug.assert(...)` inside a comptime scope stops it for the
+    /// same reason. Both assert an invariant rather than run application logic.
+    fn isCompileTimeAssertion(src: *Source, tree: *const std.zig.Ast, node: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len) return false;
+        const token_tags = tree.tokens.items(.tag);
+        switch (tags[node]) {
+            .grouped_expression => return isCompileTimeAssertion(
+                src,
+                tree,
+                @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]),
+            ),
+            .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {
+                const token = tree.nodes.items(.main_token)[node];
+                if (token >= token_tags.len or token_tags[token] != .builtin) return false;
+                return std.mem.eql(u8, tree.tokenSlice(token), "@compileError");
+            },
+            .call, .call_comma, .call_one, .call_one_comma => {
+                var call_buffer: [1]std.zig.Ast.Node.Index = undefined;
+                const call = tree.fullCall(&call_buffer, @enumFromInt(node)) orelse return false;
+                return isDebugAssertCallee(src, tree, @intFromEnum(call.ast.fn_expr));
+            },
+            else => return false,
+        }
+    }
+
+    /// True when the callee is `std.debug.assert` reached through a `std` the
+    /// file binds to `@import("std")`. The chain is read as
+    /// `std` `.` `debug` `.` `assert`, and the base expression must resolve to
+    /// that import, so a user module or a shadowing local spelled `std` does
+    /// not match. An alias of the assertion is deliberately not accepted: it is
+    /// a different spelling that would need its own resolution.
+    fn isDebugAssertCallee(src: *Source, tree: *const std.zig.Ast, callee: u32) bool {
+        const tags = tree.nodes.items(.tag);
+        const datas = tree.nodes.items(.data);
+        if (callee >= tags.len or tags[callee] != .field_access) return false;
+        const assert_access = datas[callee].node_and_token;
+        if (!segmentMatches(tree, assert_access[1], "assert")) return false;
+        const debug_node = @intFromEnum(assert_access[0]);
+        if (debug_node >= tags.len or tags[debug_node] != .field_access) return false;
+        const debug_access = datas[debug_node].node_and_token;
+        if (!segmentMatches(tree, debug_access[1], "debug")) return false;
+        return isVerifiedStdImport(src, tree, @intFromEnum(debug_access[0]));
+    }
+
+    fn segmentMatches(tree: *const std.zig.Ast, token: u32, name: []const u8) bool {
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len or token_tags[token] != .identifier) return false;
+        return std.mem.eql(u8, tree.tokenSlice(token), name);
     }
 
     fn evaluateConditionValue(tree: *const std.zig.Ast, cond_node: u32) ?bool {
@@ -784,18 +1010,22 @@ test "unreachable_code_engine - constant emission propagates allocation failures
                 for (diagnostics.items) |*diagnostic| diagnostic.deinit(memory);
                 diagnostics.deinit(memory);
             }
+            // The fixture has no `comptime` keyword, so the exemption's context
+            // is empty and the constant emission owns every allocation.
             switch (ast.nodes.items(.tag)[node]) {
                 .@"if", .if_simple => try UnreachableCodeChecker.checkIfStatement(
                     &input,
                     memory,
                     &diagnostics,
                     node,
+                    .{},
                 ),
                 .@"while", .while_simple, .while_cont => try UnreachableCodeChecker.checkWhileStatement(
                     &input,
                     memory,
                     &diagnostics,
                     node,
+                    .{},
                 ),
                 else => unreachable,
             }
@@ -817,6 +1047,139 @@ test "unreachable_code_engine - constant emission propagates allocation failures
             else => {},
         }
     }
+}
+
+test "unreachable_code_engine - comptime assertion guards are not dead code" {
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\comptime {
+        \\    const guard_limit: usize = 80;
+        \\    const guard_worst_case: usize = 77;
+        \\    if (guard_worst_case > guard_limit) {
+        \\        @compileError("max_control_bytes must hold the worst-case control sequence");
+        \\    }
+        \\}
+        \\comptime {
+        \\    if (77 > 80) {
+        \\        std.debug.assert(77 <= 80);
+        \\    }
+        \\}
+        \\comptime {
+        \\    while (false) {
+        \\        @compileError("the loop must never be entered");
+        \\    }
+        \\}
+        \\comptime {
+        \\    const dead_flag: bool = false;
+        \\    if (dead_flag) {
+        \\        std.debug.print("unreachable feature\n", .{});
+        \\    }
+        \\}
+        \\fn scale(value: u8) u8 {
+        \\    const unsupported: bool = false;
+        \\    if (unsupported) {
+        \\        @compileError("an assertion outside comptime is dead code");
+        \\    }
+        \\    return value;
+        \\}
+        \\fn shadowedStd(value: u8) u8 {
+        \\    const std = struct {
+        \\        pub const debug = struct {
+        \\            pub fn assert(ok: bool) void {
+        \\                if (!ok) @panic("fake assertion");
+        \\            }
+        \\        };
+        \\    };
+        \\    comptime {
+        \\        const limit: usize = 80;
+        \\        const worst: usize = 77;
+        \\        if (worst > limit) {
+        \\            std.debug.assert(worst <= limit);
+        \\        }
+        \\    }
+        \\    return value;
+        \\}
+        \\fn mutableAssertAlias(value: u8) u8 {
+        \\    var assert = std.debug.assert;
+        \\    defer assert = std.debug.assert;
+        \\    comptime {
+        \\        const limit: usize = 80;
+        \\        const worst: usize = 77;
+        \\        if (worst > limit) {
+        \\            assert(worst <= limit);
+        \\        }
+        \\    }
+        \\    return value;
+        \\}
+    ;
+    // Only the branches that do not assert a real invariant are reported: the
+    // comptime branch that runs real logic, the assertion outside any comptime
+    // scope, the call through a `std` the file does not bind, and the call
+    // through an alias.
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{ 21, 27, 43, 55 });
+}
+
+test "unreachable_code_engine - a user module spelled std names no assertion" {
+    const code: [:0]const u8 =
+        \\const std = struct {
+        \\    pub const debug = struct {
+        \\        pub fn assert(ok: bool) void {
+        \\            if (!ok) @panic("fake assertion");
+        \\        }
+        \\    };
+        \\};
+        \\comptime {
+        \\    const limit: usize = 80;
+        \\    const worst: usize = 77;
+        \\    if (worst > limit) {
+        \\        std.debug.assert(worst <= limit);
+        \\    }
+        \\}
+    ;
+    try expectUnreachableLines(code, .{ .build_metadata = null }, &.{11});
+}
+
+test "unreachable_code_engine - comptime parent map propagates allocation failures" {
+    const allocator = std.testing.allocator;
+    var source = Source.init(allocator, "comptime-oom.zig",
+        \\const std = @import("std");
+        \\comptime {
+        \\    const limit: usize = 80;
+        \\    if (77 > limit) {
+        \\        @compileError("capacity guard");
+        \\    }
+        \\}
+        \\comptime {
+        \\    const dead: bool = false;
+        \\    if (dead) {
+        \\        std.debug.print("dead\n", .{});
+        \\    }
+        \\}
+    );
+    defer source.deinit();
+    const tree = try source.ast();
+    const Harness = struct {
+        fn run(memory: std.mem.Allocator, ast: *const std.zig.Ast) !void {
+            var input = Source.initParsed(memory, "comptime-oom.zig", ast);
+            defer input.deinit();
+            var diagnostics: std.ArrayList(Diagnostic) = .empty;
+            defer {
+                for (diagnostics.items) |*diagnostic| diagnostic.deinit(memory);
+                diagnostics.deinit(memory);
+            }
+            try UnreachableCodeChecker.checker.checkAst(
+                &input,
+                memory,
+                &diagnostics,
+                .{ .build_metadata = null },
+            );
+            try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+            // The report covers the then-block, whose first token is the `{`
+            // that opens it on the `if` line, not the statement inside it.
+            try std.testing.expectEqual(@as(usize, 10), diagnostics.items[0].range.start.line);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Harness.run, .{tree});
 }
 
 fn expectUnreachableLines(

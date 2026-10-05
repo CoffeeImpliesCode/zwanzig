@@ -6,3 +6,5 @@ fn foo() void {
     const config = 100;
     _ = config;
 }
+
+// zwanzig: not a standalone program: a function-scope constant shadowing a file-level constant is the intentional invalidity under test, verifying that the shadowed-variable rule crosses declaration scopes.

@@ -121,30 +121,21 @@ pub fn parseSuppressions(
     var active = ActiveSuppressions.init(allocator);
     defer active.deinit();
 
+    // Walk one physical line per iteration, so the counter advances exactly
+    // once per line whatever the line holds: code, a blank line, a
+    // whitespace-only line, a comment-only line, a directive, or a final line
+    // without a newline.
     var line_number: usize = 1;
-    var i: usize = 0;
+    var line_start: usize = 0;
 
-    while (i < content.len) {
-        if (content[i] == '\n') {
-            line_number += 1;
-            i += 1;
-            continue;
-        }
+    while (line_start < content.len) {
+        const newline = std.mem.indexOfScalarPos(u8, content, line_start, '\n');
+        const line_end = newline orelse content.len;
 
-        if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
-            i += 2;
+        try parseLine(content[line_start..line_end], line_number, &map, &active);
 
-            while (i < content.len and (content[i] == ' ' or content[i] == '\t')) {
-                i += 1;
-            }
-
-            if (try tryParseDirective(content, i, line_number, &map, &active)) |new_i| {
-                i = new_i;
-                continue;
-            }
-        }
-
-        i += 1;
+        line_number += 1;
+        line_start = line_end + 1;
     }
 
     if (active.all_rules_start) |start| {
@@ -162,39 +153,61 @@ pub fn parseSuppressions(
     return map;
 }
 
+/// Scan one line, which holds the text without its newline terminator, for a
+/// directive. A line can hold more than one comment, so the scan continues
+/// past a comment that carries no directive.
+fn parseLine(
+    line: []const u8,
+    line_number: usize,
+    map: *SuppressionMap,
+    active: *ActiveSuppressions,
+) SuppressionError!void {
+    var i: usize = 0;
+    while (i + 1 < line.len) : (i += 1) {
+        if (line[i] != '/' or line[i + 1] != '/') continue;
+
+        var directive_start = i + 2;
+        while (directive_start < line.len and
+            (line[directive_start] == ' ' or line[directive_start] == '\t'))
+        {
+            directive_start += 1;
+        }
+        i = directive_start;
+
+        if (try tryParseDirective(line, directive_start, line_number, map, active)) {
+            return;
+        }
+    }
+}
+
+/// Apply the directive that starts at `start`, if one does. Reports false when
+/// no known directive prefix sits there.
 fn tryParseDirective(
-    content: []const u8,
+    line: []const u8,
     start: usize,
     directive_line: usize,
     map: *SuppressionMap,
     active: *ActiveSuppressions,
-) SuppressionError!?usize {
+) SuppressionError!bool {
     for (directives) |directive_info| {
         const prefix = directive_info.prefix;
         const kind = directive_info.kind;
 
-        if (start + prefix.len <= content.len and
-            std.mem.eql(u8, content[start .. start + prefix.len], prefix))
-        {
-            var pos = start + prefix.len;
+        if (start + prefix.len > line.len) continue;
+        if (!std.mem.eql(u8, line[start .. start + prefix.len], prefix)) continue;
 
-            var end_of_line = pos;
-            while (end_of_line < content.len and content[end_of_line] != '\n') {
-                end_of_line += 1;
-            }
-
-            if (pos < end_of_line and content[pos] == ':') {
-                pos += 1;
-                try applyDirectiveWithRules(map, active, kind, directive_line, content[pos..end_of_line]);
-            } else {
-                try applyDirectiveAllRules(map, active, kind, directive_line);
-            }
-
-            return end_of_line;
+        var rules_start = start + prefix.len;
+        if (rules_start < line.len and line[rules_start] == ':') {
+            rules_start += 1;
+            try applyDirectiveWithRules(map, active, kind, directive_line, line[rules_start..]);
+        } else {
+            try applyDirectiveAllRules(map, active, kind, directive_line);
         }
+
+        return true;
     }
 
-    return null;
+    return false;
 }
 
 fn applyDirectiveAllRules(
@@ -460,4 +473,128 @@ test "parseSuppressions: repeated rule-specific disable preserves first start" {
     try std.testing.expect(map.isSuppressed(4, "todo"));
     try std.testing.expect(!map.isSuppressed(5, "todo"));
     try std.testing.expect(!map.isSuppressed(6, "todo"));
+}
+
+test "parseSuppressions: empty comment line keeps the line counter in step" {
+    const allocator = std.testing.allocator;
+    // Line 2 holds nothing after the comment marker. It still has to count as
+    // a line, or the directive on line 3 is attributed to line 2 and
+    // suppresses line 3 instead of line 4.
+    const content =
+        \\const a = 1;
+        \\//
+        \\// zwanzig-disable-next-line
+        \\const b = 2;
+    ;
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(2, "any-rule"));
+    try std.testing.expect(!map.isSuppressed(3, "any-rule"));
+    try std.testing.expect(map.isSuppressed(4, "any-rule"));
+    try std.testing.expect(!map.isSuppressed(5, "any-rule"));
+}
+
+test "parseSuppressions: whitespace-only comment line keeps the line counter in step" {
+    const allocator = std.testing.allocator;
+    // The blanks at the end of line 2 are written out rather than left as
+    // trailing whitespace, so that the line stays visible.
+    const content = "const a = 1;\n" ++
+        "//   \t\n" ++
+        "// zwanzig-disable-next-line\n" ++
+        "const b = 2;\n";
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(3, "any-rule"));
+    try std.testing.expect(map.isSuppressed(4, "any-rule"));
+    try std.testing.expect(!map.isSuppressed(5, "any-rule"));
+}
+
+test "parseSuppressions: blank line keeps the line counter in step" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\const a = 1;
+        \\
+        \\// zwanzig-disable-next-line
+        \\const b = 2;
+    ;
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(3, "any-rule"));
+    try std.testing.expect(map.isSuppressed(4, "any-rule"));
+    try std.testing.expect(!map.isSuppressed(5, "any-rule"));
+}
+
+test "parseSuppressions: full line comment keeps the line counter in step" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\const a = 1;
+        \\// an ordinary comment
+        \\// zwanzig-disable-next-line
+        \\const b = 2;
+    ;
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(3, "any-rule"));
+    try std.testing.expect(map.isSuppressed(4, "any-rule"));
+    try std.testing.expect(!map.isSuppressed(5, "any-rule"));
+}
+
+test "parseSuppressions: file scope bounds after an empty comment line" {
+    const allocator = std.testing.allocator;
+    // The empty comment on line 1 must not pull both bounds of the region one
+    // line up.
+    const content =
+        \\//
+        \\// zwanzig-disable: todo
+        \\const a = 1;
+        \\// zwanzig-enable: todo
+        \\const b = 2;
+    ;
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(1, "todo"));
+    try std.testing.expect(map.isSuppressed(2, "todo"));
+    try std.testing.expect(map.isSuppressed(3, "todo"));
+    try std.testing.expect(!map.isSuppressed(4, "todo"));
+    try std.testing.expect(!map.isSuppressed(5, "todo"));
+    // The region names only "todo", so it must leave every other rule
+    // unsuppressed, including on the lines the region does cover.
+    try std.testing.expect(!map.isSuppressed(1, "other-rule"));
+    try std.testing.expect(!map.isSuppressed(3, "other-rule"));
+}
+
+test "parseSuppressions: last line without a trailing newline" {
+    const allocator = std.testing.allocator;
+    // The file ends on a code line that carries no newline.
+    const content = "const a = 1;\n" ++ "// zwanzig-disable-next-line\n" ++ "const b = 2;";
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(2, "any-rule"));
+    try std.testing.expect(map.isSuppressed(3, "any-rule"));
+}
+
+test "parseSuppressions: rule list on the last line without a trailing newline" {
+    const allocator = std.testing.allocator;
+    // The directive ends the file, carries a rule list, and follows an empty
+    // comment.
+    const content = "const a = 1;\n" ++ "//\n" ++ "// zwanzig-disable-next-line: todo";
+
+    var map = try parseSuppressions(allocator, content);
+    defer map.deinit();
+
+    try std.testing.expect(!map.isSuppressed(3, "todo"));
+    try std.testing.expect(map.isSuppressed(4, "todo"));
+    try std.testing.expect(!map.isSuppressed(4, "other-rule"));
 }

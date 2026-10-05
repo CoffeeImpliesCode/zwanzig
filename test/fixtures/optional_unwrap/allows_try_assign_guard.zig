@@ -23,7 +23,7 @@ fn basenameForDisplay(path: []const u8) []const u8 {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     var state = State{ .allocator = gpa.allocator() };
     try state.replaceCwdPath("/home/user");

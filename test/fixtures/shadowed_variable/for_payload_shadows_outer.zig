@@ -8,3 +8,5 @@ fn foo() void {
     }
     _ = item;
 }
+
+// zwanzig: not a standalone program: a for loop payload capture shadowing the enclosing function-scope constant is the intentional invalidity under test, verifying that the shadowed-variable rule reports the capture rather than the outer declaration.

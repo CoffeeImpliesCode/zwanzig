@@ -275,10 +275,14 @@ fn resolveCallArgumentType(
     var files = [_]import_resolver.File{
         .{ .path = "", .tree = tree },
     };
+    // Borrow the project file that owns this tree first, then the source's own
+    // immutable syntax facts, so this single-file resolver stops walking every
+    // node per query. Both borrow; the source outlives the resolver.
     if (type_ctx.project_resolver) |project| {
         const file = project.files[project.file_index];
         if (file.tree == tree) files[0].lexical_index = file.lexical_index;
     }
+    if (files[0].lexical_index == null) files[0].lexical_index = type_ctx.lexicalIndexForTree(tree);
     const resolver = ProjectTypeResolver{
         .files = &files,
         .file_index = 0,
@@ -962,8 +966,19 @@ pub const ProjectTypeResolver = struct {
         return null;
     }
 
+    /// How many leading prototype parameters an instance call leaves unwritten.
+    ///
+    /// A receiver written `anytype` or `...` names no type to compare against,
+    /// so the slot cannot be matched by type and the receiver is recognised by
+    /// being first instead. A first parameter that does declare a type still
+    /// has to resolve to the receiver: an ordinary unknown typed first
+    /// parameter is not evidence of one.
+    ///
+    /// A call written through a type namespace never reaches here, so a static
+    /// function keeps an offset of zero even with an `anytype` first parameter.
     fn implicitSelfCount(self: ProjectTypeResolver, proto_node: u32, receiver_type: ResolvedType) usize {
         const tree = self.currentFile().tree;
+        if (protoFirstParamIsInferred(tree, proto_node)) return 1;
         const type_node = protoParamTypeNode(tree, proto_node, 0) orelse return 0;
         const parameter_type = self.resolveTypeNode(type_node) orelse return 0;
         return if (resolvedTypesEqual(parameter_type, receiver_type)) 1 else 0;
@@ -2000,21 +2015,19 @@ pub const ProjectTypeResolver = struct {
             }
         }
         if (isThisBuiltinCall(tree, node)) {
-            var enclosing: ?u32 = null;
-            var smallest_span: usize = tree.tokens.len;
             const reference = tree.nodeMainToken(@enumFromInt(node));
-            for (tree.nodes.items(.tag), 0..) |tag, index| {
-                if (!isContainerTag(tag)) continue;
-                const container: std.zig.Ast.Node.Index = @enumFromInt(index);
-                const first = tree.firstToken(container);
-                const last = tree.lastToken(container);
-                if (reference < first or reference > last) continue;
-                const span = @as(usize, last) - first;
-                if (span >= smallest_span) continue;
-                smallest_span = span;
-                enclosing = @intCast(index);
+            const tags = tree.nodes.items(.tag);
+            if (self.currentFile().lexical_index) |index| {
+                if (index.smallestEnclosingContainer(tags, reference)) |container| {
+                    return .{ .file_index = self.file_index, .container_node = container };
+                }
             }
-            return .{ .file_index = self.file_index, .container_node = enclosing };
+            // No index, or none that names a container: the scan decides, so the
+            // root namespace and an inert index keep the unindexed answer.
+            return .{
+                .file_index = self.file_index,
+                .container_node = smallestContainingContainer(tree, tags, reference),
+            };
         }
         return null;
     }
@@ -2199,6 +2212,15 @@ fn functionProtoName(tree: *const std.zig.Ast, proto_node: u32) ?[]const u8 {
     return tree.tokenSlice(name_token);
 }
 
+/// The declared type of the parameter written at `parameter_index`, counted in
+/// the order the prototype writes its parameters rather than over the typed
+/// subset `ast.params` holds.
+///
+/// `ast.params` omits `anytype` and `...` slots entirely, so indexing it with a
+/// written ordinal silently answers with the next parameter's declaration. The
+/// full-prototype iterator reports those slots in place with no type
+/// expression, so an inferred slot answers `null` instead of borrowing its
+/// neighbour, and a written ordinal after one still lands on its own parameter.
 fn protoParamTypeNode(
     tree: *const std.zig.Ast,
     proto_node: u32,
@@ -2207,21 +2229,34 @@ fn protoParamTypeNode(
     const tags = tree.nodes.items(.tag);
     if (proto_node >= tags.len) return null;
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
-    const params = switch (tags[proto_node]) {
-        .fn_proto => tree.fnProto(@enumFromInt(proto_node)).ast.params,
-        .fn_proto_simple => tree.fnProtoSimple(&buffer, @enumFromInt(proto_node)).ast.params,
-        .fn_proto_one => tree.fnProtoOne(&buffer, @enumFromInt(proto_node)).ast.params,
-        .fn_proto_multi => tree.fnProtoMulti(@enumFromInt(proto_node)).ast.params,
-        else => return null,
-    };
-    if (parameter_index >= params.len) return null;
-    const parameter_node = @intFromEnum(params[parameter_index]);
-    if (parameter_node >= tags.len) return null;
-    if (import_resolver.isVarDeclTag(tags[parameter_node])) {
-        const full = tree.fullVarDecl(@enumFromInt(parameter_node)) orelse return null;
-        return @intFromEnum(full.ast.type_node.unwrap() orelse return null);
+    const fn_proto = tree.fullFnProto(&buffer, @enumFromInt(proto_node)) orelse return null;
+    var params = fn_proto.iterate(tree);
+    var written: usize = 0;
+    while (params.next()) |param| : (written += 1) {
+        if (written != parameter_index) continue;
+        const parameter_node = param.type_expr orelse return null;
+        if (@intFromEnum(parameter_node) >= tags.len) return null;
+        if (import_resolver.isVarDeclTag(tags[@intFromEnum(parameter_node)])) {
+            const full = tree.fullVarDecl(parameter_node) orelse return null;
+            return @intFromEnum(full.ast.type_node.unwrap() orelse return null);
+        }
+        return @intFromEnum(parameter_node);
     }
-    return parameter_node;
+    return null;
+}
+
+/// Whether the prototype's first written parameter is an inferred one, written
+/// `anytype` or `...`. Such a slot is absent from `ast.params`, so this reads
+/// the written order rather than that slice, and a prototype with no
+/// parameters at all is not inferred: it simply has no receiver slot.
+fn protoFirstParamIsInferred(tree: *const std.zig.Ast, proto_node: u32) bool {
+    const tags = tree.nodes.items(.tag);
+    if (proto_node >= tags.len) return false;
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const fn_proto = tree.fullFnProto(&buffer, @enumFromInt(proto_node)) orelse return false;
+    var params = fn_proto.iterate(tree);
+    const first = params.next() orelse return false;
+    return first.type_expr == null;
 }
 
 pub fn resolvedTypesEqual(lhs: ResolvedType, rhs: ResolvedType) bool {
@@ -2386,6 +2421,30 @@ fn isThisBuiltinCall(tree: *const std.zig.Ast, node: usize) bool {
     const token = main_tokens[node];
     if (token >= tree.tokens.len) return false;
     return std.mem.eql(u8, tree.tokenSlice(token), "@This");
+}
+
+/// Smallest container whose token range holds `token`, or null for the root
+/// namespace. The span rule is the tie break the indexed walk has to match: a
+/// strictly smaller span wins, so equal spans keep the lowest node index.
+fn smallestContainingContainer(
+    tree: *const std.zig.Ast,
+    tags: []const std.zig.Ast.Node.Tag,
+    token: u32,
+) ?u32 {
+    var enclosing: ?u32 = null;
+    var smallest_span: usize = tree.tokens.len;
+    for (tags, 0..) |tag, index| {
+        if (!isContainerTag(tag)) continue;
+        const container: std.zig.Ast.Node.Index = @enumFromInt(index);
+        const first = tree.firstToken(container);
+        const last = tree.lastToken(container);
+        if (token < first or token > last) continue;
+        const span = @as(usize, last) - first;
+        if (span >= smallest_span) continue;
+        smallest_span = span;
+        enclosing = @intCast(index);
+    }
+    return enclosing;
 }
 
 fn nodeIsAncestor(ancestor: u32, descendant: u32, parent_map: []const u32) bool {
@@ -2712,4 +2771,326 @@ test "ProjectTypeResolver rejects cross-file member alias cycles" {
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "indexed This containers match the unindexed scan" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Root = struct {
+        \\    self: @This() = .{},
+        \\    const Inner = struct {
+        \\        self: @This() = .{},
+        \\        fn scoped() @This() {
+        \\            return .{};
+        \\        }
+        \\        fn use() void {
+        \\            const local: @This() = .{};
+        \\            _ = local;
+        \\            {
+        \\                const deeper: @This() = .{};
+        \\                _ = deeper;
+        \\            }
+        \\        }
+        \\    };
+        \\    fn run() void {
+        \\        {
+        \\            const in_block: @This() = .{};
+        \\            _ = in_block;
+        \\        }
+        \\        Inner.use();
+        \\    }
+        \\    fn makeChild() struct { value: @This() } {
+        \\        return .{ .value = .{} };
+        \\    }
+        \\};
+        \\fn topLevel() void {
+        \\    const root_scope: @This() = .{};
+        \\    _ = root_scope;
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    // An inert index would make every comparison below trivially equal.
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    // Expected containers come from the declarations that create them, never
+    // from the text of the file.
+    const Declared = struct {
+        fn containerInitializer(ast: *const std.zig.Ast, name: []const u8) ?u32 {
+            for (ast.nodes.items(.tag), 0..) |tag, node| {
+                if (!import_resolver.isVarDeclTag(tag)) continue;
+                const full = ast.fullVarDecl(@enumFromInt(node)) orelse continue;
+                const name_token = full.ast.mut_token + 1;
+                if (name_token >= ast.tokens.len or ast.tokenTag(name_token) != .identifier) continue;
+                if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(ast.tokenSlice(name_token)), name)) continue;
+                return @intFromEnum(full.ast.init_node.unwrap() orelse return null);
+            }
+            return null;
+        }
+
+        fn returnedContainer(ast: *const std.zig.Ast, name: []const u8) ?u32 {
+            for (ast.nodes.items(.tag), 0..) |tag, node| {
+                if (tag != .fn_decl) continue;
+                const proto = functionProtoNode(ast, @intCast(node)) orelse continue;
+                const declared = functionProtoName(ast, proto) orelse continue;
+                if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(declared), name)) continue;
+                var buffer: [1]std.zig.Ast.Node.Index = undefined;
+                const full = ast.fullFnProto(&buffer, @enumFromInt(proto)) orelse continue;
+                return @intFromEnum(full.ast.return_type.unwrap() orelse return null);
+            }
+            return null;
+        }
+    };
+    const root_container = Declared.containerInitializer(&tree, "Root") orelse return error.MissingRootContainer;
+    const inner_container = Declared.containerInitializer(&tree, "Inner") orelse return error.MissingInnerContainer;
+    const child_container = Declared.returnedContainer(&tree, "makeChild") orelse return error.MissingChildContainer;
+    try std.testing.expect(isContainerTag(tree.nodeTag(@enumFromInt(root_container))));
+    try std.testing.expect(isContainerTag(tree.nodeTag(@enumFromInt(inner_container))));
+    try std.testing.expect(isContainerTag(tree.nodeTag(@enumFromInt(child_container))));
+    try std.testing.expect(root_container != inner_container and inner_container != child_container);
+    const indexed_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree, .lexical_index = &index }};
+    const plain_files = [_]import_resolver.File{.{ .path = "api.zig", .tree = &tree }};
+    const indexed: ProjectTypeResolver = .{ .files = &indexed_files, .file_index = 0 };
+    const plain: ProjectTypeResolver = .{ .files = &plain_files, .file_index = 0 };
+    // Sites in source order: Root's field, Inner's field, Inner's returned
+    // type, two Inner locals, one Root local inside a block, the returned
+    // anonymous container's field, and one site outside every container.
+    const expected_containers = [_]?u32{
+        root_container,
+        inner_container,
+        inner_container,
+        inner_container,
+        inner_container,
+        root_container,
+        child_container,
+        null,
+    };
+    var this_nodes: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, node| {
+        if (!isThisBuiltinCall(&tree, node)) continue;
+        try std.testing.expect(this_nodes < expected_containers.len);
+        const expected = expected_containers[this_nodes];
+        this_nodes += 1;
+        try std.testing.expectEqualDeep(plain.resolveTypeNode(node), indexed.resolveTypeNode(node));
+        try std.testing.expectEqualDeep(plain.resolveExprType(node), indexed.resolveExprType(node));
+        const resolved = indexed.resolveTypeNode(node) orelse return error.MissingThisType;
+        try std.testing.expectEqual(@as(usize, 0), resolved.file_index);
+        try std.testing.expectEqual(expected, resolved.container_node);
+        if (resolved.container_node) |container| {
+            try std.testing.expect(isContainerTag(tree.nodeTag(@enumFromInt(container))));
+        }
+    }
+    // Root, Inner and the returned anonymous container each own sites, and the
+    // only site outside every container is the root-level function.
+    try std.testing.expectEqual(expected_containers.len, this_nodes);
+}
+
+test "an inert lexical index leaves This answers to the scan" {
+    const allocator = std.testing.allocator;
+    var tree = try std.zig.Ast.parse(allocator,
+        \\const Broken = struct {
+        \\    self: @This() = .{},
+        \\    fn use() void {
+        \\        const scoped: @This() = .{};
+        \\        _ = scoped;
+        \\    }
+        \\    const dangling =
+    , .zig);
+    defer tree.deinit(allocator);
+    try std.testing.expect(tree.errors.len != 0);
+    var index = try LexicalIndex.init(allocator, &tree);
+    defer index.deinit(allocator);
+    const indexed_files = [_]import_resolver.File{.{ .path = "broken.zig", .tree = &tree, .lexical_index = &index }};
+    const plain_files = [_]import_resolver.File{.{ .path = "broken.zig", .tree = &tree }};
+    const indexed: ProjectTypeResolver = .{ .files = &indexed_files, .file_index = 0 };
+    const plain: ProjectTypeResolver = .{ .files = &plain_files, .file_index = 0 };
+    // Parser recovery decides which nodes survive, so only the surviving sites
+    // are compared; each one must stay unanswered on both paths.
+    var checked: usize = 0;
+    for (tree.nodes.items(.tag), 0..) |_, node| {
+        if (!isThisBuiltinCall(&tree, node)) continue;
+        try std.testing.expectEqual(@as(?ResolvedType, null), plain.resolveTypeNode(node));
+        try std.testing.expectEqual(@as(?ResolvedType, null), indexed.resolveTypeNode(node));
+        checked += 1;
+    }
+    try std.testing.expect(checked != 0);
+
+    // The same shape without the recovery site answers with a real container,
+    // which is what makes the recovered-tree silence meaningful.
+    var whole = try std.zig.Ast.parse(allocator,
+        \\const Broken = struct {
+        \\    self: @This() = .{},
+        \\    fn use() void {
+        \\        const scoped: @This() = .{};
+        \\        _ = scoped;
+        \\    }
+        \\};
+    , .zig);
+    defer whole.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), whole.errors.len);
+    var whole_index = try LexicalIndex.init(allocator, &whole);
+    defer whole_index.deinit(allocator);
+    const whole_indexed_files = [_]import_resolver.File{.{ .path = "broken.zig", .tree = &whole, .lexical_index = &whole_index }};
+    const whole_plain_files = [_]import_resolver.File{.{ .path = "broken.zig", .tree = &whole }};
+    const whole_indexed: ProjectTypeResolver = .{ .files = &whole_indexed_files, .file_index = 0 };
+    const whole_plain: ProjectTypeResolver = .{ .files = &whole_plain_files, .file_index = 0 };
+    // The same shape without the recovery site answers with the container its
+    // own declaration creates, which is what makes the silence above mean
+    // something.
+    var whole_container: ?u32 = null;
+    for (whole.nodes.items(.tag), 0..) |tag, node| {
+        if (!import_resolver.isVarDeclTag(tag)) continue;
+        const full = whole.fullVarDecl(@enumFromInt(node)) orelse continue;
+        const name_token = full.ast.mut_token + 1;
+        if (name_token >= whole.tokens.len or whole.tokenTag(name_token) != .identifier) continue;
+        if (!std.mem.eql(u8, import_resolver.normalizeIdentifier(whole.tokenSlice(name_token)), "Broken")) continue;
+        whole_container = @intFromEnum(full.ast.init_node.unwrap() orelse return error.MissingContainerInitializer);
+        break;
+    }
+    const broken_container = whole_container orelse return error.MissingBrokenContainer;
+    try std.testing.expect(isContainerTag(whole.nodeTag(@enumFromInt(broken_container))));
+    var answered: usize = 0;
+    for (whole.nodes.items(.tag), 0..) |_, node| {
+        if (!isThisBuiltinCall(&whole, node)) continue;
+        const resolved = whole_indexed.resolveTypeNode(node) orelse return error.MissingThisType;
+        try std.testing.expectEqual(@as(usize, 0), resolved.file_index);
+        try std.testing.expectEqual(@as(?u32, broken_container), resolved.container_node);
+        try std.testing.expectEqualDeep(whole_plain.resolveTypeNode(node), resolved);
+        answered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), answered);
+}
+
+test "a written parameter after an anytype slot keeps its own declared type" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Marker = struct {
+        \\    id: u32,
+        \\};
+        \\const Box = struct {
+        \\    payload: []u8,
+        \\    fn passthrough(self: anytype, sink: anytype, target: *Box, marker: *Marker) *Box {
+        \\        _ = self;
+        \\        _ = sink;
+        \\        _ = marker;
+        \\        return target;
+        \\    }
+        \\};
+        \\fn instance(box: *Box, first: *Box, second: *Box, third: *Marker) void {
+        \\    _ = box.passthrough(first, second, third);
+        \\}
+        \\fn namespaced(receiver: *Box, sink: *Marker, target: *Box, marker: *Marker) void {
+        \\    _ = Box.passthrough(receiver, sink, target, marker);
+        \\}
+    ;
+    var tree = try std.zig.Ast.parse(allocator, code, .zig);
+    defer tree.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const files = [_]import_resolver.File{.{ .path = "written.zig", .tree = &tree }};
+    const resolver: ProjectTypeResolver = .{ .files = &files, .file_index = 0 };
+
+    // Both calls are found by the method they name; the instance call is the
+    // one whose receiver is a value, the namespace call the one whose receiver
+    // is the container itself.
+    var instance_call: ?u32 = null;
+    var namespace_call: ?u32 = null;
+    var box_container: ?u32 = null;
+    var marker_container: ?u32 = null;
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (isCallNode(tag)) {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, @enumFromInt(node)) orelse continue;
+            if (tree.nodeTag(call.ast.fn_expr) != .field_access) continue;
+            const access = tree.nodes.items(.data)[@intFromEnum(call.ast.fn_expr)].node_and_token;
+            const receiver = @intFromEnum(access[0]);
+            if (tree.nodeTag(@enumFromInt(receiver)) != .identifier) continue;
+            const receiver_name = import_resolver.identifierName(&tree, receiver) orelse continue;
+            if (std.mem.eql(u8, receiver_name, "box")) {
+                instance_call = @intCast(node);
+            } else if (std.mem.eql(u8, receiver_name, "Box")) {
+                namespace_call = @intCast(node);
+            }
+            continue;
+        }
+        if (!import_resolver.isVarDeclTag(tag)) continue;
+        const full = tree.fullVarDecl(@enumFromInt(node)) orelse continue;
+        const name_token = full.ast.mut_token + 1;
+        if (name_token >= tree.tokens.len or tree.tokenTag(name_token) != .identifier) continue;
+        const initializer = @intFromEnum(full.ast.init_node.unwrap() orelse continue);
+        if (std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), "Box")) {
+            box_container = initializer;
+        } else if (std.mem.eql(u8, import_resolver.normalizeIdentifier(tree.tokenSlice(name_token)), "Marker")) {
+            marker_container = initializer;
+        }
+    }
+    const instance = instance_call orelse return error.MissingInstanceCall;
+    const namespaced = namespace_call orelse return error.MissingNamespaceCall;
+    const container = box_container orelse return error.MissingBoxContainer;
+    const marker = marker_container orelse return error.MissingMarkerContainer;
+
+    // Both call shapes name one declaration and differ only in how many leading
+    // parameters the receiver consumed, which is what shifts the credit. The
+    // callee is the prototype the method name reaches, and this file owns it.
+    const callable = resolver.resolveCallableAtCall(instance) orelse return error.MissingInstanceCallable;
+    try std.testing.expectEqual(@as(usize, 1), callable.implicit_self_count);
+    try std.testing.expectEqual(@as(usize, 0), callable.file_index);
+    try std.testing.expectEqualStrings("passthrough", functionProtoName(&tree, callable.proto_node) orelse
+        return error.MissingProtoName);
+    const static_callable = resolver.resolveCallableAtCall(namespaced) orelse return error.MissingNamespaceCallable;
+    try std.testing.expectEqual(@as(usize, 0), static_callable.implicit_self_count);
+    try std.testing.expectEqual(callable.file_index, static_callable.file_index);
+    try std.testing.expectEqual(callable.proto_node, static_callable.proto_node);
+
+    // Each written argument is checked against the prototype slot it occupies.
+    // The receiver is written `anytype`, so the instance call supplies it: its
+    // three arguments are slots one to three, and the inferred slot one names no
+    // type. The namespace call supplies nothing, so its four arguments are slots
+    // zero to three and both inferred slots name none. The two typed slots that
+    // follow keep the distinct pointees the prototype wrote for them, so a credit
+    // shifted by the receiver hands an argument its neighbour's pointee, and
+    // indexing the typed-only parameter slice answers the first typed argument
+    // with no type at all.
+    //
+    // Every check runs through the public API and then through the type it names,
+    // so what is asserted is what a consumer observes, not the pointer node kind
+    // the frontend emitted for the written type.
+    var instance_buffer: [1]std.zig.Ast.Node.Index = undefined;
+    var namespace_buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const shapes = [_]struct {
+        call: u32,
+        params: []const std.zig.Ast.Node.Index,
+        pointees: []const ?u32,
+    }{
+        .{
+            .call = instance,
+            .params = (tree.fullCall(&instance_buffer, @enumFromInt(instance)) orelse
+                return error.MissingInstanceCall).ast.params,
+            .pointees = &.{ null, container, marker },
+        },
+        .{
+            .call = namespaced,
+            .params = (tree.fullCall(&namespace_buffer, @enumFromInt(namespaced)) orelse
+                return error.MissingNamespaceCall).ast.params,
+            .pointees = &.{ null, null, container, marker },
+        },
+    };
+    for (shapes) |shape| {
+        try std.testing.expectEqual(shape.pointees.len, shape.params.len);
+        for (shape.params, shape.pointees) |argument, pointee| {
+            const declared = resolver.resolveCallArgumentTypeNode(
+                shape.call,
+                @intFromEnum(argument),
+                &.{},
+            );
+            if (pointee == null) {
+                try std.testing.expect(declared == null);
+                continue;
+            }
+            const named = resolver.resolveTypeNode(declared orelse return error.MissingTypedArgument) orelse
+                return error.MissingPointerTarget;
+            try std.testing.expectEqual(@as(usize, 0), named.file_index);
+            try std.testing.expectEqual(pointee, named.container_node);
+        }
+    }
 }

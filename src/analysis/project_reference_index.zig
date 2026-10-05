@@ -19,6 +19,24 @@ pub const ProjectReferenceIndex = struct {
     edges: std.AutoHashMapUnmanaged(Edge, void) = .empty,
     pending: std.ArrayList(Fact) = .empty,
     cursor: usize = 0,
+    /// Root modules the analyzed build scripts compile an artifact from.
+    compilation_roots: std.ArrayList(usize) = .empty,
+    compilation_root_files: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    /// Roots each module's own import table binds, keyed by module root file.
+    module_imports: std.AutoHashMapUnmanaged(usize, std.ArrayList(usize)) = .empty,
+    /// Files every analyzed file imports directly, resolved once per file.
+    direct_imports: std.AutoHashMapUnmanaged(usize, []const usize) = .empty,
+    /// Compilation root of each file, with an unresolved answer cached too.
+    compilation_root_answers: std.AutoHashMapUnmanaged(usize, ?usize) = .empty,
+    /// Generation each file was reached in, which is the visited set of a
+    /// single walk without clearing the map between walks.
+    reach_generations: std.AutoHashMapUnmanaged(usize, usize) = .empty,
+    reach_generation: usize = 0,
+    /// Worklist one reachability walk reuses, so a later walk that fits an
+    /// earlier one allocates nothing.
+    reach_queue: std.ArrayList(usize) = .empty,
+    /// Set when a build module edge arrived after derived answers were built.
+    graph_dirty: bool = false,
 
     const Error = std.mem.Allocator.Error;
     const FileLists = std.StringHashMapUnmanaged(std.ArrayList(usize));
@@ -103,7 +121,73 @@ pub const ProjectReferenceIndex = struct {
         return self.targets(.{ .file = file, .node = node, .kind = .namespace });
     }
 
+    /// Record the root module an artifact compiles. Every file that exactly one
+    /// artifact's module graph reaches resolves `@import("root")` to that
+    /// root; a file two artifacts reach has no single compilation root, so its
+    /// `@import("root")` resolves to no file at all.
+    pub fn addCompilationRoot(self: *ProjectReferenceIndex, file: usize) Error!void {
+        const result = try self.compilation_root_files.getOrPut(self.arena.allocator(), file);
+        self.graph_dirty = true;
+        if (!result.found_existing) try self.compilation_roots.append(self.arena.allocator(), file);
+    }
+
+    /// Record a root that another module's import table binds, which is what
+    /// places that module inside a compilation unit's module graph.
+    pub fn addModuleImport(self: *ProjectReferenceIndex, module: usize, imported: usize) Error!void {
+        const result = try self.module_imports.getOrPut(self.arena.allocator(), module);
+        if (!result.found_existing) result.value_ptr.* = .empty;
+        if (std.mem.indexOfScalar(usize, result.value_ptr.items, imported) != null) return;
+        self.graph_dirty = true;
+        try result.value_ptr.append(self.arena.allocator(), imported);
+    }
+
+    /// Answers derived from the module graph stay only as long as the graph
+    /// they came from does, so a registration arriving after a query drops all
+    /// of them instead of leaving a stale root or import list behind.
+    fn syncDerived(self: *ProjectReferenceIndex) void {
+        if (!self.graph_dirty) return;
+        self.graph_dirty = false;
+        self.compilation_root_answers.clearRetainingCapacity();
+        self.direct_imports.clearRetainingCapacity();
+        for (self.file_indexes) |*index| index.imports.clearRetainingCapacity();
+        // Edges and targets are derived from the same graph, so a late
+        // registration drops them rather than answering from the graph as it
+        // stood before the new module edge.
+        self.edges.clearRetainingCapacity();
+        self.pending.clearRetainingCapacity();
+        self.entries.clearRetainingCapacity();
+        self.entry_ids.clearRetainingCapacity();
+        self.cursor = 0;
+    }
+
+    /// Root module of the compilation unit that compiles `file`. A file two
+    /// artifacts reach has no single compilation root, so it answers null
+    /// instead of an arbitrary choice that would hide one root's unused
+    /// declarations.
+    pub fn compilationRootOf(self: *ProjectReferenceIndex, file: usize) Error!?usize {
+        self.syncDerived();
+        if (self.compilation_roots.items.len == 0) return null;
+        if (self.compilation_root_answers.get(file)) |cached| return cached;
+
+        var answer: ?usize = null;
+        for (self.compilation_roots.items) |root| {
+            const reached = root == file or try self.reaches(root, file);
+            if (!reached) continue;
+            if (answer != null) {
+                answer = null;
+                break;
+            }
+            answer = root;
+        }
+        try self.compilation_root_answers.put(self.arena.allocator(), file, answer);
+        return answer;
+    }
+
     fn targets(self: *ProjectReferenceIndex, key: Key) Error![]const usize {
+        // The graph is settled here, before an entry exists for this query:
+        // dropping derived state while one is being expanded would invalidate
+        // the entry this walk is holding.
+        self.syncDerived();
         const entry = try self.ensure(key);
         try self.drain();
         return self.entries.items[entry].files.items;
@@ -138,6 +222,16 @@ pub const ProjectReferenceIndex = struct {
     fn importTargets(self: *ProjectReferenceIndex, file: usize, path: []const u8) Error![]const usize {
         if (self.file_indexes[file].imports.get(path)) |cached| return cached;
         var result: std.ArrayList(usize) = .empty;
+        // `@import("root")` names the root module of the compilation unit this
+        // file is compiled in, and the build module graph is the only thing
+        // that knows it. With no root, or with two artifacts reaching the file,
+        // the answer stays empty: falling through would resolve a reserved
+        // spelling to whatever file or module name happens to be `root`.
+        if (import_resolver.isReservedImport(path)) {
+            if (try self.compilationRootOf(file)) |root| try result.append(self.arena.allocator(), root);
+            try self.file_indexes[file].imports.put(self.arena.allocator(), path, result.items);
+            return result.items;
+        }
         if (self.exact_paths.get(path)) |candidates| try self.appendMatching(&result, candidates.items, file, path);
         const directory = std.fs.path.dirname(self.files[file].path) orelse "";
         var joined_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -160,6 +254,70 @@ pub const ProjectReferenceIndex = struct {
         std.mem.sort(usize, result.items, {}, std.sort.asc(usize));
         try self.file_indexes[file].imports.put(self.arena.allocator(), path, result.items);
         return result.items;
+    }
+
+    /// Whether the compilation unit rooted at `root` reaches `file`. The walk
+    /// is iterative and reuses one worklist, so a deep import chain costs no
+    /// stack and a walk that fits an earlier one allocates nothing.
+    fn reaches(self: *ProjectReferenceIndex, root: usize, file: usize) Error!bool {
+        if (root == file) return true;
+        const allocator = self.arena.allocator();
+        const generation = self.nextReachGeneration();
+        self.reach_queue.clearRetainingCapacity();
+        try self.reach_queue.append(allocator, root);
+        try self.reach_generations.put(allocator, root, generation);
+
+        var cursor: usize = 0;
+        while (cursor < self.reach_queue.items.len) : (cursor += 1) {
+            for (try self.directImportsOf(self.reach_queue.items[cursor])) |imported| {
+                if (imported == file) return true;
+                if ((self.reach_generations.get(imported) orelse 0) == generation) continue;
+                try self.reach_generations.put(allocator, imported, generation);
+                try self.reach_queue.append(allocator, imported);
+            }
+        }
+        return false;
+    }
+
+    fn nextReachGeneration(self: *ProjectReferenceIndex) usize {
+        self.reach_generation +%= 1;
+        if (self.reach_generation == 0) {
+            // The counter wrapped, so every recorded stamp is stale again.
+            self.reach_generations.clearRetainingCapacity();
+            self.reach_generation = 1;
+        }
+        return self.reach_generation;
+    }
+
+    /// Files one module-graph edge away from `file`: every path its `@import`
+    /// calls name, plus the roots its module's own import table binds.
+    /// `@import("root")` is not one of them, because it names the module this
+    /// walk already started from, and following it could only reach files that
+    /// another artifact's module graph holds.
+    fn directImportsOf(self: *ProjectReferenceIndex, file: usize) Error![]const usize {
+        if (self.direct_imports.get(file)) |cached| return cached;
+        var result: std.ArrayList(usize) = .empty;
+        if (file < self.files.len) {
+            const tree = self.files[file].tree;
+            if (tree.errors.len == 0) {
+                for (tree.nodes.items(.tag), 0..) |tag, node| {
+                    if (!import_resolver.isBuiltinCallTag(tag)) continue;
+                    const path = import_resolver.importPathFromBuiltinCall(tree, node) orelse continue;
+                    if (import_resolver.isReservedImport(path)) continue;
+                    for (try self.importTargets(file, path)) |target| try self.appendImported(&result, target);
+                }
+            }
+        }
+        if (self.module_imports.get(file)) |imported| {
+            for (imported.items) |target| try self.appendImported(&result, target);
+        }
+        try self.direct_imports.put(self.arena.allocator(), file, result.items);
+        return result.items;
+    }
+
+    fn appendImported(self: *ProjectReferenceIndex, result: *std.ArrayList(usize), target: usize) Error!void {
+        if (std.mem.indexOfScalar(usize, result.items, target) != null) return;
+        try result.append(self.arena.allocator(), target);
     }
 
     fn ensure(self: *ProjectReferenceIndex, key: Key) Error!usize {
@@ -457,4 +615,73 @@ test "reference index keeps namespace member and shadowed alias targets distinct
         matched += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), matched);
+}
+
+/// Node of a tree's `@import("root")` call, which the reserved-spelling
+/// assertions below address by name rather than by a hard-coded index.
+fn reservedImportNode(tree: *const std.zig.Ast) !u32 {
+    for (tree.nodes.items(.tag), 0..) |tag, node| {
+        if (!import_resolver.isBuiltinCallTag(tag)) continue;
+        const path = import_resolver.importPathFromBuiltinCall(tree, node) orelse continue;
+        if (import_resolver.isReservedImport(path)) return @intCast(node);
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "reference index re-resolves a root import after a late module edge" {
+    const allocator = std.testing.allocator;
+    var checker = try std.zig.Ast.parse(allocator, "pub fn checkRoot() void {}", .zig);
+    defer checker.deinit(allocator);
+    var seam = try std.zig.Ast.parse(allocator,
+        \\comptime {
+        \\    const checker_root = @import("root");
+        \\    _ = checker_root.checkRoot;
+        \\}
+    , .zig);
+    defer seam.deinit(allocator);
+    var other = try std.zig.Ast.parse(allocator, "pub fn checkRoot() void {}", .zig);
+    defer other.deinit(allocator);
+    // The decoy is a real file named root.zig whose own body imports the
+    // reserved spelling, so the assertion below exercises that lookup instead
+    // of an out-of-range node.
+    var decoy = try std.zig.Ast.parse(allocator,
+        \\comptime {
+        \\    const decoy_root = @import("root");
+        \\    _ = decoy_root.checkRoot;
+        \\}
+    , .zig);
+    defer decoy.deinit(allocator);
+    const files = [_]import_resolver.File{
+        .{ .path = "checker.zig", .tree = &checker },
+        .{ .path = "seam.zig", .tree = &seam },
+        .{ .path = "other.zig", .tree = &other },
+        // A file whose own stem is `root`, present so the reserved spelling has
+        // something on disk it must never answer from.
+        .{ .path = "root.zig", .tree = &decoy },
+    };
+    var index = try ProjectReferenceIndex.init(allocator, &files);
+    defer index.deinit();
+
+    const root_import = try reservedImportNode(&seam);
+    const decoy_import = try reservedImportNode(&decoy);
+
+    // Without a build graph the reserved import names nothing, in the seam or in
+    // the root.zig decoy that sits beside it.
+    try std.testing.expectEqual(@as(usize, 0), (try index.namespaceTargets(1, root_import)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try index.namespaceTargets(3, decoy_import)).len);
+    try std.testing.expectEqual(@as(?usize, null), try index.compilationRootOf(1));
+
+    // The edge and the artifact root registered up front answer it.
+    try index.addModuleImport(0, 1);
+    try index.addCompilationRoot(0);
+    try std.testing.expectEqualSlices(usize, &.{0}, try index.namespaceTargets(1, root_import));
+    try std.testing.expectEqual(@as(?usize, 0), try index.compilationRootOf(1));
+
+    // A second artifact that reaches the seam arrives after those queries
+    // cached their answers. It must replace them rather than survive beside
+    // them, and the seam then has no single root to name.
+    try index.addModuleImport(2, 1);
+    try index.addCompilationRoot(2);
+    try std.testing.expectEqual(@as(?usize, null), try index.compilationRootOf(1));
+    try std.testing.expectEqual(@as(usize, 0), (try index.namespaceTargets(1, root_import)).len);
 }

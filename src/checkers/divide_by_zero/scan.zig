@@ -320,3 +320,92 @@ test "divide-by-zero emission propagates allocation failures without leaks" {
     // The borrowed AST isolates location, message, and append allocations.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ &tree, site });
 }
+
+test "a break that leaves the loop keeps the division behind it quiet" {
+    // An unlabeled `break` is routed to the loop's own exit, so a guard that
+    // fires one leaves the loop instead of falling into the statement it was
+    // protecting. The break edge therefore never reaches the site, and every
+    // path that does carry the negated guard, which is what proves the
+    // denominator non-zero here. The labeled break in this same shape is
+    // pinned quiet by `labeled_break_guard_no_violation`, and both builds
+    // reach the site the same way, so both have to read the same way.
+    const TypeContext = @import("../../type_context.zig").TypeContext;
+
+    const Harness = struct {
+        fn scanInto(code: [:0]const u8, allocator: std.mem.Allocator, diagnostics: *std.ArrayList(Diagnostic)) !void {
+            var source = Source.init(allocator, "loop-break-guard.zig", code);
+            defer source.deinit();
+            var type_ctx = TypeContext.init(allocator, &source);
+            defer type_ctx.deinit();
+            const tree = try source.ast();
+
+            var reported: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(allocator);
+            defer reported.deinit();
+
+            const context: checker_mod.CheckerContext = .{
+                .build_metadata = null,
+                .type_context = &type_ctx,
+            };
+
+            const tags = tree.nodes.items(.tag);
+            for (0..tags.len) |i| {
+                if (tags[i] != .fn_decl) continue;
+                const fn_node = ids.astId(@intCast(i));
+
+                var cfg_handle = (context.getOrBuildCfg(allocator, &source, fn_node) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidAst => continue,
+                }) orelse continue;
+                defer cfg_handle.deinit();
+
+                var analysis = try context.getOrAnalyze(allocator, &source, &cfg_handle, "divide-by-zero-engine", .configured);
+                defer analysis.deinit();
+                if (analysis.complete) {
+                    try scanForZeroDivisors(&source, allocator, diagnostics, tree, analysis.engine, cfg_handle.cfg, fn_node, &reported);
+                }
+            }
+        }
+    };
+
+    const guarded: [:0]const u8 =
+        \\pub fn unlabeled_break_does_not_prune(lhs: i64, rhs: i64) i64 {
+        \\    while (rhs != 7) {
+        \\        if (rhs == 0) break;
+        \\        return @divTrunc(lhs, rhs);
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    // The control carries no guard at all, so a scan that reported nothing for
+    // any reason would pass the case above on its own.
+    const unguarded: [:0]const u8 =
+        \\pub fn reachable_zero(lhs: i64, flag: bool) i64 {
+        \\    var divisor: i64 = 2;
+        \\    if (flag) {
+        \\        divisor = 0;
+        \\    }
+        \\    return @divTrunc(lhs, divisor);
+        \\}
+    ;
+
+    const allocator = std.testing.allocator;
+
+    var guarded_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (guarded_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        guarded_diagnostics.deinit(allocator);
+    }
+    try Harness.scanInto(guarded, allocator, &guarded_diagnostics);
+    try std.testing.expectEqual(@as(usize, 0), guarded_diagnostics.items.len);
+
+    var unguarded_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (unguarded_diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+        unguarded_diagnostics.deinit(allocator);
+    }
+    try Harness.scanInto(unguarded, allocator, &unguarded_diagnostics);
+    try std.testing.expectEqual(@as(usize, 1), unguarded_diagnostics.items.len);
+    try std.testing.expectEqual(checker_mod.Severity.warning, unguarded_diagnostics.items[0].severity);
+    try std.testing.expectEqualStrings("possible division by zero can panic at runtime", unguarded_diagnostics.items[0].message);
+}

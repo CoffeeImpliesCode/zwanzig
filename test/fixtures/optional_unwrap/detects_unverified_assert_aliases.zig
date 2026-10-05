@@ -1,13 +1,13 @@
 // EXPECT: line=34 rule=optional-unwrap
 // EXPECT: line=40 rule=optional-unwrap
-// EXPECT: line=60 rule=optional-unwrap
-// EXPECT: line=67 rule=optional-unwrap
+// EXPECT: line=64 rule=optional-unwrap
+// EXPECT: line=71 rule=optional-unwrap
 //
 // Only a `const` declaration whose initializer resolves to the real
 // `std.debug.assert` proves anything. A same-named user function, an
-// alias of a user `debug` namespace, a local that shadows the alias, and
-// a `var` that is rebound to another function all keep the spelling
-// without the effect.
+// alias of a user `debug` namespace, a second local that binds the
+// alias's name, and a rebound `var` all keep the spelling without the
+// effect: an alias is matched by the declaration it names, not by spelling.
 const std = @import("std");
 
 const lookalike = struct {
@@ -54,23 +54,27 @@ const Shadowing = struct {
 
     pub fn takeShadowed(self: *Shadowing) u32 {
         {
+            const assert = std.debug.assert;
+            _ = assert;
+        }
+        {
             const assert = lookalike;
             assert(self.value != null);
         }
-        return self.value.?; // local shadows the alias
+        return self.value.?; // second binding of the alias's name
     }
 
     pub fn takeRebound(self: *Shadowing) u32 {
-        var guard = std.debug.assert;
+        var guard: *const fn (bool) void = std.debug.assert;
         guard = lookalike;
         guard(self.value != null);
         return self.value.?; // rebound var
     }
 };
 
-const assert = std.debug.assert;
-
 test "an unverified assert spelling proves nothing" {
+    const assert = std.debug.assert;
+
     var a = State.init();
     a.write(1);
     _ = a.takeUserFunction();

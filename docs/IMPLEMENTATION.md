@@ -13,7 +13,7 @@ Larger subsystems are split into focused submodules with thin facades:
 - `src/cli/` - CLI parsing (`args.zig`), config merge (`config_merge.zig`), default rule/checker registry (`registry.zig`), and the run loop (`run.zig`)
 - `src/formatters/` - Output formatters (console text and SARIF)
 - `src/cfg/` - CFG graph types, builder, and DOT output (facade: `src/cfg.zig`)
-- `src/engine/` - Analysis engine internals (analysis, state, values, constraints, summaries, store) (facade: `src/engine.zig`)
+- `src/engine/` - Analysis engine internals at the engine root: `base.zig`, `value.zig`, `constraints.zig`, `env.zig`, `state.zig`, `summary.zig`, `graph.zig`, `analysis.zig`, `store.zig`, and `dot.zig`, plus the `src/engine/analysis/` package holding `engine.zig`, `ownership.zig`, `resource_calls.zig`, `branch_constraints.zig`, and `arena_provenance.zig` (facade: `src/engine.zig`)
 - `src/analysis/` + `src/project_sources.zig` - Immutable syntax snapshots, lexical/path indexes, project references, and best-effort import/call type resolution
 - `src/analysis_cache.zig` - Per-file reuse of compatible engine analyses through exclusive leases
 - `src/zir/` + `src/types/` - ZIR bridge implementation and shared type info (facade: `src/zir_bridge.zig`)
@@ -1137,7 +1137,7 @@ On a disk-cache hit, the analyzer restores live declaration annotations from the
 
 ## Analysis engine
 
-The analysis engine (`src/engine.zig`) implements a worklist-based traversal of the CFG to build an exploded graph for path-sensitive static analysis. The facade in `src/engine.zig` re-exports from `src/engine/` (analysis, state, values, constraints, summaries, store, dot).
+The analysis engine (`src/engine.zig`) implements a worklist-based traversal of the CFG to build an exploded graph for path-sensitive static analysis. The facade in `src/engine.zig` imports nine modules from `src/engine/` and re-exports their public types: `base`, `value`, `constraints`, `env`, `state`, `summary`, `graph`, `analysis`, and `dot`. `store.zig` sits at the engine root, and the facade does not re-export it.
 
 ### Concepts
 
@@ -1189,6 +1189,8 @@ pub const AbstractValue = union(enum) {
 ```
 
 **Value categories:** `unknown` (default), `null_val`, `non_null`, `int_range`, `concrete_int`, `concrete_bool`.
+
+**Widening:** `widen` is directional: `self` is the previous value at the widening point and `other` the incoming value from a back edge. A `concrete_int` widens as the single-value interval it is, so integers widen as intervals rather than collapsing to `unknown`. `IntRange.widen` keeps a bound that did not move and throws a bound that moved to its end of the `i64` domain. A counter that grows therefore keeps the value it started from as its lower bound, and the loop condition can still tell which passes the loop really takes. Everything else - `unknown`, a null against a non-null, two different booleans - widens to `unknown`.
 
 #### Environment
 
@@ -1259,7 +1261,7 @@ The worklist is an `ArrayList(WorklistItem)` consumed via `append` and `pop`, wh
 Why DFS:
 
 - **Deduplication merges identical states.** In the pure-deduplication case, a complete run reaches the same fixed point regardless of traversal order. This claim excludes runs stopped by hard limits or changed by widening.
-- **Widening is order-sensitive.** With widening enabled (the default), traversal order can affect precision because `AbstractValue.widen` is not commutative. For example, `int_range[a,b].widen(concrete_int v)` keeps the range when `v` lies inside `[a,b]`, while `concrete_int(v).widen(int_range[a,b])` collapses to `unknown`. DFS vs BFS can therefore change which state arrives at a widening point first and how aggressively values are widened. The engine does not aim to be deterministic across order changes; widening is a precision/termination tool, and the cheaper traversal is preferred.
+- **Widening is order-sensitive.** `self` is  the previous value at the widening point and `other` the value from the back edge. A counter that grows from `concrete_int(0)` to `concrete_int(1)` widens to the range `IntRange .init(0, std.math.maxInt(i64))`. The minimum did not move, so the engine keeps it. Reversing the operands widens `concrete_int(1)` with `concrete_int(0)` and gives the range `IntRange .init(std.math.minInt(i64), 1)`. The same rule keeps a stable bound and extends a moving one. DFS and BFS can therefore differ in precision. Widening forces convergence, not traversal-independent results. The engine keeps the cheaper DFS worklist.
 - **`pop` is O(1).** Removing from the front of an `ArrayList` to get FIFO requires `orderedRemove(0)`, which is O(n); a true order-preserving deque needs `std.fifo.LinearFifo` or a head-index pattern with its own bookkeeping. DFS via `pop` is the cheapest implementation that satisfies the algorithm.
 - **Better cache locality.** Items pushed last are popped next, so the processing kernel tends to reuse state freshly written by the transfer function.
 
@@ -1328,7 +1330,9 @@ Branch extraction normalizes grouped expressions, reversed integer comparisons, 
 
 #### ConstraintManager
 
-The `ConstraintManager` tracks active constraints on a path. Operations: `addConstraint`, `isSatisfiable`, `refineValue`, `clone`.
+The `ConstraintManager` tracks active constraints on a path. Operations: `addConstraint`, `isSatisfiable`, `refineValue`, `clone`, `forgetVar`.
+
+`forgetVar` retires the facts that named an assigned variable, and `ProgramState.setVar` calls it on every write. A fact came from a guard that read the value the variable is about to stop having, so keeping it would make the path demand a value it can no longer take - pruning branches the assignment just opened, and pruning the path outright once the new value contradicts it. A `var_compare` naming either operand dies with the write. Facts about other variables survive. The list is compacted in place, the variable's index entry is given back, and the contradiction flag is re-derived from the survivors, which can reopen a branch the assignment made reachable and keeps a contradiction between two variables no assignment touched. Nothing is allocated, and a list that never named the variable is left exactly as it was.
 
 #### ProgramState with constraints
 
@@ -1410,7 +1414,7 @@ The engine tracks `ErrorState`: `error_active`, `error_handled`, or `normal`. If
 
 ### StoreViolationsEngineChecker
 
-The `StoreViolationsEngineChecker` (`src/checkers/store_violations_engine.zig`) reports double-free, free-without-alloc, close-without-open, use-after-free/close, and leaks. It acquires a configured per-function analysis and scans `ProgramState` store violations. Compatible checkers can reuse that analysis through exclusive leases.
+The `StoreViolationsEngineChecker` (`src/checkers/store_violations_engine.zig`) reports eight violation kinds: double-free, double-close, free-without-alloc, close-without-open, use-after-free, use-after-close, resource leak, and defer-frees-escapee. It acquires a configured per-function analysis and scans `ProgramState` store violations. Compatible checkers can reuse that analysis through exclusive leases.
 
 The resource call model supports config-defined `free_owned` operations (for deinit-like APIs that free owned resources without freeing the receiver) and applies errdeferred releases on error returns to surface double-free issues on error paths.
 
@@ -1460,7 +1464,7 @@ Escape tracking is performed **before** function inlining.
 
 Leak violations are only reported on normal return paths. Error returns suppress leak reports (caller handles cleanup via `errdefer`).
 
-The engine detects error returns via literal error values (`return error.SomeError`) and type-based detection (`TypeContext`).
+The engine decides this from the syntax tree of the analyzed file. It accepts a literal error value (`return error.SomeError`), a member of a declared error set (`return ConfigError.InvalidConfigFormat`), and a switch or a conditional whose branches all return one.
 
 #### Type-based resource detection
 
@@ -1493,6 +1497,9 @@ try analyzer.registerChecker(&OptionalUnwrapEngineChecker.checker);
 try analyzer.registerChecker(&SwallowedErrorChecker.checker);
 try analyzer.registerChecker(&UnreachableCodeChecker.checker);
 try analyzer.registerChecker(&StoreViolationsEngineChecker.checker);
+try analyzer.registerChecker(&StackEscapeEngineChecker.checker);
+try analyzer.registerChecker(&DivideByZeroEngineChecker.checker);
+try analyzer.registerChecker(&SliceBoundsEngineChecker.checker);
 ```
 
 ## Interprocedural analysis

@@ -86,6 +86,12 @@ pub const SwallowedErrorChecker = struct {
             engine_mod.dot.writePathTracesToFile(engine.getGraph(), context.io_context, dir, src.getFilePath(), cfg_handle.cfg.fn_name, allocator);
         }
 
+        // A handler that turns the error into the value this function hands
+        // back is handling it, not swallowing it. The scan is per function and
+        // structural, so the verdict does not depend on the engine finishing.
+        var outcome = try OutcomeScan.run(tree, ids.astIndex(fn_node), allocator);
+        defer outcome.deinit();
+
         // Examine CFG nodes for catch_expr with swallowed errors
         for (cfg_handle.cfg.nodes.items) |cfg_node| {
             if (cfg_node.ir_node.tag == .catch_expr) {
@@ -103,6 +109,7 @@ pub const SwallowedErrorChecker = struct {
                     parent_map,
                     engine_ptr,
                     allocator,
+                    &outcome,
                 )) {
                     // Get source range from IR node
                     if (cfg_node.ir_node.source_range) |range| {
@@ -130,6 +137,8 @@ pub const SwallowedErrorChecker = struct {
     /// 4. The handler completes normally (reaches merge point)
     /// 5. The handler does NOT record the caught payload on every path that
     ///    reaches that merge point
+    /// 6. The handler does NOT translate the error into the value the function
+    ///    returns to its caller
     fn isErrorSwallowed(
         cfg: *const Cfg,
         catch_node_idx: CfgNodeId,
@@ -139,6 +148,7 @@ pub const SwallowedErrorChecker = struct {
         parent_map: []const u32,
         engine: ?*const AnalysisEngine,
         allocator: std.mem.Allocator,
+        outcome: *const OutcomeScan,
     ) CheckerError!bool {
         // Find the catch_error edge
         var handler_entry: ?CfgNodeId = null;
@@ -177,6 +187,10 @@ pub const SwallowedErrorChecker = struct {
                 allocator,
             )) return false;
         }
+
+        // A handler that turns the error into the function's own result is a
+        // declared outcome, not a dropped error.
+        if (handlerReportsOutcome(tree, ids.astIndex(handler_ast), outcome)) return false;
 
         // Trace through the handler to see if it:
         // 1. Returns an error (good)
@@ -549,6 +563,19 @@ pub const SwallowedErrorChecker = struct {
         return token < token_tags.len and token_tags[token] == .identifier;
     }
 
+    /// Binding name an identifier token answers to, with `@"..."` quoting
+    /// normalized away so quoted and bare spellings compare equal.
+    fn tokenName(tree: *const std.zig.Ast, token: u32) []const u8 {
+        return import_resolver.normalizeIdentifier(tree.tokenSlice(token));
+    }
+
+    /// Binding name of an identifier node, or null when the node is not a
+    /// plain identifier.
+    fn identifierName(tree: *const std.zig.Ast, node: u32) ?[]const u8 {
+        const token = identifierToken(tree, node) orelse return null;
+        return tokenName(tree, token);
+    }
+
     fn varDeclName(tree: *const std.zig.Ast, node: u32) ?u32 {
         const full = tree.fullVarDecl(@enumFromInt(node)) orelse return null;
         const name_token = full.ast.mut_token + 1;
@@ -798,6 +825,392 @@ pub const SwallowedErrorChecker = struct {
             .has_control_transfer = has_control_transfer,
             .has_input_progress = has_input_progress,
         };
+    }
+
+    /// What one function hands back to its caller.
+    ///
+    /// A handler that turns the error into that value is handling it: the
+    /// caller observes the failure instead of the error disappearing. The scan
+    /// is per function and purely structural, so the verdict does not depend on
+    /// whether the analysis engine finished inside its budget.
+    const OutcomeScan = struct {
+        tree: *const std.zig.Ast,
+        allocator: std.mem.Allocator,
+        /// Name the function returns, when every `return` names it. A binding
+        /// is identified by name, not by token: a declaration and each of its
+        /// uses are distinct tokens.
+        result_name: ?[]const u8 = null,
+        /// False once a `return` names something else or returns nothing.
+        uniform: bool = true,
+        /// The settled way this result records a failure, or null when the
+        /// function has no single outcome to report.
+        outcome_kind: ?OutcomeKind = null,
+        /// Assignment nodes whose target root is a plain identifier.
+        writes: std.ArrayList(u32) = .empty,
+        /// Names whose address is taken, which would let a call change the
+        /// result after the handler wrote it.
+        borrowed: std.ArrayList([]const u8) = .empty,
+        /// Every local declaration this function introduces.
+        declarations: std.ArrayList(LocalDecl) = .empty,
+
+        fn deinit(self: *OutcomeScan) void {
+            self.writes.deinit(self.allocator);
+            self.borrowed.deinit(self.allocator);
+            self.declarations.deinit(self.allocator);
+        }
+
+        /// A local binding, with the name it introduces and whether it can be
+        /// assigned after its initializer.
+        const LocalDecl = struct { name: []const u8, node: u32, mutable: bool };
+
+        fn run(
+            tree: *const std.zig.Ast,
+            fn_node: u32,
+            allocator: std.mem.Allocator,
+        ) CheckerError!OutcomeScan {
+            var scan = OutcomeScan{ .tree = tree, .allocator = allocator };
+            errdefer scan.deinit();
+            var collector = OutcomeCollector{ .scan = &scan };
+            try walkOutcome(tree, fn_node, &collector);
+            resolveResult(&scan);
+            return scan;
+        }
+    };
+
+    /// `return` operands, local declarations, and the names that assignments
+    /// and borrows name. A nested declaration is a separate function with its
+    /// own result, so its body is never entered.
+    const OutcomeCollector = struct {
+        scan: *OutcomeScan,
+        depth: u8 = 0,
+
+        fn visit(self: *@This(), tree: *const std.zig.Ast, node: u32) CheckerError!void {
+            const tags = tree.nodes.items(.tag);
+            const datas = tree.nodes.items(.data);
+            switch (tags[node]) {
+                .@"return" => {
+                    const operand = datas[node].opt_node.unwrap() orelse {
+                        self.scan.uniform = false;
+                        return;
+                    };
+                    const name = resultName(tree, @intFromEnum(operand)) orelse {
+                        self.scan.uniform = false;
+                        return;
+                    };
+                    const known = self.scan.result_name orelse {
+                        self.scan.result_name = name;
+                        return;
+                    };
+                    if (!std.mem.eql(u8, known, name)) self.scan.uniform = false;
+                },
+                .address_of => {
+                    const name = identifierName(tree, @intFromEnum(datas[node].node)) orelse return;
+                    try self.scan.borrowed.append(self.scan.allocator, name);
+                },
+                .simple_var_decl,
+                .local_var_decl,
+                .aligned_var_decl,
+                => {
+                    const name_token = varDeclName(tree, node) orelse return;
+                    const full = tree.fullVarDecl(@enumFromInt(node)) orelse return;
+                    try self.scan.declarations.append(self.scan.allocator, .{
+                        .name = tokenName(tree, name_token),
+                        .node = node,
+                        .mutable = tree.tokenTag(full.ast.mut_token) == .keyword_var,
+                    });
+                },
+                .assign,
+                .assign_mul,
+                .assign_div,
+                .assign_mod,
+                .assign_add,
+                .assign_sub,
+                .assign_shl,
+                .assign_shl_sat,
+                .assign_shr,
+                .assign_bit_and,
+                .assign_bit_xor,
+                .assign_bit_or,
+                .assign_mul_wrap,
+                .assign_add_wrap,
+                .assign_sub_wrap,
+                .assign_mul_sat,
+                .assign_add_sat,
+                .assign_sub_sat,
+                => {
+                    if (writeTargetName(tree, node) == null) return;
+                    try self.scan.writes.append(self.scan.allocator, node);
+                },
+                else => {},
+            }
+        }
+
+        fn child(tree: *const std.zig.Ast, child_node: u32, self: *@This()) CheckerError!void {
+            const tags = tree.nodes.items(.tag);
+            if (child_node != 0 and child_node < tags.len) {
+                switch (tags[child_node]) {
+                    .fn_decl, .test_decl => return,
+                    else => {},
+                }
+            }
+            try walkOutcome(tree, child_node, self);
+        }
+    };
+
+    fn walkOutcome(
+        tree: *const std.zig.Ast,
+        node: u32,
+        collector: *OutcomeCollector,
+    ) CheckerError!void {
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len) return;
+        if (collector.depth == 64) return;
+        collector.depth += 1;
+        defer collector.depth -= 1;
+        try collector.visit(tree, node);
+        try ast_walk.walkChildren(OutcomeCollector, tree, node, collector, OutcomeCollector.child);
+    }
+
+    /// The one way this function's result records a failure.
+    ///
+    /// A rejection writes `false` into the returned boolean; a counter
+    /// accumulates into the returned count. Writes that disagree, because one
+    /// of them could hand the caller a success, leave no outcome to report.
+    const OutcomeKind = enum { rejection, counter };
+
+    /// Settle the result binding: exactly one mutable local must carry the name
+    /// every `return` hands back, nothing may reach it through a borrow, and
+    /// every write to it must encode the same failure.
+    fn resolveResult(scan: *OutcomeScan) void {
+        const result_name = scan.result_name orelse return;
+        if (!scan.uniform) return;
+        for (scan.borrowed.items) |name| {
+            if (std.mem.eql(u8, name, result_name)) return;
+        }
+        const tree = scan.tree;
+        var declaration: u32 = 0;
+        for (scan.declarations.items) |local| {
+            if (!std.mem.eql(u8, local.name, result_name)) continue;
+            // A second binding of the same name makes a spelling match
+            // ambiguous, so no write can be attributed to the result.
+            if (declaration != 0 or !local.mutable) return;
+            declaration = local.node;
+        }
+        if (declaration == 0) return;
+        const is_boolean = bindingIsBoolean(tree, declaration);
+
+        const tags = tree.nodes.items(.tag);
+        var rejections: usize = 0;
+        var counters: usize = 0;
+        for (scan.writes.items) |write| {
+            if (write == 0 or write >= tags.len) return;
+            const target = writeTargetName(tree, write) orelse continue;
+            if (!std.mem.eql(u8, target, result_name)) continue;
+            switch (tags[write]) {
+                .assign => {
+                    if (!is_boolean or !assignsRejection(tree, write)) return;
+                    rejections += 1;
+                },
+                .assign_add, .assign_sub => {
+                    if (!counterChangeIsNonZero(tree, write)) return;
+                    counters += 1;
+                },
+                else => return,
+            }
+        }
+        if (rejections != 0 and counters == 0) {
+            scan.outcome_kind = .rejection;
+        } else if (counters != 0 and rejections == 0) {
+            scan.outcome_kind = .counter;
+        }
+    }
+
+    /// Name of a `return` operand that is exactly one identifier.
+    fn resultName(tree: *const std.zig.Ast, node: u32) ?[]const u8 {
+        const tags = tree.nodes.items(.tag);
+        var current = node;
+        for (0..4) |_| {
+            if (current == 0 or current >= tags.len) return null;
+            switch (tags[current]) {
+                .identifier => return identifierName(tree, current),
+                .grouped_expression => current = @intFromEnum(tree.nodes.items(.data)[current].node_and_token[0]),
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Name an assignment writes, taken from the plain identifier its target
+    /// is rooted at, so `state.saved` and `ptr.*` name `state` and `ptr`.
+    ///
+    /// Crediting the root is what the caller reads back: the returned value
+    /// carries its own fields and elements and reaches whatever a pointer
+    /// designates, so a write made through any of them is read through that
+    /// same returned value. A different local that merely shares the spelling,
+    /// or a call that could change the result behind the handler, is what this
+    /// excludes — `resolveResult` demands one mutable declaration under the
+    /// returned name whose address is taken nowhere.
+    fn writeTargetName(tree: *const std.zig.Ast, node: u32) ?[]const u8 {
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len) return null;
+        const lhs = @intFromEnum(tree.nodes.items(.data)[node].node_and_node[0]);
+        return identifierName(tree, placeBase(tree, lhs));
+    }
+
+    /// A local is a boolean when it is declared `bool` or initialized from a
+    /// boolean literal.
+    fn bindingIsBoolean(tree: *const std.zig.Ast, decl: u32) bool {
+        const full = tree.fullVarDecl(@enumFromInt(decl)) orelse return false;
+        if (full.ast.type_node.unwrap()) |type_node| {
+            const node = @intFromEnum(type_node);
+            const token = identifierToken(tree, node) orelse return false;
+            return std.mem.eql(u8, tree.tokenSlice(token), "bool");
+        }
+        const init = @intFromEnum(full.ast.init_node.unwrap() orelse return false);
+        return value.evaluateBoolLiteral(tree, init) != null;
+    }
+
+    /// True when the handler writes the function's result in the one way this
+    /// function records a failure, so the caller observes the rejection or the
+    /// failure count instead of the error vanishing.
+    ///
+    /// Every statement must be such a write or a control transfer, because a
+    /// branch inside the handler could leave the result untouched on one path.
+    /// `resolveResult` has already proved that no write anywhere in the
+    /// function can turn the result back into a success, so another write of
+    /// the same kind keeps the outcome observable.
+    fn handlerReportsOutcome(
+        tree: *const std.zig.Ast,
+        handler_ast: u32,
+        outcome: *const OutcomeScan,
+    ) bool {
+        const kind = outcome.outcome_kind orelse return false;
+        const tags = tree.nodes.items(.tag);
+        var inline_buffer: [2]u32 = undefined;
+        const statements = ast_walk.getBlockStatements(tree, handler_ast, &inline_buffer) orelse return false;
+        if (statements.len == 0) return false;
+
+        var reports = false;
+        for (statements) |statement| {
+            if (statement == 0 or statement >= tags.len) return false;
+            switch (tags[statement]) {
+                .@"break", .@"continue", .@"return" => {},
+                .assign => {
+                    if (kind != .rejection) return false;
+                    if (!writesResult(tree, statement, outcome)) return false;
+                    reports = true;
+                },
+                .assign_add, .assign_sub => {
+                    if (kind != .counter) return false;
+                    if (!writesResult(tree, statement, outcome)) return false;
+                    reports = true;
+                },
+                else => return false,
+            }
+        }
+        return reports;
+    }
+
+    /// True when this statement writes the binding the settled outcome names.
+    fn writesResult(tree: *const std.zig.Ast, statement: u32, outcome: *const OutcomeScan) bool {
+        const result_name = outcome.result_name orelse return false;
+        const target = writeTargetName(tree, statement) orelse return false;
+        return std.mem.eql(u8, target, result_name);
+    }
+
+    /// True when `lhs = rhs` stores a value that is statically false, which is
+    /// how a handler says the input was rejected.
+    fn assignsRejection(tree: *const std.zig.Ast, statement: u32) bool {
+        const rhs = @intFromEnum(tree.nodes.items(.data)[statement].node_and_node[1]);
+        return staticBool(tree, rhs, 0) == false;
+    }
+
+    /// True when a `+=` or `-=` actually records a failure. Only a written-out
+    /// nonzero integer counts: `+= 0`, a constant known to be zero, and an
+    /// operand whose value is not spelled out all leave the returned count at
+    /// the success value the caller already sees.
+    fn counterChangeIsNonZero(tree: *const std.zig.Ast, statement: u32) bool {
+        const rhs = @intFromEnum(tree.nodes.items(.data)[statement].node_and_node[1]);
+        return positiveIntLiteral(tree, rhs, 0);
+    }
+
+    /// A nonzero integer literal, following only parentheses.
+    fn positiveIntLiteral(tree: *const std.zig.Ast, node: u32, depth: u8) bool {
+        if (depth > 2) return false;
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len) return false;
+        switch (tags[node]) {
+            .number_literal => {
+                const token = tree.nodes.items(.main_token)[node];
+                const amount = integerLiteralValue(tree, token) orelse return false;
+                return amount != 0;
+            },
+            .grouped_expression => return positiveIntLiteral(
+                tree,
+                @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]),
+                depth + 1,
+            ),
+            else => return false,
+        }
+    }
+
+    /// Value of a plain integer literal in any base. `_` separators are
+    /// ignored, and the float, exponent, and hex-float forms a count never
+    /// uses are rejected rather than guessed at.
+    fn integerLiteralValue(tree: *const std.zig.Ast, token: u32) ?u64 {
+        const token_tags = tree.tokens.items(.tag);
+        if (token >= token_tags.len or token_tags[token] != .number_literal) return null;
+        const slice = tree.tokenSlice(token);
+        if (slice.len == 0) return null;
+        for (slice) |c| {
+            if (c == '.' or c == 'e' or c == 'E' or c == 'p' or c == 'P') return null;
+        }
+        var base: u64 = 10;
+        var digits = slice;
+        if (slice.len > 2 and slice[0] == '0') {
+            switch (slice[1]) {
+                'x', 'X' => base = 16,
+                'o', 'O' => base = 8,
+                'b', 'B' => base = 2,
+                else => {},
+            }
+            if (base != 10) digits = slice[2..];
+        }
+        if (digits.len == 0) return null;
+        var parsed_value: u64 = 0;
+        for (digits) |c| {
+            if (c == '_') continue;
+            const digit: u64 = switch (c) {
+                '0'...'9' => @intCast(c - '0'),
+                'a'...'f' => @intCast(10 + (c - 'a')),
+                'A'...'F' => @intCast(10 + (c - 'A')),
+                else => return null,
+            };
+            if (digit >= base) return null;
+            parsed_value = std.math.add(u64, std.math.mul(u64, parsed_value, base) catch return null, digit) catch return null;
+        }
+        return parsed_value;
+    }
+
+    /// Statically known boolean, following only parentheses and negation.
+    fn staticBool(tree: *const std.zig.Ast, node: u32, depth: u8) ?bool {
+        if (depth > 4) return null;
+        if (value.evaluateBoolLiteral(tree, node)) |literal| return literal;
+        const tags = tree.nodes.items(.tag);
+        if (node == 0 or node >= tags.len) return null;
+        switch (tags[node]) {
+            .grouped_expression => return staticBool(
+                tree,
+                @intFromEnum(tree.nodes.items(.data)[node].node_and_token[0]),
+                depth + 1,
+            ),
+            .bool_not => {
+                const inner = staticBool(tree, @intFromEnum(tree.nodes.items(.data)[node].node), depth + 1) orelse
+                    return null;
+                return !inner;
+            },
+            else => return null,
+        }
     }
 };
 
@@ -1327,6 +1740,289 @@ test "swallowed_error - storing on every path keeps the exemption" {
     var source = Source.init(allocator, "test.zig", code);
     defer source.deinit();
 
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "swallowed_error - a returned rejection or failure count is not swallowed" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn mayFail() error{BadByte}!u8 { return error.BadByte; }
+        \\const Sanitizer = struct {
+        \\    last: []const u8 = "",
+        \\    pub fn acceptCluster(self: *Sanitizer, cluster: []const u8) bool {
+        \\        var accepted = true;
+        \\        var i: usize = 0;
+        \\        while (i < cluster.len) {
+        \\            const len: usize = std.unicode.utf8ByteSequenceLength(cluster[i]) catch {
+        \\                accepted = false;
+        \\                break;
+        \\            };
+        \\            i += len;
+        \\        }
+        \\        self.last = cluster;
+        \\        return accepted;
+        \\    }
+        \\};
+        \\pub fn tallied() u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += 1;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\pub fn subtally() i8 {
+        \\    var rejected: i8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected -= 1;
+        \\    };
+        \\    return rejected;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // The verdict is structural, so it holds for the engine run and for the
+    // conservative fallback alike.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "swallowed_error - a write through a field or index of the result is the caller's outcome" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const Stats = struct { failures: u8 = 0 };
+        \\fn mayFail() error{BadByte}!void { return error.BadByte; }
+        \\fn tallyThroughField() Stats {
+        \\    var stats = Stats{};
+        \\    _ = mayFail() catch {
+        \\        stats.failures += 1;
+        \\    };
+        \\    return stats;
+        \\}
+        \\fn tallyThroughIndex() [2]u8 {
+        \\    var counts = [_]u8{ 0, 0 };
+        \\    _ = mayFail() catch {
+        \\        counts[0] += 1;
+        \\    };
+        \\    return counts;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // The handler writes storage the returned value carries, so the caller
+    // reads the failure back out of it: crediting the target's root is what
+    // makes these two handlers exemptions rather than warnings.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "swallowed_error - a result that never reaches the caller is still swallowed" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\fn mayFail() error{BadByte}!u8 { return error.BadByte; }
+        \\fn report(slot: *u8) void { _ = slot; }
+        \\fn arbitraryValue() i32 {
+        \\    var y: i32 = 0;
+        \\    _ = mayFail() catch {
+        \\        y = 1;
+        \\    };
+        \\    return y;
+        \\}
+        \\fn acceptedValue() bool {
+        \\    var ok = true;
+        \\    _ = mayFail() catch {
+        \\        ok = true;
+        \\    };
+        \\    return ok;
+        \\}
+        \\fn overwrittenTally() u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += 1;
+        \\    };
+        \\    rejected = 0;
+        \\    return rejected;
+        \\}
+        \\fn borrowedTally() u8 {
+        \\    var rejected: u8 = 0;
+        \\    report(&rejected);
+        \\    _ = mayFail() catch {
+        \\        rejected += 1;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn shadowedTally() u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        var rejected: u8 = 9;
+        \\        rejected += 1;
+        \\        _ = rejected;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn notReturned() u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += 1;
+        \\    };
+        \\    return 0;
+        \\}
+        \\fn conditionallyReturned(flag: bool) u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += 1;
+        \\    };
+        \\    if (flag) return rejected;
+        \\    return 0;
+        \\}
+        \\fn branchedHandler(flag: bool) u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        if (flag) rejected += 1;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn zeroIncrement() u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += 0;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn zeroDecrement() i8 {
+        \\    var rejected: i8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected -= 0;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn zeroConstIncrement() u8 {
+        \\    var rejected: u8 = 0;
+        \\    const bump: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += bump;
+        \\    };
+        \\    return rejected;
+        \\}
+        \\fn maybeZeroIncrement(step: u8) u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail() catch {
+        \\        rejected += step;
+        \\    };
+        \\    return rejected;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // Every one of these handlers either stores an arbitrary value, lets the
+    // result be discarded before the caller sees it, can leave it untouched on
+    // a path, or changes a counter by an amount that records nothing.
+    for ([_]?usize{ null, 0 }) |max_steps| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try SwallowedErrorChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .analysis_limits = .{ .max_worklist_steps = max_steps },
+        });
+        try std.testing.expectEqual(@as(usize, 12), diagnostics.items.len);
+        for (diagnostics.items) |diagnostic| {
+            try std.testing.expectEqualStrings("swallowed-error", diagnostic.rule_id);
+        }
+    }
+}
+
+test "swallowed_error - the rejected-by-the-result reducer reports no finding" {
+    const allocator = std.testing.allocator;
+    const code: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn mayFail(byte: u8) error{ PermissionDenied, BadByte }!u8 {
+        \\    _ = byte;
+        \\    return error.BadByte;
+        \\}
+        \\pub const Sanitizer = struct {
+        \\    last: []const u8 = "",
+        \\
+        \\    pub fn acceptCluster(self: *Sanitizer, cluster: []const u8) bool {
+        \\        var accepted = true;
+        \\        var i: usize = 0;
+        \\        while (i < cluster.len) {
+        \\            const len: usize = std.unicode.utf8ByteSequenceLength(cluster[i]) catch {
+        \\                accepted = false;
+        \\                break;
+        \\            };
+        \\            if (len > cluster.len - i) {
+        \\                accepted = false;
+        \\                break;
+        \\            }
+        \\            i += len;
+        \\        }
+        \\        self.last = cluster;
+        \\        return accepted;
+        \\    }
+        \\};
+        \\pub fn rethrown(byte: u8) error{ PermissionDenied, BadByte }!u8 {
+        \\    return mayFail(byte) catch |err| return err;
+        \\}
+        \\pub fn logged(byte: u8) u8 {
+        \\    return mayFail(byte) catch |err| blk: {
+        \\        std.log.err("cluster rejected: {any}", .{err});
+        \\        break :blk 0;
+        \\    };
+        \\}
+        \\pub fn discarded(byte: u8) void {
+        \\    _ = mayFail(byte) catch {};
+        \\}
+        \\pub fn tallied(byte: u8) u8 {
+        \\    var rejected: u8 = 0;
+        \\    _ = mayFail(byte) catch {
+        \\        rejected += 1;
+        \\    };
+        \\    return rejected;
+        \\}
+    ;
+    var source = Source.init(allocator, "test.zig", code);
+    defer source.deinit();
+
+    // The returned binding is spelled by a declaration token and by separate
+    // use tokens; the rethrow, the log, and the empty discard keep their own
+    // verdicts, and the empty discard stays the empty-catch rule's business.
     for ([_]?usize{ null, 0 }) |max_steps| {
         var diagnostics: std.ArrayList(Diagnostic) = .empty;
         defer {

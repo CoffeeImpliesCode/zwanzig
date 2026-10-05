@@ -115,6 +115,21 @@ pub const Constraint = union(enum) {
         return hasher.final();
     }
 
+    /// Whether this fact is about the value `var_id` holds.
+    ///
+    /// A `var_compare` names one on either side, so the fact belongs to both
+    /// variables: it is about the two relative to each other, and assigning
+    /// either of them moves one of the two values it reads.
+    fn mentionsVar(self: Constraint, var_id: VarId) bool {
+        return switch (self) {
+            .int_compare => |ic| ic.var_id == var_id,
+            .null_check => |nc| nc.var_id == var_id,
+            .var_compare => |vc| vc.var1_id == var_id or vc.var2_id == var_id,
+            .bool_check => |bc| bc.var_id == var_id,
+            .literal_bool => false,
+        };
+    }
+
     /// Create an integer comparison constraint.
     pub fn intCompare(var_id: VarId, op: CompareOp, value: i64) Constraint {
         return .{ .int_compare = .{ .var_id = var_id, .op = op, .value = value } };
@@ -180,6 +195,16 @@ pub const Constraint = union(enum) {
     }
 };
 
+/// Copy live constraints without retaining unused list capacity.
+/// Graph snapshots keep independent lists. Exact-size copies reduce retained
+/// memory, but later appends may need another allocation.
+fn cloneItems(list: std.ArrayList(Constraint), allocator: std.mem.Allocator) std.mem.Allocator.Error!std.ArrayList(Constraint) {
+    var copy: std.ArrayList(Constraint) = .empty;
+    try copy.ensureTotalCapacityPrecise(allocator, list.items.len);
+    copy.appendSliceAssumeCapacity(list.items);
+    return copy;
+}
+
 /// Manages path constraints for symbolic execution.
 /// Tracks a set of constraints that must all hold on a given path.
 pub const ConstraintManager = struct {
@@ -190,6 +215,15 @@ pub const ConstraintManager = struct {
     per_var_constraints: std.AutoHashMap(VarId, VarConstraintLists),
     /// Whether a contradiction has been detected
     has_contradiction: bool,
+    /// Whether a fact was kept out of `per_var_constraints`.
+    ///
+    /// A fact arriving while the manager is already contradictory is kept in
+    /// the list but not indexed: the check it would have joined has already
+    /// answered, and indexing it afterwards would mean allocating, which is
+    /// what forgetting a variable may not do. From here on the index cannot
+    /// answer for the list, so the incremental check reads the facts
+    /// themselves - a pass `addConstraint` already makes to drop duplicates.
+    index_is_partial: bool,
 
     const VarConstraintLists = struct {
         int_constraints: std.ArrayList(Constraint) = .empty,
@@ -205,9 +239,9 @@ pub const ConstraintManager = struct {
         fn clone(self: *const VarConstraintLists, allocator: std.mem.Allocator) !VarConstraintLists {
             var result: VarConstraintLists = .{};
             errdefer result.deinit(allocator);
-            result.int_constraints = try self.int_constraints.clone(allocator);
-            result.null_constraints = try self.null_constraints.clone(allocator);
-            result.bool_constraints = try self.bool_constraints.clone(allocator);
+            result.int_constraints = try cloneItems(self.int_constraints, allocator);
+            result.null_constraints = try cloneItems(self.null_constraints, allocator);
+            result.bool_constraints = try cloneItems(self.bool_constraints, allocator);
             return result;
         }
     };
@@ -218,6 +252,7 @@ pub const ConstraintManager = struct {
             .allocator = allocator,
             .per_var_constraints = std.AutoHashMap(VarId, VarConstraintLists).init(allocator),
             .has_contradiction = false,
+            .index_is_partial = false,
         };
     }
 
@@ -234,8 +269,9 @@ pub const ConstraintManager = struct {
     pub fn clone(self: *const ConstraintManager, allocator: std.mem.Allocator) !ConstraintManager {
         var new_cm = ConstraintManager.init(allocator);
         errdefer new_cm.deinit();
-        new_cm.constraints = try self.constraints.clone(allocator);
+        new_cm.constraints = try cloneItems(self.constraints, allocator);
         new_cm.has_contradiction = self.has_contradiction;
+        new_cm.index_is_partial = self.index_is_partial;
 
         try new_cm.per_var_constraints.ensureTotalCapacity(self.per_var_constraints.count());
         var iter = self.per_var_constraints.iterator();
@@ -262,6 +298,63 @@ pub const ConstraintManager = struct {
         try self.constraints.append(self.allocator, constraint);
     }
 
+    /// Drop every constraint that names `var_id`, because the variable is
+    /// taking a value those facts do not describe.
+    ///
+    /// A fact only says what held while the variable held its previous value:
+    /// `x == 0` came from a guard that read the old `x`, and keeping it once
+    /// `x` is assigned 1 leaves the path demanding a value it can no longer
+    /// have, which prunes every branch the assignment opened. A fact about
+    /// another variable still holds, so a guard on `y` survives an assignment
+    /// to `x`.
+    ///
+    /// The fact list is compacted in place and the variable's index entry is
+    /// given back, so nothing is allocated and a list that never named the
+    /// variable is left exactly as it was.
+    pub fn forgetVar(self: *ConstraintManager, var_id: VarId) void {
+        var i: usize = 0;
+        var kept: usize = 0;
+        while (i < self.constraints.items.len) : (i += 1) {
+            const constraint = self.constraints.items[i];
+            if (constraint.mentionsVar(var_id)) continue;
+            if (kept != i) self.constraints.items[kept] = constraint;
+            kept += 1;
+        }
+        // No fact named the variable, so the facts - and the contradiction
+        // they add up to - are the ones the state already had.
+        if (kept == self.constraints.items.len) return;
+        self.constraints.shrinkRetainingCapacity(kept);
+        if (self.per_var_constraints.fetchRemove(var_id)) |removed| {
+            var lists = removed.value;
+            lists.deinit(self.allocator);
+        }
+        // Facts only contradict each other by both being there, so dropping
+        // some cannot make a feasible path infeasible: only a path already
+        // flagged has an answer to re-read.
+        if (self.has_contradiction) self.recomputeContradiction();
+    }
+
+    /// Re-decide contradiction from the facts still in the list.
+    ///
+    /// The per-variable index cannot answer this: it is keyed by the very
+    /// variable just given up, so the pair that made the path contradictory
+    /// may be half of its record already. Reading the answer off the facts
+    /// that remain both reopens a branch an assignment made reachable and
+    /// keeps a contradiction between two variables no assignment touched.
+    fn recomputeContradiction(self: *ConstraintManager) void {
+        var contradiction = false;
+        for (self.constraints.items) |existing| {
+            for (self.constraints.items) |candidate| {
+                if (self.areContradictory(existing, candidate)) {
+                    contradiction = true;
+                    break;
+                }
+            }
+            if (contradiction) break;
+        }
+        self.has_contradiction = contradiction;
+    }
+
     /// Check if the current constraint set is satisfiable.
     /// Returns false if there's a definite contradiction.
     pub fn isSatisfiable(self: *const ConstraintManager, env: *const Environment) bool {
@@ -279,20 +372,23 @@ pub const ConstraintManager = struct {
     }
 
     fn updateContradictionState(self: *ConstraintManager, constraint: Constraint) !void {
-        if (self.has_contradiction) return;
+        if (self.has_contradiction) {
+            switch (constraint) {
+                // These are the kinds the index holds. One arriving now stays
+                // out of it, which leaves the index unable to answer for the
+                // list from here on.
+                .int_compare, .null_check, .bool_check => self.index_is_partial = true,
+                else => {},
+            }
+            return;
+        }
         switch (constraint) {
             .int_compare => |ic| {
                 const entry = try self.per_var_constraints.getOrPut(ic.var_id);
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .{};
                 }
-                var contradiction = false;
-                for (entry.value_ptr.int_constraints.items) |existing| {
-                    if (self.areContradictory(existing, constraint)) {
-                        contradiction = true;
-                        break;
-                    }
-                }
+                const contradiction = self.contradictsRecorded(entry.value_ptr.int_constraints.items, constraint);
                 try entry.value_ptr.int_constraints.append(self.allocator, constraint);
                 if (contradiction) {
                     self.has_contradiction = true;
@@ -303,13 +399,7 @@ pub const ConstraintManager = struct {
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .{};
                 }
-                var contradiction = false;
-                for (entry.value_ptr.null_constraints.items) |existing| {
-                    if (self.areContradictory(existing, constraint)) {
-                        contradiction = true;
-                        break;
-                    }
-                }
+                const contradiction = self.contradictsRecorded(entry.value_ptr.null_constraints.items, constraint);
                 try entry.value_ptr.null_constraints.append(self.allocator, constraint);
                 if (contradiction) {
                     self.has_contradiction = true;
@@ -320,13 +410,7 @@ pub const ConstraintManager = struct {
                 if (!entry.found_existing) {
                     entry.value_ptr.* = .{};
                 }
-                var contradiction = false;
-                for (entry.value_ptr.bool_constraints.items) |existing| {
-                    if (self.areContradictory(existing, constraint)) {
-                        contradiction = true;
-                        break;
-                    }
-                }
+                const contradiction = self.contradictsRecorded(entry.value_ptr.bool_constraints.items, constraint);
                 try entry.value_ptr.bool_constraints.append(self.allocator, constraint);
                 if (contradiction) {
                     self.has_contradiction = true;
@@ -340,6 +424,20 @@ pub const ConstraintManager = struct {
                 }
             },
         }
+    }
+
+    /// Whether anything already recorded contradicts `constraint`.
+    ///
+    /// `recorded` is what the index holds for the variable the constraint is
+    /// about, which is the whole of what can contradict it - but only while
+    /// the index carries every fact. Once a fact has gone in unindexed, the
+    /// list is the only thing left that still knows all of them.
+    fn contradictsRecorded(self: *const ConstraintManager, recorded: []const Constraint, constraint: Constraint) bool {
+        const candidates: []const Constraint = if (self.index_is_partial) self.constraints.items else recorded;
+        for (candidates) |existing| {
+            if (self.areContradictory(existing, constraint)) return true;
+        }
+        return false;
     }
 
     fn isConstraintSatisfiable(self: *const ConstraintManager, constraint: Constraint, env: *const Environment) bool {
@@ -1218,4 +1316,123 @@ test "literal_bool refineValue behavior" {
 
     const concrete_pruned = ConstraintManager.refineValue(.{ .concrete_int = 42 }, Constraint.literalBool(false));
     try testing.expect(concrete_pruned == null);
+}
+
+test "ConstraintManager forgetVar drops the facts naming the variable" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var cm = ConstraintManager.init(allocator);
+    defer cm.deinit();
+
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 0));
+    try cm.addConstraint(Constraint.nullCheck(ids.varId(1), true));
+    try cm.addConstraint(Constraint.boolCheck(ids.varId(1), false));
+    try cm.addConstraint(Constraint.varCompare(ids.varId(1), .lt, ids.varId(2)));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(3), .eq, 7));
+    try cm.addConstraint(Constraint.literalBool(true));
+
+    cm.forgetVar(ids.varId(1));
+
+    try testing.expectEqual(@as(usize, 2), cm.size());
+    for (cm.constraints.items) |constraint| {
+        try testing.expect(!constraint.mentionsVar(ids.varId(1)));
+    }
+    var survivors: usize = 0;
+    for (cm.constraints.items) |constraint| {
+        if (constraint.eql(Constraint.intCompare(ids.varId(3), .eq, 7))) survivors += 1;
+        if (constraint.eql(Constraint.literalBool(true))) survivors += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), survivors);
+    // The index the unreachable-code checker reads must not answer for a
+    // variable whose facts are gone, and must still answer for the rest.
+    try testing.expect(cm.per_var_constraints.get(ids.varId(1)) == null);
+    try testing.expect(cm.per_var_constraints.get(ids.varId(3)) != null);
+}
+
+test "ConstraintManager forgetVar drops a var_compare naming either operand" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    for ([_]VarId{ ids.varId(1), ids.varId(2) }) |assigned| {
+        var cm = ConstraintManager.init(allocator);
+        defer cm.deinit();
+        try cm.addConstraint(Constraint.varCompare(ids.varId(1), .lt, ids.varId(2)));
+
+        cm.forgetVar(assigned);
+
+        try testing.expectEqual(@as(usize, 0), cm.size());
+    }
+}
+
+test "ConstraintManager forgetVar reopens only the contradiction it removed" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var env = Environment.init(allocator);
+    defer env.deinit();
+
+    var opened = ConstraintManager.init(allocator);
+    defer opened.deinit();
+    try opened.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 0));
+    try opened.addConstraint(Constraint.intCompare(ids.varId(1), .ne, 0));
+    try testing.expect(!opened.isSatisfiable(&env));
+
+    // `x` left the only value it was pinned to, so the branch is live again.
+    opened.forgetVar(ids.varId(1));
+    try testing.expect(opened.isSatisfiable(&env));
+    try opened.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 1));
+    try testing.expect(opened.isSatisfiable(&env));
+
+    var blocked = ConstraintManager.init(allocator);
+    defer blocked.deinit();
+    try blocked.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 0));
+    try blocked.addConstraint(Constraint.intCompare(ids.varId(1), .ne, 0));
+    try blocked.addConstraint(Constraint.boolCheck(ids.varId(4), true));
+    try blocked.addConstraint(Constraint.boolCheck(ids.varId(4), false));
+
+    // `flag` was never assigned, so what it says about itself still holds.
+    blocked.forgetVar(ids.varId(1));
+    try testing.expect(!blocked.isSatisfiable(&env));
+}
+
+test "ConstraintManager catches a contradiction against a fact it never indexed" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var env = Environment.init(allocator);
+    defer env.deinit();
+
+    var cm = ConstraintManager.init(allocator);
+    defer cm.deinit();
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 0));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .ne, 0));
+    try testing.expect(!cm.isSatisfiable(&env));
+
+    // The path is contradictory already, so this fact joins no index.
+    try cm.addConstraint(Constraint.intCompare(ids.varId(2), .eq, 5));
+
+    // Reassigning `x` reopens the path, and what is left is the fact about
+    // `y` - which is still the one to contradict.
+    cm.forgetVar(ids.varId(1));
+    try testing.expect(cm.isSatisfiable(&env));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(2), .ne, 5));
+    try testing.expect(!cm.isSatisfiable(&env));
+}
+
+test "ConstraintManager forgetVar gives memory back without asking for any" {
+    const testing = std.testing;
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var cm = ConstraintManager.init(failing.allocator());
+    defer cm.deinit();
+
+    try cm.addConstraint(Constraint.intCompare(ids.varId(1), .eq, 0));
+    try cm.addConstraint(Constraint.nullCheck(ids.varId(1), false));
+    try cm.addConstraint(Constraint.intCompare(ids.varId(2), .eq, 3));
+
+    const allocations = failing.allocations;
+    const deallocations = failing.deallocations;
+    cm.forgetVar(ids.varId(1));
+
+    try testing.expectEqual(allocations, failing.allocations);
+    try testing.expect(failing.deallocations > deallocations);
+    try testing.expectEqual(@as(usize, 1), cm.size());
 }

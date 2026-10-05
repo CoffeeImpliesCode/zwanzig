@@ -29,3 +29,5 @@ pub const ActuallyReflected = struct {
     test { comptime { real_testing.refAllDeclsRecursive(@This()); } }
     test { comptime { std_alias.testing.refAllDecls(@This()); } }
 };
+
+// zwanzig: not a standalone program: shadowing `real_testing` with a local struct is the subject of this test, verifying that shadowed namespace aliases cannot impersonate std.testing reflection.

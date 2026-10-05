@@ -80,7 +80,8 @@ pub const OptionalUnwrapEngineChecker = struct {
 
         // Scan AST for unwrap_optional nodes and check nullability
         const tree = try src.ast();
-        try scan.scanForUnsafeUnwraps(src, allocator, diagnostics, tree, engine, cfg_handle.cfg, reported, fn_node, context.type_context);
+        const test_severity = if (context.config) |config| config.optional_unwrap_test_severity orelse .warning else .warning;
+        try scan.scanForUnsafeUnwraps(src, allocator, diagnostics, tree, engine, cfg_handle.cfg, reported, fn_node, context.type_context, test_severity);
     }
 };
 
@@ -1504,4 +1505,41 @@ test "method proof joins every successful return and preserves intermediate scop
         \\};
     ;
     try expectOptionalUnwrapDiagnosticLines(code, &.{ 10, 12, 14, 16, 18, 20, 22, 24 });
+}
+
+test "optional unwrap test severity keeps helpers and nested methods at production severity" {
+    const code: [:0]const u8 =
+        \\fn read(value: ?u8) u8 { return value.?; }
+        \\test "oracle" {
+        \\    const value: ?u8 = null;
+        \\    _ = value.?;
+        \\    const Nested = struct {
+        \\        fn readNested(item: ?u8) u8 { return item.?; }
+        \\    };
+        \\    _ = Nested.readNested;
+        \\}
+    ;
+    const allocator = std.testing.allocator;
+    for ([_]checker_mod.Severity{ .hint, .warning, .err }) |severity| {
+        var source = Source.init(allocator, "test-policy.zig", code);
+        defer source.deinit();
+        const config: checker_mod.Config = .{
+            .rule_filter = .none,
+            .optional_unwrap_test_severity = severity,
+        };
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer {
+            for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+            diagnostics.deinit(allocator);
+        }
+        try OptionalUnwrapEngineChecker.checker.checkAst(&source, allocator, &diagnostics, .{
+            .build_metadata = null,
+            .config = &config,
+        });
+        try std.testing.expectEqual(@as(usize, 3), diagnostics.items.len);
+        for (diagnostics.items) |diagnostic| {
+            const expected: checker_mod.Severity = if (diagnostic.range.start.line == 4) severity else .warning;
+            try std.testing.expectEqual(expected, diagnostic.severity);
+        }
+    }
 }
